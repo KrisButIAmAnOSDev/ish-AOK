@@ -254,49 +254,9 @@
 # and do NOT maintain CPU_res -- so unlike i386 do_jump we must never read
 # CPU_res. (do_jump's sxo/sxoz read CPU_res directly with no eager path, which is
 # stale garbage on amd64.) Branches to \target if the COND_LIST condition holds.
-.macro amd64_do_jump cond, target
-    .ifc \cond,o
-        ldrb w8, [_cpu, CPU_of]
-        cbnz w8, \target
-    .endif
-    .ifc \cond,c
-        ldrb w8, [_cpu, CPU_cf]
-        cbnz w8, \target
-    .endif
-    .ifc \cond,z
-        ldr w8, [_cpu, CPU_eflags]
-        tbnz w8, 6, \target
-    .endif
-    .ifc \cond,cz
-        ldrb w8, [_cpu, CPU_cf]
-        cbnz w8, \target
-        ldr w8, [_cpu, CPU_eflags]
-        tbnz w8, 6, \target
-    .endif
-    .ifc \cond,s
-        ldr w8, [_cpu, CPU_eflags]
-        tbnz w8, 7, \target
-    .endif
-    .ifc \cond,p
-        ldr w8, [_cpu, CPU_eflags]
-        tbnz w8, 2, \target
-    .endif
-    .ifc \cond,sxo
-        ldr w8, [_cpu, CPU_eflags]
-        ubfx w8, w8, 7, 1
-        ldrb w9, [_cpu, CPU_of]
-        cmp w8, w9
-        b.ne \target
-    .endif
-    .ifc \cond,sxoz
-        ldr w8, [_cpu, CPU_eflags]
-        tbnz w8, 6, \target
-        ubfx w8, w8, 7, 1
-        ldrb w9, [_cpu, CPU_of]
-        cmp w8, w9
-        b.ne \target
-    .endif
-.endm
+# amd64_do_jump now lives in gadgets.h so math.S can use it too -- the
+# condition-evaluating gadgets (setcc, cmov) need it alongside the memory
+# helpers, and the two files are separate translation units.
 
 # amd64 block-chaining dispatch, the riscv64_branch_dispatch design with
 # this guest's 64-bit rip fields. Branch gadgets load the chosen target
@@ -412,6 +372,74 @@ amd64_gen_loop loopne, ne
 # tagged for amd64_branch_dispatch, so the frontend can patch either arm to a
 # successor block. gen.c flushes the reg cache, so RCX is read straight out of
 # CPU_amd64_regs.
+# 0F 90+cc SETcc r/m8, register form (mod==3). Writes 1 or 0 into a byte
+# register and touches no flags.
+#
+# SETE/SETNE alone were 5.3% of every amd64 interpreter bridge measured on a
+# threaded workload, and unlike the lock-prefixed atomics they need no
+# read-modify-write reasoning at all -- just the condition the jcc gadgets
+# already evaluate, and the byte writeback the byte-ALU family already does.
+#
+# The operand packing deliberately matches amd64_byte_alu_reg_imm --
+# dst_id(4-7) | is_high(8) -- so amd64_byte_writeback is reused verbatim,
+# including its handling of AH/CH/DH/BH (which, with no REX prefix, is what
+# encodings 4-7 mean).
+#
+# Order matters: amd64_do_jump clobbers w8/w9, and both the packed operand and
+# the destination's current value live there, so the condition is evaluated
+# FIRST into x15 and the operand is only loaded afterwards.
+# amd64_do_jump lives here in control.S while the byte-register helpers live in
+# math.S, and the two are separate translation units -- so the write is inlined
+# rather than reusing amd64_byte_writeback. gen.c FLUSHES the register cache
+# before this gadget, so every guest register is in CPU_amd64_regs and a direct
+# load/store is the correct way to reach it.
+#
+# Order matters: amd64_do_jump clobbers w8/w9, so the condition is evaluated
+# into x15 BEFORE the operand word is loaded.
+.macro amd64_gen_setcc name, cond
+    .gadget amd64_set_\name
+        amd64_do_jump \cond, 1f
+        mov  x15, 0
+        b    2f
+    1:  mov  x15, 1
+    2:  amd64_setcc_store
+.endm
+
+.macro amd64_gen_setncc name, cond
+    .gadget amd64_setn_\name
+        amd64_do_jump \cond, 1f
+        mov  x15, 1
+        b    2f
+    1:  mov  x15, 0
+    2:  amd64_setcc_store
+.endm
+
+# x15 holds the 0/1 result. Operand: dst_id(4-7) | is_high(8) -- the same
+# packing the byte-ALU family uses, so AH/CH/DH/BH (encodings 4-7 with no REX)
+# land in the right half of the register.
+.macro amd64_setcc_store
+    ldr  x8, [_ip]
+    ubfx x13, x8, 4, 4
+    ubfx x11, x8, 8, 1
+    lsl  x11, x11, 3
+    add  x12, _cpu, CPU_amd64_regs
+    ldr  x9, [x12, x13, lsl 3]
+    mov  x14, 0xff
+    lsl  x14, x14, x11
+    bic  x9, x9, x14
+    lsl  x15, x15, x11
+    and  x15, x15, x14
+    orr  x9, x9, x15
+    str  x9, [x12, x13, lsl 3]
+    gret 1
+.endm
+
+.irp cond, o,c,z,cz,s,p,sxo,sxoz
+    amd64_gen_setcc \cond, \cond
+    amd64_gen_setncc \cond, \cond
+.endr
+
+
 .gadget amd64_jrcxz
     ldr x8, [_cpu, (CPU_amd64_regs + 8)]    /* RCX */
     cbz x8, 1f

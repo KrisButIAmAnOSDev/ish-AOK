@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dlfcn.h>
 #include "jit/gen.h"
 #include "emu/modrm.h"
 #include "emu/cpuid.h"
@@ -6057,9 +6058,71 @@ static void gen_amd64_helper_tlb_1_retint(struct gen_state *state, void *helper,
     gen(state, arg0);
 }
 
+// ---------------------------------------------------------------------------
+// Bridge inventory. Every gen_amd64_helper_* emission is a place where a
+// compiled amd64 block calls back into emu/amd64_interp.c's semantics rather
+// than running a gadget -- the block stays compiled, but the instruction is
+// still interpreted. There was no counter for these at all: the only amd64 JIT
+// statistic was the block-FALLBACK histogram, which counts something different
+// and goes to zero while every one of these is still firing.
+//
+// Counts are per helper and per COMPILE, so they measure how many distinct
+// bridge sites exist in the code that ran, not how hot each one is -- blocks
+// are cached, so a bridge inside a loop is emitted once and executed forever.
+// Breadth here, depth from timing.
+//
+// Enable with ISH_TRACE_AMD64_BRIDGES=1.
+#define AMD64_BRIDGE_SLOTS 256
+static void *amd64_bridge_helper[AMD64_BRIDGE_SLOTS];
+static unsigned long amd64_bridge_arg0[AMD64_BRIDGE_SLOTS];
+static unsigned long amd64_bridge_count[AMD64_BRIDGE_SLOTS];
+static unsigned long amd64_bridge_total;
+
+static bool amd64_bridge_stats_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1)
+        enabled = getenv("ISH_TRACE_AMD64_BRIDGES") != NULL ? 1 : 0;
+    return enabled == 1;
+}
+
+static void amd64_bridge_dump(void) {
+    fprintf(stderr, "[amd64-bridges] total=%lu distinct=%u\n", amd64_bridge_total,
+            (unsigned) ({ unsigned n = 0; for (unsigned i = 0; i < AMD64_BRIDGE_SLOTS; i++)
+                          if (amd64_bridge_helper[i] != NULL) n++; n; }));
+    for (unsigned i = 0; i < AMD64_BRIDGE_SLOTS; i++) {
+        if (amd64_bridge_helper[i] == NULL)
+            continue;
+        Dl_info info;
+        const char *name = dladdr(amd64_bridge_helper[i], &info) && info.dli_sname
+            ? info.dli_sname : "?";
+        unsigned long pm = amd64_bridge_total
+            ? (1000UL * amd64_bridge_count[i] / amd64_bridge_total) : 0;
+        fprintf(stderr, "[amd64-bridges]   %-24s op=%02lx  %lu  (%lu.%lu%%)\n",
+                name, amd64_bridge_arg0[i], amd64_bridge_count[i], pm / 10, pm % 10);
+    }
+}
+
+static void amd64_bridge_note(void *helper, unsigned long arg0) {
+    if (!amd64_bridge_stats_enabled())
+        return;
+    for (unsigned i = 0; i < AMD64_BRIDGE_SLOTS; i++) {
+        if ((amd64_bridge_helper[i] == helper && amd64_bridge_arg0[i] == arg0) ||
+                amd64_bridge_helper[i] == NULL) {
+            amd64_bridge_helper[i] = helper;
+            amd64_bridge_arg0[i] = arg0;
+            amd64_bridge_count[i]++;
+            break;
+        }
+    }
+    amd64_bridge_total++;
+    if (amd64_bridge_total >= 8 && (amd64_bridge_total & (amd64_bridge_total - 1)) == 0)
+        amd64_bridge_dump();
+}
+
 static void gen_amd64_helper_tlb_2_retint(struct gen_state *state, void *helper,
         unsigned long arg0, unsigned long arg1) {
     extern void gadget_helper_tlb_2_retint(void);
+    amd64_bridge_note(helper, arg0 & 0xff);
     gen_amd64_flush_reg_cache(state);
     gen_amd64_flush_rip(state);
     gen(state, (unsigned long) gadget_helper_tlb_2_retint);
@@ -6071,6 +6134,7 @@ static void gen_amd64_helper_tlb_2_retint(struct gen_state *state, void *helper,
 static void gen_amd64_helper_tlb_3_retint(struct gen_state *state, void *helper,
         unsigned long arg0, unsigned long arg1, unsigned long arg2) {
     extern void gadget_helper_tlb_3_retint(void);
+    amd64_bridge_note(helper, arg0 & 0xff);
     gen_amd64_flush_reg_cache(state);
     gen_amd64_flush_rip(state);
     gen(state, (unsigned long) gadget_helper_tlb_3_retint);
@@ -6892,6 +6956,101 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
 #endif
 
     // imul reg, rm (0F AF): high-reg / memory / 16-bit forms bridge to the helper.
+    // 0F 90+cc SETcc r/m8, register form (mod==3). Must come BEFORE the
+    // 0f-rm-helper arm below, which currently claims the whole 0x90-0x9f range
+    // and bridges it: SETE/SETNE alone were 5.3% of every amd64 interpreter
+    // bridge measured on a threaded workload.
+    //
+    // The condition encoding is the same one gen_amd64_jcc uses -- base
+    // condition in (cc >> 1) & 7, negated by the low bit -- so the gadget table
+    // is the jcc table with a set/setn pair per entry. The memory form (mod!=3)
+    // keeps bridging for now.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.fs_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_rep_none &&
+            insn.op2 >= 0x90 && insn.op2 <= 0x9f) {
+        extern void gadget_amd64_set_o(void), gadget_amd64_set_c(void),
+                gadget_amd64_set_z(void), gadget_amd64_set_cz(void),
+                gadget_amd64_set_s(void), gadget_amd64_set_p(void),
+                gadget_amd64_set_sxo(void), gadget_amd64_set_sxoz(void);
+        extern void gadget_amd64_setn_o(void), gadget_amd64_setn_c(void),
+                gadget_amd64_setn_z(void), gadget_amd64_setn_cz(void),
+                gadget_amd64_setn_s(void), gadget_amd64_setn_p(void),
+                gadget_amd64_setn_sxo(void), gadget_amd64_setn_sxoz(void);
+        static void (* const set_gadgets[8])(void) = {
+            gadget_amd64_set_o, gadget_amd64_set_c, gadget_amd64_set_z, gadget_amd64_set_cz,
+            gadget_amd64_set_s, gadget_amd64_set_p, gadget_amd64_set_sxo, gadget_amd64_set_sxoz,
+        };
+        static void (* const setn_gadgets[8])(void) = {
+            gadget_amd64_setn_o, gadget_amd64_setn_c, gadget_amd64_setn_z, gadget_amd64_setn_cz,
+            gadget_amd64_setn_s, gadget_amd64_setn_p, gadget_amd64_setn_sxo, gadget_amd64_setn_sxoz,
+        };
+        unsigned cc = insn.op2 & 0xf;
+        if (amd64_modrm_mod(insn.modrm) != 3) {
+            // Memory destination: same condition, different gadget family, and
+            // the address goes through the standard meta/disp path.
+            extern void gadget_amd64_set_o_mem(void), gadget_amd64_set_c_mem(void),
+                    gadget_amd64_set_z_mem(void), gadget_amd64_set_cz_mem(void),
+                    gadget_amd64_set_s_mem(void), gadget_amd64_set_p_mem(void),
+                    gadget_amd64_set_sxo_mem(void), gadget_amd64_set_sxoz_mem(void);
+            extern void gadget_amd64_setn_o_mem(void), gadget_amd64_setn_c_mem(void),
+                    gadget_amd64_setn_z_mem(void), gadget_amd64_setn_cz_mem(void),
+                    gadget_amd64_setn_s_mem(void), gadget_amd64_setn_p_mem(void),
+                    gadget_amd64_setn_sxo_mem(void), gadget_amd64_setn_sxoz_mem(void);
+            static void (* const setm[8])(void) = {
+                gadget_amd64_set_o_mem, gadget_amd64_set_c_mem, gadget_amd64_set_z_mem,
+                gadget_amd64_set_cz_mem, gadget_amd64_set_s_mem, gadget_amd64_set_p_mem,
+                gadget_amd64_set_sxo_mem, gadget_amd64_set_sxoz_mem,
+            };
+            static void (* const setnm[8])(void) = {
+                gadget_amd64_setn_o_mem, gadget_amd64_setn_c_mem, gadget_amd64_setn_z_mem,
+                gadget_amd64_setn_cz_mem, gadget_amd64_setn_s_mem, gadget_amd64_setn_p_mem,
+                gadget_amd64_setn_sxo_mem, gadget_amd64_setn_sxoz_mem,
+            };
+            unsigned long meta, disp;
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, 8, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("setcc-mem ip=%llx cc=%u next=%llx",
+                    (unsigned long long) insn.start_ip, cc,
+                    (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) ((cc & 1) ? setnm[(cc >> 1) & 7]
+                                                 : setm[(cc >> 1) & 7]));
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        unsigned raw_rm = amd64_modrm_rm(insn.modrm);
+        bool is_high = !insn.rex.present && raw_rm >= 4;
+        unsigned byte_id = is_high ? raw_rm - 4
+                                   : (raw_rm | (insn.rex.b ? 8u : 0u));
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("setcc ip=%llx cc=%u dst=%u(hi%u) next=%llx",
+                (unsigned long long) insn.start_ip, cc, byte_id, is_high,
+                (unsigned long long) next_ip);
+        // The gadget reads and writes CPU_amd64_regs directly, so the cached
+        // registers must be back in memory first.
+        gen_amd64_flush_reg_cache(state);
+        gen(state, (unsigned long) ((cc & 1) ? setn_gadgets[(cc >> 1) & 7]
+                                             : set_gadgets[(cc >> 1) & 7]));
+        gen(state, (unsigned long) (((unsigned long) byte_id << 4) |
+                                    ((unsigned long) (is_high ? 1 : 0) << 8)));
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     if (!insn.address_size_prefix &&
             (insn.rep_mode == amd64_jit_rep_none ||
              ((insn.op2 == 0xbc || insn.op2 == 0xbd) &&

@@ -3258,6 +3258,45 @@ amd64_v_neon_binop_mem pcmpeqb, cmeq, 16b
     gret 3
     amd64_vread_bullshit 16, pshufbm
 
+# 0F 90+cc SETcc m8 -- the memory form. Same condition encoding as the register
+# form in control.S; this one lives here because it needs amd64_vmem_addr and
+# amd64_vwrite_prep, and amd64_do_jump was moved to gadgets.h so both files can
+# reach it.
+#
+# The condition is evaluated FIRST: amd64_do_jump clobbers w8/w9, and those are
+# exactly the meta word and the resolved host pointer. x10 carries the 0/1
+# across the address resolution, which only touches x0/x8/x11-x15 (and its miss
+# helpers bracket their C calls with save_c/restore_c, which preserves x10).
+.macro amd64_gen_setcc_mem name, cond, pol
+    .gadget amd64_set\pol\()_\name\()_mem
+        amd64_do_jump \cond, 1f
+        .ifc \pol,n
+            mov  x10, 1
+        .else
+            mov  x10, 0
+        .endif
+        b    2f
+    1:
+        .ifc \pol,n
+            mov  x10, 0
+        .else
+            mov  x10, 1
+        .endif
+    2:  ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        amd64_vmem_addr
+        amd64_vwrite_prep 1, set\pol\()\name
+        strb w10, [x9]
+        amd64_vwrite_done 1, set\pol\()\name
+        gret 3
+        amd64_vwrite_bullshit 1, set\pol\()\name
+.endm
+
+.irp cond, o,c,z,cz,s,p,sxo,sxoz
+    amd64_gen_setcc_mem \cond, \cond,
+    amd64_gen_setcc_mem \cond, \cond, n
+.endr
+
 amd64_v_str3a_mem palignr,   vec_palignr128
 amd64_v_str3a_mem pcmpistri, amd64_jit_pcmpistri
 amd64_v_str3a_mem pcmpestri, amd64_jit_pcmpestri

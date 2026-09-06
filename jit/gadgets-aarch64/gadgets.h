@@ -274,3 +274,48 @@ back_write_done_\id :
 .endm
 
 # vim: ft=gas
+
+.macro amd64_do_jump cond, target
+    .ifc \cond,o
+        ldrb w8, [_cpu, CPU_of]
+        cbnz w8, \target
+    .endif
+    .ifc \cond,c
+        ldrb w8, [_cpu, CPU_cf]
+        cbnz w8, \target
+    .endif
+    .ifc \cond,z
+        ldr w8, [_cpu, CPU_eflags]
+        tbnz w8, 6, \target
+    .endif
+    .ifc \cond,cz
+        ldrb w8, [_cpu, CPU_cf]
+        cbnz w8, \target
+        ldr w8, [_cpu, CPU_eflags]
+        tbnz w8, 6, \target
+    .endif
+    .ifc \cond,s
+        ldr w8, [_cpu, CPU_eflags]
+        tbnz w8, 7, \target
+    .endif
+    .ifc \cond,p
+        ldr w8, [_cpu, CPU_eflags]
+        tbnz w8, 2, \target
+    .endif
+    .ifc \cond,sxo
+        ldr w8, [_cpu, CPU_eflags]
+        ubfx w8, w8, 7, 1
+        ldrb w9, [_cpu, CPU_of]
+        cmp w8, w9
+        b.ne \target
+    .endif
+    .ifc \cond,sxoz
+        ldr w8, [_cpu, CPU_eflags]
+        tbnz w8, 6, \target
+        ubfx w8, w8, 7, 1
+        ldrb w9, [_cpu, CPU_of]
+        cmp w8, w9
+        b.ne \target
+    .endif
+.endm
+
