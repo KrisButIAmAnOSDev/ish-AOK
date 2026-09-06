@@ -5971,3 +5971,279 @@ _gadget_array_start fused_test32
     amd64_fused_cmp_ri \cond
     amd64_fused_cmp_rr \cond
 .endr
+
+# ===========================================================================
+# Byte family, bit scan, and memory-source multiply -- the last interpreter
+# bridges in compiler code (cc1: `shr al,imm`, `cmp [mem],r8`, `and r8,[mem]`,
+# `bsr`, `imul reg,[mem]`).
+#
+# Byte-register operands live inside the 64-bit slots of cpu->amd64_regs: the
+# low byte of regs[r] for AL/CL/DL/BL, SPL..DIL (REX present) and R8B..R15B, and
+# BYTE 1 of regs[r-4] for AH/CH/DH/BH (no REX, rm/reg 4-7). gen.c resolves the
+# slot and passes a "high" bit; the gadget forms the byte pointer with one add.
+# Everything here is flush style: the register cache is flushed (and
+# invalidated) before these run, so cpu->amd64_regs is authoritative and every
+# write goes there. Nothing below touches x20-x27.
+# ===========================================================================
+
+# SHL/SHR/SAR r/m8 by 1 (0xd0), CL (0xd2) or imm8 (0xc0), mod==3.
+# Operand: packed(0) = slot(0-3) | group(4-7: 4 shl / 5 shr / 7 sar) | count(8-15)
+#   | is_high(16) | use_cl(17). The count is masked by 31 for every operand size,
+# as the hardware does; a zero count leaves the flags alone. CF is the last bit
+# shifted out (0 once the count exceeds the width), OF is defined for count 1
+# only (SHL: bit7(res)^CF, SHR: sign of the source, SAR: 0), ZF/SF/PF come from
+# the 8-bit result via amd64_cached_set_shift_flags 7. gret 1.
+.gadget amd64_shift8
+    ldr  x8, [_ip]
+    and  x11, x8, 0xf                /* slot */
+    ubfx x9, x8, 4, 4                /* group */
+    ubfx x10, x8, 8, 8               /* count: imm8, or the literal 1 */
+    add  x13, _cpu, CPU_amd64_regs
+    tbz  x8, 17, 1f
+    ldrb w10, [x13, 8]               /* CL = low byte of regs[rcx] */
+1:  add  x11, x13, x11, lsl 3        /* &regs[slot] */
+    tbz  x8, 16, 2f
+    add  x11, x11, 1                 /* AH/CH/DH/BH: byte 1 of the slot */
+2:  and  x10, x10, 31
+    cbz  x10, 9f
+    ldrb w13, [x11]                  /* operand byte, zero-extended */
+    cmp  x9, 4
+    b.eq 3f
+    cmp  x9, 5
+    b.eq 4f
+    sxtb w13, w13                    /* SAR: shift the sign-extended value */
+    asr  w15, w13, w10
+    sub  w12, w10, 1
+    lsr  w14, w13, w12               /* CF = bit (count-1) of the source */
+    b    5f
+3:  lsl  w15, w13, w10               /* SHL */
+    mov  w12, 8
+    sub  w12, w12, w10
+    lsr  w14, w13, w12               /* CF = bit (8-count) of the source; 0 past 8 */
+    b    5f
+4:  lsr  w15, w13, w10               /* SHR */
+    sub  w12, w10, 1
+    lsr  w14, w13, w12               /* CF = bit (count-1) of the source */
+5:  and  w14, w14, 1
+    mov  w16, 0
+    cmp  x10, 1
+    b.ne 6f
+    cmp  x9, 4
+    b.eq 7f
+    cmp  x9, 5
+    b.eq 8f
+    b    6f                          /* SAR: OF = 0 */
+7:  lsr  w16, w15, 7                 /* SHL: OF = bit7(res) ^ CF */
+    and  w16, w16, 1
+    eor  w16, w16, w14
+    b    6f
+8:  lsr  w16, w13, 7                 /* SHR: OF = sign of the source */
+6:  and  w15, w15, 0xff
+    strb w15, [x11]
+    amd64_cached_set_shift_flags 7
+9:  gret 1
+
+# <alu> r8, r/m8 (0x02/0a/22/2a/32/3a), mod!=3: register destination, memory
+# source. Memory is read-only here, so no write prep and nothing to undo.
+# Operands: [meta][disp][next_ip][packed], packed = group(0-3) | slot(4-7) |
+# is_high(8). CMP (group 7) sets flags and skips the write. gret 4.
+.gadget amd64_byte_alu_regmem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep 1, byte_alu_regmem
+    ldrb w10, [x9]                   /* rhs = [mem] */
+    ldr  x8, [_ip, 24]               /* packed (vread_prep clobbered x8) */
+    ubfx x11, x8, 4, 4
+    add  x14, _cpu, CPU_amd64_regs
+    add  x9, x14, x11, lsl 3         /* x9 = &regs[slot]; byte_compute keeps x9 */
+    tbz  x8, 8, 1f
+    add  x9, x9, 1
+1:  ldrb w13, [x9]                   /* lhs = destination byte */
+    amd64_byte_compute
+    and  x12, x8, 0xf
+    cmp  x12, 7
+    b.eq 2f
+    strb w15, [x9]
+2:  gret 4
+    amd64_vread_bullshit 1, byte_alu_regmem
+
+# CMP r/m8, r8 (0x38) and TEST r/m8, r8 (0x84), mod!=3: the memory operand is
+# the lhs and nothing is written, so this is the read path -- a CMP against a
+# read-only page must not fault as a write. packed = group(0-3: 7 cmp / 4 test)
+# | slot(4-7) | is_high(8). gret 4.
+.gadget amd64_byte_cmp_memreg
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep 1, byte_cmp_memreg
+    ldrb w13, [x9]                   /* lhs = [mem] */
+    ldr  x8, [_ip, 24]
+    ubfx x11, x8, 4, 4
+    add  x14, _cpu, CPU_amd64_regs
+    add  x9, x14, x11, lsl 3
+    tbz  x8, 8, 1f
+    add  x9, x9, 1
+1:  ldrb w10, [x9]                   /* rhs = register byte */
+    amd64_byte_compute               /* flags only; the result is dropped */
+    gret 4
+    amd64_vread_bullshit 1, byte_cmp_memreg
+
+# <alu> r/m8, r8 (0x00/08/20/28/30), mod!=3: memory destination, read-modify-
+# write in the dual-prep frame of amd64_gen_imm_arith (guest address in x0
+# across both preps, result in x10 across the write prep). gen.c keeps LOCKed
+# byte RMW on the helper, which does a host atomic. packed = group(0-3) |
+# slot(4-7) | is_high(8). gret 4.
+.gadget amd64_byte_alu_memreg
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    mov  x0, x9                      /* guest addr survives both preps */
+    amd64_vread_prep 1, byte_alu_memreg_r
+    ldrb w13, [x9]                   /* lhs = [mem] */
+    ldr  x8, [_ip, 24]
+    ubfx x11, x8, 4, 4
+    add  x14, _cpu, CPU_amd64_regs
+    add  x9, x14, x11, lsl 3
+    tbz  x8, 8, 1f
+    add  x9, x9, 1
+1:  ldrb w10, [x9]                   /* rhs = register byte */
+    amd64_byte_compute
+    mov  x10, x15                    /* result -> x10 (survives the write prep) */
+    mov  x9, x0
+    amd64_vwrite_prep 1, byte_alu_memreg_w
+    strb w10, [x9]
+    amd64_vwrite_done 1, byte_alu_memreg_w
+    gret 4
+    amd64_vread_bullshit 1, byte_alu_memreg_r
+    amd64_vwrite_bullshit 1, byte_alu_memreg_w
+
+# BSF (0F BC) / BSR (0F BD) r, r/m, 32/64, no REP prefix (TZCNT/LZCNT keep
+# bridging: they redefine what a zero source means). A zero source sets ZF and
+# leaves the destination alone, exactly as the interpreter does; otherwise ZF is
+# cleared and the destination gets the bit index (zero-extended into the slot,
+# which is also the 32-bit rule). CF/OF/SF/AF/PF are architecturally undefined
+# and are left untouched. ZF goes into eflags and its lazy bit is cleared.
+# Body inputs: x10 = source (already zero-extended for 32-bit), x12 = dst slot,
+# x8 bit 16 = BSR. Clobbers x11, x14, x15, x16, x17.
+.macro amd64_bitscan_body
+    ldrb w11, [_cpu, CPU_flags_res]
+    bic  w11, w11, ZF_RES
+    strb w11, [_cpu, CPU_flags_res]
+    ldr  w17, [_cpu, CPU_eflags]
+    cbnz x10, .Lbs_nonzero_\@
+    orr  w17, w17, ZF_FLAG
+    str  w17, [_cpu, CPU_eflags]
+    b    .Lbs_done_\@
+.Lbs_nonzero_\@:
+    bic  w17, w17, ZF_FLAG
+    str  w17, [_cpu, CPU_eflags]
+    tbnz x8, 16, .Lbs_bsr_\@
+    rbit x15, x10                    /* BSF: index of the lowest set bit */
+    clz  x15, x15
+    b    .Lbs_store_\@
+.Lbs_bsr_\@:
+    clz  x15, x10                    /* BSR: 63 - clz (31 - clz32 once zero-extended) */
+    mov  x16, 63
+    sub  x15, x16, x15
+.Lbs_store_\@:
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x12, lsl 3]
+.Lbs_done_\@:
+.endm
+
+# Register source. packed(0) = src(0-3) | dst(4-7) | is_bsr(16) | is64(17). gret 1.
+.gadget amd64_bitscan_reg
+    ldr  x8, [_ip]
+    and  x11, x8, 0xf
+    ubfx x12, x8, 4, 4
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x10, [x14, x11, lsl 3]
+    tbnz x8, 17, 5f
+    mov  w10, w10                    /* 32-bit source */
+5:  amd64_bitscan_body
+    gret 1
+
+# Memory source. Operands: [meta][disp][next_ip][packed], packed = dst(4-7) |
+# is_bsr(16); the width is the gadget's. gret 4.
+.macro amd64_gen_bitscan_mem name, vbytes
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w10, [x9]
+.else
+    ldr  x10, [x9]
+.endif
+    ldr  x8, [_ip, 24]
+    ubfx x12, x8, 4, 4
+    amd64_bitscan_body
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+amd64_gen_bitscan_mem bitscan_mem32, 4
+amd64_gen_bitscan_mem bitscan_mem64, 8
+
+# IMUL r, r/m (0F AF) and IMUL r, r/m, imm (69 id / 6B ib) with a memory
+# source, 32/64. The multiply and the CF=OF=overflow rule are amd64_imul_body's;
+# the difference is flush style -- the destination is written to
+# cpu->amd64_regs, not the register cache, so any destination register works.
+# Operands: [meta][disp][next_ip][packed = dst(8-11)] (+ [imm], sign-extended
+# by gen.c, for the imm forms). gret 4 (reg form) / 5 (imm form).
+.macro amd64_gen_imul_mem name, vbytes, use_imm
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w13, [x9]
+.else
+    ldr  x13, [x9]
+.endif
+    ldr  x8, [_ip, 24]
+    ubfx x9, x8, 8, 4                /* dst slot */
+    add  x14, _cpu, CPU_amd64_regs
+.if \use_imm
+    ldr  x10, [_ip, 32]              /* the immediate */
+.else
+    ldr  x10, [x14, x9, lsl 3]       /* dst is the other factor */
+.endif
+.if \vbytes == 4
+    sxtw x13, w13
+    sxtw x10, w10
+    mul  x14, x13, x10
+    sxtw x15, w14
+    cmp  x15, x14
+    cset w16, ne                     /* overflow: the product does not fit 32 signed */
+    mov  w15, w14                    /* zero-extend into the 64-bit slot */
+.else
+    mul  x15, x13, x10
+    smulh x14, x13, x10
+    asr  x17, x15, 63
+    cmp  x14, x17
+    cset w16, ne
+.endif
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x9, lsl 3]
+    strb w16, [_cpu, CPU_cf]
+    strb w16, [_cpu, CPU_of]
+    ldr  w17, [_cpu, CPU_eflags]
+    mov  w14, (1 | (1 << 11))
+    bic  w17, w17, w14
+    cbz  w16, 1f
+    orr  w17, w17, w14
+1:  str  w17, [_cpu, CPU_eflags]
+.if \use_imm
+    gret 5
+.else
+    gret 4
+.endif
+    amd64_vread_bullshit \vbytes, \name
+.endm
+amd64_gen_imul_mem imul_mem32, 4, 0
+amd64_gen_imul_mem imul_mem64, 8, 0
+amd64_gen_imul_mem imul_imm_mem32, 4, 1
+amd64_gen_imul_mem imul_imm_mem64, 8, 1
