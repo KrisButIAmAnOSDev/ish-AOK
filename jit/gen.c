@@ -10627,6 +10627,73 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     }
 #endif
 
+    // Native MOV [mem], imm -- store an immediate (0xc6 imm8, 0xc7 imm32
+    // sign-extended). Group 0 only; c6/c7 with a nonzero group is #UD. mod!=3
+    // (a register destination is the separate mov_imm_reg path). `movl/movq
+    // $imm,(mem)` was ~7% of the remaining bridges. FS accepted; a byte or word
+    // store never crosses a page.
+    if (!insn.two_byte_opcode && !insn.address_size_prefix &&
+            !insn.lock_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.has_modrm && amd64_modrm_mod(insn.modrm) != 3 &&
+            amd64_modrm_reg(insn.modrm) == 0 &&
+            (insn.opcode == 0xc6 || insn.opcode == 0xc7)) {
+        unsigned size = insn.opcode == 0xc6 ? 8
+            : (insn.rex.w ? 64 : (insn.operand_size_prefix ? 16 : 32));
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        long imm;
+        if (insn.opcode == 0xc6) {
+            int8_t imm8;
+            if (!tlb_read(tlb, next_ip, &imm8, sizeof(imm8))) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            imm = imm8;
+            next_ip += 1;
+        } else if (insn.operand_size_prefix) {
+            int16_t imm16;
+            if (!tlb_read(tlb, next_ip, &imm16, sizeof(imm16))) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            imm = imm16;
+            next_ip += 2;
+        } else {
+            int32_t imm32;
+            if (!tlb_read(tlb, next_ip, &imm32, sizeof(imm32))) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            imm = imm32;   // sign-extended to 64 for the c7 REX.W form
+            next_ip += 4;
+        }
+        extern void gadget_amd64_mov_imm_mem8(void), gadget_amd64_mov_imm_mem16(void),
+                gadget_amd64_mov_imm_mem32(void), gadget_amd64_mov_imm_mem64(void);
+        void (*g)(void) = size == 8 ? gadget_amd64_mov_imm_mem8
+            : size == 16 ? gadget_amd64_mov_imm_mem16
+            : size == 32 ? gadget_amd64_mov_imm_mem32 : gadget_amd64_mov_imm_mem64;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("mov-imm-mem ip=%llx size=%u imm=%lx next=%llx",
+                (unsigned long long) insn.start_ip, size, imm,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen(state, (unsigned long) g);
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen(state, (unsigned long) imm);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             (insn.opcode == 0x80 || insn.opcode == 0x81 ||

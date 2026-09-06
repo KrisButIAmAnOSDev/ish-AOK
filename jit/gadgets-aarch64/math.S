@@ -4801,6 +4801,37 @@ amd64_gen_lock_imm lock_imm64, 8, 63, 64
 amd64_gen_xchg_mem xchg_mem32, 4, 32
 amd64_gen_xchg_mem xchg_mem64, 8, 64
 
+# MOV [mem], imm -- store an immediate: 0xc7 (imm32, sign-extended to the
+# operand size) and 0xc6 (imm8). A pure store, so no read prep, no flags -- the
+# single most common thing after a load, struct-field init and zeroing. `movl
+# $imm,(mem)` / `movq $imm,(mem)` were ~7% of the remaining bridges (opcode c7,
+# memory forms). Operands: [meta][disp][next_ip][imm]. gret 4.
+.macro amd64_gen_mov_imm_mem name, vbytes
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vwrite_prep \vbytes, \name
+    ldr  x10, [_ip, 24]              /* imm (already sign-extended by gen.c) */
+.if \vbytes == 1
+    strb w10, [x9]
+.elseif \vbytes == 2
+    strh w10, [x9]
+.elseif \vbytes == 4
+    str  w10, [x9]
+.else
+    str  x10, [x9]
+.endif
+    amd64_vwrite_done \vbytes, \name
+    gret 4
+    amd64_vwrite_bullshit \vbytes, \name
+.endm
+
+amd64_gen_mov_imm_mem mov_imm_mem8,  1
+amd64_gen_mov_imm_mem mov_imm_mem16, 2
+amd64_gen_mov_imm_mem mov_imm_mem32, 4
+amd64_gen_mov_imm_mem mov_imm_mem64, 8
+
 amd64_gen_imm_arith imm_arith32, 4, 31
 amd64_gen_imm_arith imm_arith64, 8, 63
 
