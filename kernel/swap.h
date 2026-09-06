@@ -177,10 +177,14 @@ ssize_t swap_area_pwrite(const void *buf, size_t len, off_t off);
 //  - it must never run mm_release, because that can reach mem_destroy, and the
 //    bounded-teardown guard keys on current->mm_teardown -- without it a FUSE
 //    flush in an unmapped file's ->close waits for a guest process that will
-//    never run again. So kswapd never retains an mm at all: it holds a TASK
-//    reference from task_snapshot_collect, and do_exit blocks on exactly those
-//    references before it releases the mm, so task->mm stays valid for as long
-//    as the reference is held.
+//    never run again. So kswapd never retains an mm at all. It PINS the mem
+//    (mem_ref_cnt_mod, which mm_release waits on before mem_destroy) under the
+//    task's general_lock, and the task reference from task_snapshot_collect
+//    keeps the task itself alive. The task reference alone was the original
+//    protocol and it is not sufficient: do_exit blocks on those references
+//    before releasing the mm, but exec swaps task->mm and releases the old
+//    one with the task alive and referenced, which is how kswapd came to
+//    sweep a freed address space on a device (kernel/swap.c, kswapd loop).
 
 // Passes since the last one that did any work, for /proc/ish/swap.
 struct swap_kswapd_stats {

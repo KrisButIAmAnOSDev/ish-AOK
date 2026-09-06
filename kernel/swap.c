@@ -1029,11 +1029,38 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
         if (!swap_kswapd_should_reclaim())
             continue;
 
-        // NO mm_retain ANYWHERE IN HERE. The task reference from the snapshot
-        // is what keeps task->mm alive: do_exit waits on exactly those
-        // references (exit_wait_needed) before it calls mm_release, so the mm
-        // cannot be torn down while we hold one -- and kswapd never becomes the
-        // thread that runs mem_destroy, which it must not, having no `current`.
+        // NO mm_retain ANYWHERE IN HERE: kswapd must never become the thread
+        // that runs mem_destroy, having no `current` (swap.h). What keeps an
+        // address space alive across its sweep is the mem PIN instead --
+        // mem_ref_cnt_mod, which mm_release waits on before it tears the mem
+        // down -- taken under the task's general_lock, so it is in place
+        // before anyone can publish a different mm for that task.
+        //
+        // The task reference from the snapshot is NOT enough on its own, and
+        // believing it was killed the app on an iPad. do_exit does wait for
+        // those references before it releases the mm; EXEC does not. elf_exec
+        // and the native exec both swap task->mm and mm_release the old one
+        // with the task alive and referenced (kernel/exec.c), so an mm read
+        // from a snapshot task can be a freed one by the time the sweep
+        // reaches it. MEASURED 2026-09-06 on the A9 iPad, under a swap soak
+        // whose logger forked date/grep/cut every 30 seconds:
+        //
+        //   kswapd0: EXC_BAD_ACCESS address 0, mem_pgdir_chunk_get <- mem_pt
+        //   <- swap_frame_eligible <- swap_evict_common <- swap_evict_bytes
+        //   <- swap_kswapd_main, with mem->pgdir_root NULL -- exactly what
+        //   mem_destroy leaves behind.
+        //
+        // trylock, and skip the task on failure, for the reason fs/proc/root.c's
+        // collect_mem_page_stats documents: do_exit spins in exit_wait_backoff()
+        // with general_lock held, waiting for references that include the one
+        // this snapshot holds, so a blocking lock here is a deadlock. A task
+        // that cannot be locked is mid-exit and its address space is about to
+        // go anyway.
+        //
+        // What the pin costs: an exec that races the sweep spins in mm_release
+        // until the sweep of its OLD address space finishes, at most one slice,
+        // and that slice's writes go to an address space nothing will fault
+        // back in. Rare and bounded; the alternative was the crash above.
         struct task_snapshot snapshot = {0};
         if (task_snapshot_collect(&snapshot, false) != 0)
             continue;
@@ -1045,16 +1072,28 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
                 break;
             if (atomic_load_explicit(&swap_kswapd_stop, memory_order_acquire))
                 break;
-            struct mm *mm = snapshot.tasks[i]->mm;
+            struct task *task = snapshot.tasks[i];
+            if (trylock(&task->general_lock) != 0)
+                continue;
+            struct mm *mm = task->mm;
+            if (mm != NULL)
+                mem_ref_cnt_mod(&mm->mem, 1);
+            unlock(&task->general_lock);
             if (mm == NULL)
                 continue;
+            // Every thread of a group names the same mm; sweep it once. (A
+            // pointer in seen[] may by now name a freed mm whose address was
+            // reused -- that only skips the newcomer for this pass.)
             bool already = false;
             for (unsigned j = 0; j < seen_count && !already; j++)
                 already = seen[j] == mm;
-            if (already)
+            if (already) {
+                mem_ref_cnt_mod(&mm->mem, -1);
                 continue;
+            }
             seen[seen_count++] = mm;
             long released = swap_evict_bytes(&mm->mem, SWAP_KSWAPD_SLICE_BYTES);
+            mem_ref_cnt_mod(&mm->mem, -1);
             if (released > 0)
                 got += (uint64_t) released;
         }
