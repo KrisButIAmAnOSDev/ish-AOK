@@ -439,6 +439,60 @@ amd64_gen_loop loopne, ne
     amd64_gen_setncc \cond, \cond
 .endr
 
+# 0F 40+cc CMOVcc r, r/m -- register source (mod==3).
+#
+# The destination is written EVEN WHEN THE CONDITION IS FALSE: on real x86-64
+# CMOVcc always writes, and a 32-bit write zero-extends, so a not-taken 32-bit
+# cmov CLEARS the upper half. Verified on hardware; AOK's interpreter had this
+# wrong in both of its copies until now. Writing the current value back is a
+# no-op at 16 and 64 bits, so the store below is unconditional at every size.
+#
+# gen.c flushes the register cache, so guest registers are in CPU_amd64_regs.
+# amd64_do_jump clobbers w8/w9, so it runs before anything is loaded.
+#
+# Operand: src_id(0-3) | dst_id(4-7) | size(8-15).
+.macro amd64_gen_cmov name, cond, pol
+    .gadget amd64_cmov\pol\()_\name
+        amd64_do_jump \cond, 1f
+        .ifc \pol,n
+            mov  x16, 1
+        .else
+            mov  x16, 0
+        .endif
+        b    2f
+    1:
+        .ifc \pol,n
+            mov  x16, 0
+        .else
+            mov  x16, 1
+        .endif
+    2:  ldr  x8, [_ip]
+        ubfx x11, x8, 0, 4
+        ubfx x12, x8, 4, 4
+        ubfx x13, x8, 8, 8
+        add  x14, _cpu, CPU_amd64_regs
+        ldr  x9,  [x14, x11, lsl 3]      /* src */
+        ldr  x10, [x14, x12, lsl 3]      /* current dst */
+        cmp  x16, 0
+        csel x15, x9, x10, ne            /* taken ? src : dst */
+        cmp  x13, 64
+        b.eq 3f
+        cmp  x13, 32
+        b.eq 4f
+        bfi  x10, x15, 0, 16             /* 16-bit: upper 48 preserved */
+        mov  x15, x10
+        b    3f
+    4:  mov  w15, w15                    /* 32-bit: zero-extend */
+    3:  str  x15, [x14, x12, lsl 3]
+        gret 1
+.endm
+
+.irp cond, o,c,z,cz,s,p,sxo,sxoz
+    amd64_gen_cmov \cond, \cond,
+    amd64_gen_cmov \cond, \cond, n
+.endr
+
+
 
 .gadget amd64_jrcxz
     ldr x8, [_cpu, (CPU_amd64_regs + 8)]    /* RCX */

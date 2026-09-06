@@ -6956,6 +6956,56 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
 #endif
 
     // imul reg, rm (0F AF): high-reg / memory / 16-bit forms bridge to the helper.
+    // 0F 40+cc CMOVcc r, r/m -- register source (mod==3). Before the
+    // 0f-rm-helper arm, same as SETcc. The destination is written even when the
+    // condition is false (see the gadget), which is what emu/amd64_interp.c had
+    // wrong until it was fixed alongside this.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.fs_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_rep_none &&
+            amd64_modrm_mod(insn.modrm) == 3 &&
+            insn.op2 >= 0x40 && insn.op2 <= 0x4f) {
+        extern void gadget_amd64_cmov_o(void), gadget_amd64_cmov_c(void),
+                gadget_amd64_cmov_z(void), gadget_amd64_cmov_cz(void),
+                gadget_amd64_cmov_s(void), gadget_amd64_cmov_p(void),
+                gadget_amd64_cmov_sxo(void), gadget_amd64_cmov_sxoz(void);
+        extern void gadget_amd64_cmovn_o(void), gadget_amd64_cmovn_c(void),
+                gadget_amd64_cmovn_z(void), gadget_amd64_cmovn_cz(void),
+                gadget_amd64_cmovn_s(void), gadget_amd64_cmovn_p(void),
+                gadget_amd64_cmovn_sxo(void), gadget_amd64_cmovn_sxoz(void);
+        static void (* const cmovg[8])(void) = {
+            gadget_amd64_cmov_o, gadget_amd64_cmov_c, gadget_amd64_cmov_z,
+            gadget_amd64_cmov_cz, gadget_amd64_cmov_s, gadget_amd64_cmov_p,
+            gadget_amd64_cmov_sxo, gadget_amd64_cmov_sxoz,
+        };
+        static void (* const cmovng[8])(void) = {
+            gadget_amd64_cmovn_o, gadget_amd64_cmovn_c, gadget_amd64_cmovn_z,
+            gadget_amd64_cmovn_cz, gadget_amd64_cmovn_s, gadget_amd64_cmovn_p,
+            gadget_amd64_cmovn_sxo, gadget_amd64_cmovn_sxoz,
+        };
+        unsigned cc = insn.op2 & 0xf;
+        unsigned size = insn.rex.w ? 64 : (insn.operand_size_prefix ? 16 : 32);
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        unsigned dst_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned src_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("cmov ip=%llx cc=%u src=%u dst=%u size=%u next=%llx",
+                (unsigned long long) insn.start_ip, cc, src_id, dst_id, size,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen(state, (unsigned long) ((cc & 1) ? cmovng[(cc >> 1) & 7]
+                                             : cmovg[(cc >> 1) & 7]));
+        gen(state, (unsigned long) ((unsigned long) src_id |
+                                    ((unsigned long) dst_id << 4) |
+                                    ((unsigned long) size << 8)));
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     // 0F 90+cc SETcc r/m8, register form (mod==3). Must come BEFORE the
     // 0f-rm-helper arm below, which currently claims the whole 0x90-0x9f range
     // and bridges it: SETE/SETNE alone were 5.3% of every amd64 interpreter
