@@ -10286,6 +10286,57 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
+    // Native <alu> reg, r/m -- register destination, memory source: ADD (03),
+    // OR (0b), AND (23), SUB (2b), XOR (33), CMP (3b), 32/64-bit, mod!=3.
+    // Everything here used to go through amd64_jit_mem_op, which is the only
+    // implementation the JIT had for this whole family; `sub 2b` alone was 6.7%
+    // of all remaining bridges after the FS work.
+    //
+    // Memory is READ-ONLY in this direction, so there is no write prep and no
+    // store -- much simpler than the imm-to-mem family, and nothing to undo if
+    // a write would have faulted. ADC (13) and SBB (1b) are excluded: they take
+    // CF as an input, which this shape does not carry. The rm-destination
+    // direction (01/09/21/29/31/39) still bridges -- it is a read-modify-write
+    // and needs the write path.
+    if (!insn.two_byte_opcode && !insn.address_size_prefix &&
+            !insn.lock_prefix && !insn.operand_size_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
+            amd64_modrm_mod(insn.modrm) != 3 &&
+            insn.opcode < 0x40 && (insn.opcode & 7) == 3 &&
+            ((insn.opcode >> 3) & 7) != 2 && ((insn.opcode >> 3) & 7) != 3) {
+        unsigned group = (insn.opcode >> 3) & 7;
+        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        extern void gadget_amd64_regmem_arith32(void), gadget_amd64_regmem_arith64(void);
+        extern void gadget_amd64_regmem_logic32(void), gadget_amd64_regmem_logic64(void);
+        extern void gadget_amd64_regmem_cmp32(void), gadget_amd64_regmem_cmp64(void);
+        void (*g)(void);
+        if (group == 7)
+            g = (size == 64) ? gadget_amd64_regmem_cmp64 : gadget_amd64_regmem_cmp32;
+        else if (group == 0 || group == 5)
+            g = (size == 64) ? gadget_amd64_regmem_arith64 : gadget_amd64_regmem_arith32;
+        else
+            g = (size == 64) ? gadget_amd64_regmem_logic64 : gadget_amd64_regmem_logic32;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("regmem-alu ip=%llx op=%02x group=%u size=%u next=%llx",
+                (unsigned long long) insn.start_ip, insn.opcode, group, size,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen(state, (unsigned long) g);
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen(state, (unsigned long) group);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     if (!insn.two_byte_opcode &&
             !insn.address_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&

@@ -4467,6 +4467,151 @@ amd64_gen_adcsbb_ri adcsbb_ri64, 8, 63
     amd64_vwrite_bullshit \vbytes, \name\()_w
 .endm
 
+# <alu> reg, r/m -- REGISTER destination, memory source: 0x03 add, 0x0b or,
+# 0x23 and, 0x2b sub, 0x33 xor, 0x3b cmp.
+#
+# Simpler than the imm-to-mem family above because memory is READ-ONLY here:
+# no write prep, no store, and nothing to undo if the write would have faulted.
+# `sub 2b` alone was 6.7% of all remaining interpreter bridges after the FS
+# work, because every one of these had to go through amd64_jit_mem_op.
+#
+# Register contract for the flag macros: x13 = lhs (the register), x10 = rhs
+# (the memory value), x15 = result, w14 = CF, w16 = OF. Same as the imm family,
+# with lhs and rhs swapped in origin -- there the memory operand is the
+# destination, here it is the source.
+#
+# meta must be re-read from [_ip] after amd64_vread_prep, which clobbers x8.
+# Operands: [meta][disp][next_ip][group]. gret 4.
+.macro amd64_gen_regmem_arith name, vbytes, sbit
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w10, [x9]
+.else
+    ldr  x10, [x9]
+.endif
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x12, lsl 3]
+    ldr  x9, [_ip, 24]
+.if \vbytes == 4
+    mov  w13, w13
+    mov  w10, w10
+    cmp  x9, 0
+    b.eq 1f
+    subs w15, w13, w10
+    cset w14, cc
+    cset w16, vs
+    b    2f
+1:  adds w15, w13, w10
+    cset w14, cs
+    cset w16, vs
+2:  mov  w15, w15
+.else
+    cmp  x9, 0
+    b.eq 1f
+    subs x15, x13, x10
+    cset w14, cc
+    cset w16, vs
+    b    2f
+1:  adds x15, x13, x10
+    cset w14, cs
+    cset w16, vs
+2:
+.endif
+    amd64_cached_set_addsub_flags \sbit
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x12, lsl 3]
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+
+# CMP reg, r/m (0x3b): identical to the subtract above but with no write back.
+.macro amd64_gen_regmem_cmp name, vbytes, sbit
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w10, [x9]
+.else
+    ldr  x10, [x9]
+.endif
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x12, lsl 3]
+.if \vbytes == 4
+    mov  w13, w13
+    mov  w10, w10
+    subs w15, w13, w10
+    cset w14, cc
+    cset w16, vs
+    mov  w15, w15
+.else
+    subs x15, x13, x10
+    cset w14, cc
+    cset w16, vs
+.endif
+    amd64_cached_set_addsub_flags \sbit
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+
+# <logic> reg, r/m: 0x0b or, 0x23 and, 0x33 xor. Clears CF and OF.
+.macro amd64_gen_regmem_logic name, vbytes, ssize
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w10, [x9]
+.else
+    ldr  x10, [x9]
+.endif
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x12, lsl 3]
+    ldr  x9, [_ip, 24]
+    cmp  x9, 4
+    b.eq 1f
+    cmp  x9, 6
+    b.eq 2f
+    orr  x15, x13, x10
+    b    3f
+1:  and  x15, x13, x10
+    b    3f
+2:  eor  x15, x13, x10
+3:
+.if \vbytes == 4
+    mov  w15, w15
+.endif
+    mov  x11, \ssize
+    amd64_cached_set_logic_flags x15, x11
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x12, lsl 3]
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+
+amd64_gen_regmem_arith regmem_arith32, 4, 31
+amd64_gen_regmem_arith regmem_arith64, 8, 63
+amd64_gen_regmem_cmp   regmem_cmp32,   4, 31
+amd64_gen_regmem_cmp   regmem_cmp64,   8, 63
+amd64_gen_regmem_logic regmem_logic32, 4, 32
+amd64_gen_regmem_logic regmem_logic64, 8, 64
+
 amd64_gen_imm_arith imm_arith32, 4, 31
 amd64_gen_imm_arith imm_arith64, 8, 63
 
