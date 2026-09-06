@@ -3004,6 +3004,17 @@ amd64_vmem_segfault_read:
     ldr  x14, [_ip, 16]
     add  x9, x9, x14
 7003:
+    /* AMD64_JIT_MEM_FS (bit 33): an %fs-relative address, which in long mode is
+       just a flat base added to the effective address. Without this every
+       FS-prefixed memory instruction had to bridge -- and that is nearly all of
+       them in threaded code, because the stack-protector canary at %fs:0x28 and
+       every __thread variable go through it. Measured on a 4-thread pthread
+       workload it was 22% of ALL interpreter bridges: mov 8b 12.3%, sub 2b
+       5.3%, mov 89 3.0%, xor 33 1.3%. */
+    tbz  x8, 33, 7004f
+    ldr  x14, [_cpu, CPU_tls_ptr]
+    add  x9, x9, x14
+7004:
 .endm
 
 # movaps/movups xmm, m128 (0F 28 / 0F 10): cpu->xmm[reg] = [addr]

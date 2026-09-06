@@ -6097,8 +6097,10 @@ static void amd64_bridge_dump(void) {
             ? info.dli_sname : "?";
         unsigned long pm = amd64_bridge_total
             ? (1000UL * amd64_bridge_count[i] / amd64_bridge_total) : 0;
-        fprintf(stderr, "[amd64-bridges]   %-24s op=%02lx  %lu  (%lu.%lu%%)\n",
-                name, amd64_bridge_arg0[i], amd64_bridge_count[i], pm / 10, pm % 10);
+        fprintf(stderr, "[amd64-bridges]   %-24s op=%02lx%s  %lu  (%lu.%lu%%)\n",
+                name, amd64_bridge_arg0[i] & 0xff,
+                (amd64_bridge_arg0[i] & 0x100) ? " FS" : "   ",
+                amd64_bridge_count[i], pm / 10, pm % 10);
     }
 }
 
@@ -6122,7 +6124,7 @@ static void amd64_bridge_note(void *helper, unsigned long arg0) {
 static void gen_amd64_helper_tlb_2_retint(struct gen_state *state, void *helper,
         unsigned long arg0, unsigned long arg1) {
     extern void gadget_helper_tlb_2_retint(void);
-    amd64_bridge_note(helper, arg0 & 0xff);
+    amd64_bridge_note(helper, (arg0 & 0xff) | ((arg0 & AMD64_JIT_MEM_FS) ? 0x100 : 0));
     gen_amd64_flush_reg_cache(state);
     gen_amd64_flush_rip(state);
     gen(state, (unsigned long) gadget_helper_tlb_2_retint);
@@ -6134,7 +6136,7 @@ static void gen_amd64_helper_tlb_2_retint(struct gen_state *state, void *helper,
 static void gen_amd64_helper_tlb_3_retint(struct gen_state *state, void *helper,
         unsigned long arg0, unsigned long arg1, unsigned long arg2) {
     extern void gadget_helper_tlb_3_retint(void);
-    amd64_bridge_note(helper, arg0 & 0xff);
+    amd64_bridge_note(helper, (arg0 & 0xff) | ((arg0 & AMD64_JIT_MEM_FS) ? 0x100 : 0));
     gen_amd64_flush_reg_cache(state);
     gen_amd64_flush_rip(state);
     gen(state, (unsigned long) gadget_helper_tlb_3_retint);
@@ -10036,10 +10038,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     // CPU_amd64_regs and the destination reg is written there too. Per-size gadget
     // keeps the vread/vwrite size literal (correct cross-page staging). The byte
     // gadgets handle the AH/CH/DH/BH high-byte aliasing (modrm.reg 4-7 without REX)
-    // via meta's REX_PRESENT bit. FS-prefix and address-size forms keep bridging
-    // (amd64_vmem_addr adds no tls_ptr).
+    // via meta's REX_PRESENT bit. The FS prefix is now handled natively --
+    // amd64_vmem_addr adds cpu->tls_ptr for it -- which matters more than it
+    // sounds: %fs:0x28 is the stack-protector canary and every __thread
+    // variable is FS-relative, so this was 12.3% of all interpreter bridges for
+    // opcode 8b alone. Address-size forms still bridge.
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
-            !insn.fs_prefix && !insn.lock_prefix &&
+            !insn.lock_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             amd64_modrm_mod(insn.modrm) != 3 &&
             (insn.opcode == 0x88 || insn.opcode == 0x89 ||
