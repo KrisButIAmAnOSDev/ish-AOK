@@ -7671,6 +7671,340 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
+    // ---- SSE2 integer ops, 66 0F xx, register AND memory sources, table driven.
+    // Reg forms touch only cpu->xmm[] (no flush, rip deferred); mem forms read 16
+    // bytes through the vector prep (reg cache and rip flushed first). Ops the older
+    // reg-reg arm above already takes are also listed so the memory form lands here.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix && insn.operand_size_prefix &&
+            insn.rep_mode == amd64_jit_rep_none) {
+        extern void gadget_amd64_v_punpcklbw_reg(void), gadget_amd64_v_punpcklbw_mem(void);
+        extern void gadget_amd64_v_punpcklwd_reg(void), gadget_amd64_v_punpcklwd_mem(void);
+        extern void gadget_amd64_v_punpckldq_reg(void), gadget_amd64_v_punpckldq_mem(void);
+        extern void gadget_amd64_v_packsswb_reg(void), gadget_amd64_v_packsswb_mem(void);
+        extern void gadget_amd64_v_pcmpgtb_reg(void), gadget_amd64_v_pcmpgtb_mem(void);
+        extern void gadget_amd64_v_pcmpgtw_reg(void), gadget_amd64_v_pcmpgtw_mem(void);
+        extern void gadget_amd64_v_pcmpgtd_reg(void), gadget_amd64_v_pcmpgtd_mem(void);
+        extern void gadget_amd64_v_packuswb_reg(void), gadget_amd64_v_packuswb_mem(void);
+        extern void gadget_amd64_v_punpckhbw_reg(void), gadget_amd64_v_punpckhbw_mem(void);
+        extern void gadget_amd64_v_punpckhwd_reg(void), gadget_amd64_v_punpckhwd_mem(void);
+        extern void gadget_amd64_v_punpckhdq_reg(void), gadget_amd64_v_punpckhdq_mem(void);
+        extern void gadget_amd64_v_packssdw_reg(void), gadget_amd64_v_packssdw_mem(void);
+        extern void gadget_amd64_v_punpcklqdq_reg(void), gadget_amd64_v_punpcklqdq_mem(void);
+        extern void gadget_amd64_v_punpckhqdq_reg(void), gadget_amd64_v_punpckhqdq_mem(void);
+        extern void gadget_amd64_v_pcmpeqb_reg(void), gadget_amd64_v_pcmpeqb_mem(void);
+        extern void gadget_amd64_v_pcmpeqw_reg(void), gadget_amd64_v_pcmpeqw_mem(void);
+        extern void gadget_amd64_v_pcmpeqd_reg(void), gadget_amd64_v_pcmpeqd_mem(void);
+        extern void gadget_amd64_v_paddq_reg(void), gadget_amd64_v_paddq_mem(void);
+        extern void gadget_amd64_v_pmullw_reg(void), gadget_amd64_v_pmullw_mem(void);
+        extern void gadget_amd64_v_psubusb_reg(void), gadget_amd64_v_psubusb_mem(void);
+        extern void gadget_amd64_v_psubusw_reg(void), gadget_amd64_v_psubusw_mem(void);
+        extern void gadget_amd64_v_pminub_reg(void), gadget_amd64_v_pminub_mem(void);
+        extern void gadget_amd64_v_pand_reg(void), gadget_amd64_v_pand_mem(void);
+        extern void gadget_amd64_v_paddusb_reg(void), gadget_amd64_v_paddusb_mem(void);
+        extern void gadget_amd64_v_paddusw_reg(void), gadget_amd64_v_paddusw_mem(void);
+        extern void gadget_amd64_v_pmaxub_reg(void), gadget_amd64_v_pmaxub_mem(void);
+        extern void gadget_amd64_v_pandn_reg(void), gadget_amd64_v_pandn_mem(void);
+        extern void gadget_amd64_v_pavgb_reg(void), gadget_amd64_v_pavgb_mem(void);
+        extern void gadget_amd64_v_pavgw_reg(void), gadget_amd64_v_pavgw_mem(void);
+        extern void gadget_amd64_v_pminsw_reg(void), gadget_amd64_v_pminsw_mem(void);
+        extern void gadget_amd64_v_por_reg(void), gadget_amd64_v_por_mem(void);
+        extern void gadget_amd64_v_pmaxsw_reg(void), gadget_amd64_v_pmaxsw_mem(void);
+        extern void gadget_amd64_v_pxor_reg(void), gadget_amd64_v_pxor_mem(void);
+        extern void gadget_amd64_v_pmuludq_reg(void), gadget_amd64_v_pmuludq_mem(void);
+        extern void gadget_amd64_v_pmaddwd_reg(void), gadget_amd64_v_pmaddwd_mem(void);
+        extern void gadget_amd64_v_psadbw_reg(void), gadget_amd64_v_psadbw_mem(void);
+        extern void gadget_amd64_v_psubb_reg(void), gadget_amd64_v_psubb_mem(void);
+        extern void gadget_amd64_v_psubw_reg(void), gadget_amd64_v_psubw_mem(void);
+        extern void gadget_amd64_v_psubd_reg(void), gadget_amd64_v_psubd_mem(void);
+        extern void gadget_amd64_v_psubq_reg(void), gadget_amd64_v_psubq_mem(void);
+        extern void gadget_amd64_v_paddb_reg(void), gadget_amd64_v_paddb_mem(void);
+        extern void gadget_amd64_v_paddw_reg(void), gadget_amd64_v_paddw_mem(void);
+        extern void gadget_amd64_v_paddd_reg(void), gadget_amd64_v_paddd_mem(void);
+        static const struct { uint8_t op2; void (*reg)(void); void (*mem)(void); } v_tab[] = {
+            {0x60, gadget_amd64_v_punpcklbw_reg, gadget_amd64_v_punpcklbw_mem},
+            {0x61, gadget_amd64_v_punpcklwd_reg, gadget_amd64_v_punpcklwd_mem},
+            {0x62, gadget_amd64_v_punpckldq_reg, gadget_amd64_v_punpckldq_mem},
+            {0x63, gadget_amd64_v_packsswb_reg, gadget_amd64_v_packsswb_mem},
+            {0x64, gadget_amd64_v_pcmpgtb_reg, gadget_amd64_v_pcmpgtb_mem},
+            {0x65, gadget_amd64_v_pcmpgtw_reg, gadget_amd64_v_pcmpgtw_mem},
+            {0x66, gadget_amd64_v_pcmpgtd_reg, gadget_amd64_v_pcmpgtd_mem},
+            {0x67, gadget_amd64_v_packuswb_reg, gadget_amd64_v_packuswb_mem},
+            {0x68, gadget_amd64_v_punpckhbw_reg, gadget_amd64_v_punpckhbw_mem},
+            {0x69, gadget_amd64_v_punpckhwd_reg, gadget_amd64_v_punpckhwd_mem},
+            {0x6a, gadget_amd64_v_punpckhdq_reg, gadget_amd64_v_punpckhdq_mem},
+            {0x6b, gadget_amd64_v_packssdw_reg, gadget_amd64_v_packssdw_mem},
+            {0x6c, gadget_amd64_v_punpcklqdq_reg, gadget_amd64_v_punpcklqdq_mem},
+            {0x6d, gadget_amd64_v_punpckhqdq_reg, gadget_amd64_v_punpckhqdq_mem},
+            {0x74, gadget_amd64_v_pcmpeqb_reg, gadget_amd64_v_pcmpeqb_mem},
+            {0x75, gadget_amd64_v_pcmpeqw_reg, gadget_amd64_v_pcmpeqw_mem},
+            {0x76, gadget_amd64_v_pcmpeqd_reg, gadget_amd64_v_pcmpeqd_mem},
+            {0xd4, gadget_amd64_v_paddq_reg, gadget_amd64_v_paddq_mem},
+            {0xd5, gadget_amd64_v_pmullw_reg, gadget_amd64_v_pmullw_mem},
+            {0xd8, gadget_amd64_v_psubusb_reg, gadget_amd64_v_psubusb_mem},
+            {0xd9, gadget_amd64_v_psubusw_reg, gadget_amd64_v_psubusw_mem},
+            {0xda, gadget_amd64_v_pminub_reg, gadget_amd64_v_pminub_mem},
+            {0xdb, gadget_amd64_v_pand_reg, gadget_amd64_v_pand_mem},
+            {0xdc, gadget_amd64_v_paddusb_reg, gadget_amd64_v_paddusb_mem},
+            {0xdd, gadget_amd64_v_paddusw_reg, gadget_amd64_v_paddusw_mem},
+            {0xde, gadget_amd64_v_pmaxub_reg, gadget_amd64_v_pmaxub_mem},
+            {0xdf, gadget_amd64_v_pandn_reg, gadget_amd64_v_pandn_mem},
+            {0xe0, gadget_amd64_v_pavgb_reg, gadget_amd64_v_pavgb_mem},
+            {0xe3, gadget_amd64_v_pavgw_reg, gadget_amd64_v_pavgw_mem},
+            {0xea, gadget_amd64_v_pminsw_reg, gadget_amd64_v_pminsw_mem},
+            {0xeb, gadget_amd64_v_por_reg, gadget_amd64_v_por_mem},
+            {0xee, gadget_amd64_v_pmaxsw_reg, gadget_amd64_v_pmaxsw_mem},
+            {0xef, gadget_amd64_v_pxor_reg, gadget_amd64_v_pxor_mem},
+            {0xf4, gadget_amd64_v_pmuludq_reg, gadget_amd64_v_pmuludq_mem},
+            {0xf5, gadget_amd64_v_pmaddwd_reg, gadget_amd64_v_pmaddwd_mem},
+            {0xf6, gadget_amd64_v_psadbw_reg, gadget_amd64_v_psadbw_mem},
+            {0xf8, gadget_amd64_v_psubb_reg, gadget_amd64_v_psubb_mem},
+            {0xf9, gadget_amd64_v_psubw_reg, gadget_amd64_v_psubw_mem},
+            {0xfa, gadget_amd64_v_psubd_reg, gadget_amd64_v_psubd_mem},
+            {0xfb, gadget_amd64_v_psubq_reg, gadget_amd64_v_psubq_mem},
+            {0xfc, gadget_amd64_v_paddb_reg, gadget_amd64_v_paddb_mem},
+            {0xfd, gadget_amd64_v_paddw_reg, gadget_amd64_v_paddw_mem},
+            {0xfe, gadget_amd64_v_paddd_reg, gadget_amd64_v_paddd_mem},
+        };
+        const void *hit_reg = NULL, *hit_mem = NULL;
+        for (unsigned i = 0; i < sizeof v_tab / sizeof v_tab[0]; i++)
+            if (v_tab[i].op2 == insn.op2) { hit_reg = (const void *) v_tab[i].reg; hit_mem = (const void *) v_tab[i].mem; break; }
+        if (hit_reg != NULL && amd64_modrm_mod(insn.modrm) == 3 && !insn.fs_prefix) {
+            unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+            unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+            if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-int-reg op2=%02x ip=%llx src=%u dst=%u next=%llx",
+                    insn.op2, (unsigned long long) insn.start_ip, rm_id, reg_id,
+                    (unsigned long long) next_ip);
+            gen(state, (unsigned long) hit_reg);
+            gen(state, (unsigned long) (rm_id | (reg_id << 4)));
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+        if (hit_mem != NULL && amd64_modrm_mod(insn.modrm) != 3) {
+            unsigned long meta, disp;
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, 128, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-int-mem op2=%02x ip=%llx meta=%lx next=%llx",
+                    insn.op2, (unsigned long long) insn.start_ip, meta,
+                    (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) hit_mem);
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+    }
+
+    // ---- shuffles: shufps (0F C6), shufpd (66 0F C6), pshufd (66 0F 70), pshuflw
+    // (F2 0F 70), pshufhw (F3 0F 70). The imm8 becomes a 16-byte tbl index vector
+    // here, at compile time: tbl2 indexes {dst, src} (0-31), tbl1 the source alone.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix &&
+            ((insn.op2 == 0xc6 && insn.rep_mode == amd64_jit_rep_none) ||
+             (insn.op2 == 0x70 && (insn.operand_size_prefix ? insn.rep_mode == amd64_jit_rep_none
+                                                            : insn.rep_mode != amd64_jit_rep_none)))) {
+        // kind: 0 shufps, 1 shufpd, 2 pshufd, 3 pshuflw, 4 pshufhw
+        int kind = insn.op2 == 0xc6 ? (insn.operand_size_prefix ? 1 : 0)
+                 : (insn.operand_size_prefix ? 2 : (insn.rep_mode == amd64_jit_repnz ? 3 : 4));
+        bool two_src = kind <= 1;
+        bool is_mem = amd64_modrm_mod(insn.modrm) != 3;
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        unsigned long meta = 0, disp = 0;
+        if (is_mem) {
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, 128, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+        } else if (insn.fs_prefix) {
+            goto amd64_bridge_step;
+        } else if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        uint8_t imm;
+        if (!tlb_read(tlb, next_ip, &imm, sizeof(imm))) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        next_ip += sizeof(imm);
+        uint8_t idx[16];
+        for (unsigned i = 0; i < 16; i++) idx[i] = i;
+        switch (kind) {
+        case 0: for (unsigned k = 0; k < 4; k++) { unsigned sel = (imm >> (2 * k)) & 3;
+                    for (unsigned j = 0; j < 4; j++) idx[4 * k + j] = (k < 2 ? 0 : 16) + 4 * sel + j; } break;
+        case 1: for (unsigned k = 0; k < 2; k++) { unsigned sel = (imm >> k) & 1;
+                    for (unsigned j = 0; j < 8; j++) idx[8 * k + j] = (k == 0 ? 0 : 16) + 8 * sel + j; } break;
+        case 2: for (unsigned k = 0; k < 4; k++) { unsigned sel = (imm >> (2 * k)) & 3;
+                    for (unsigned j = 0; j < 4; j++) idx[4 * k + j] = 4 * sel + j; } break;
+        case 3: for (unsigned k = 0; k < 4; k++) { unsigned sel = (imm >> (2 * k)) & 3;
+                    for (unsigned j = 0; j < 2; j++) idx[2 * k + j] = 2 * sel + j; } break;
+        default: for (unsigned k = 0; k < 4; k++) { unsigned sel = (imm >> (2 * k)) & 3;
+                    for (unsigned j = 0; j < 2; j++) idx[8 + 2 * k + j] = 8 + 2 * sel + j; } break;
+        }
+        unsigned long lo = 0, hi = 0;
+        for (unsigned i = 0; i < 8; i++) { lo |= (unsigned long) idx[i] << (8 * i); hi |= (unsigned long) idx[8 + i] << (8 * i); }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("v-shuf kind=%d ip=%llx imm=%02x mem=%d src=%u dst=%u next=%llx",
+                kind, (unsigned long long) insn.start_ip, imm, is_mem, rm_id, reg_id,
+                (unsigned long long) next_ip);
+        extern void gadget_amd64_v_tbl2_reg(void), gadget_amd64_v_tbl2_mem(void),
+                gadget_amd64_v_tbl1_reg(void), gadget_amd64_v_tbl1_mem(void);
+        if (is_mem) {
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) (two_src ? gadget_amd64_v_tbl2_mem : gadget_amd64_v_tbl1_mem));
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+        } else {
+            gen(state, (unsigned long) (two_src ? gadget_amd64_v_tbl2_reg : gadget_amd64_v_tbl1_reg));
+            gen(state, (unsigned long) (rm_id | (reg_id << 4)));
+        }
+        gen(state, lo);
+        gen(state, hi);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
+    // ---- pextrw r32, xmm, imm8 (66 0F C5, mod==3) / pinsrw xmm, r32|m16, imm8 (66 0F C4).
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix && insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            (insn.op2 == 0xc5 || insn.op2 == 0xc4) &&
+            (insn.op2 == 0xc4 || amd64_modrm_mod(insn.modrm) == 3)) {
+        bool is_mem = amd64_modrm_mod(insn.modrm) != 3;
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        unsigned long meta = 0, disp = 0;
+        if (is_mem) {
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, 16, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+        } else if (insn.fs_prefix) {
+            goto amd64_bridge_step;
+        } else if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        uint8_t imm;
+        if (!tlb_read(tlb, next_ip, &imm, sizeof(imm))) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        next_ip += sizeof(imm);
+        unsigned lane = imm & 7;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("v-pextr/insrw op2=%02x ip=%llx lane=%u mem=%d rm=%u reg=%u next=%llx",
+                insn.op2, (unsigned long long) insn.start_ip, lane, is_mem, rm_id, reg_id,
+                (unsigned long long) next_ip);
+        extern void gadget_amd64_v_pextrw(void), gadget_amd64_v_pinsrw_reg(void), gadget_amd64_v_pinsrw_mem(void);
+        gen_amd64_flush_reg_cache(state);
+        if (is_mem) {
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) gadget_amd64_v_pinsrw_mem);
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            gen(state, (unsigned long) lane);
+        } else if (insn.op2 == 0xc5) {
+            gen(state, (unsigned long) gadget_amd64_v_pextrw);
+            gen(state, (unsigned long) (rm_id | (reg_id << 4) | (lane << 8)));
+        } else {
+            gen(state, (unsigned long) gadget_amd64_v_pinsrw_reg);
+            gen(state, (unsigned long) (rm_id | (reg_id << 4) | (lane << 8)));
+        }
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
+    // ---- comiss/ucomiss (0F 2F/2E) and comisd/ucomisd (66 ...): ZF/PF/CF from an
+    // ordered compare, the rest cleared. Register or 4/8-byte memory source.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            (insn.op2 == 0x2e || insn.op2 == 0x2f)) {
+        bool is_mem = amd64_modrm_mod(insn.modrm) != 3;
+        bool dbl = insn.operand_size_prefix;
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        extern void gadget_amd64_v_comiss_reg(void), gadget_amd64_v_comiss_mem(void),
+                gadget_amd64_v_comisd_reg(void), gadget_amd64_v_comisd_mem(void);
+        if (is_mem) {
+            unsigned long meta, disp;
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, dbl ? 64 : 32, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-comis-mem op2=%02x dbl=%d ip=%llx next=%llx", insn.op2, dbl,
+                    (unsigned long long) insn.start_ip, (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) (dbl ? gadget_amd64_v_comisd_mem : gadget_amd64_v_comiss_mem));
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+        if (!insn.fs_prefix) {
+            if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-comis-reg op2=%02x dbl=%d ip=%llx src=%u dst=%u next=%llx", insn.op2, dbl,
+                    (unsigned long long) insn.start_ip, rm_id, reg_id, (unsigned long long) next_ip);
+            gen(state, (unsigned long) (dbl ? gadget_amd64_v_comisd_reg : gadget_amd64_v_comiss_reg));
+            gen(state, (unsigned long) (rm_id | (reg_id << 4)));
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+    }
+
+    // ---- movhlps (0F 12, mod==3): dst.low = src.high; movlhps (0F 16, mod==3): dst.high = src.low.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix && !insn.fs_prefix && !insn.operand_size_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && amd64_modrm_mod(insn.modrm) == 3 &&
+            (insn.op2 == 0x12 || insn.op2 == 0x16)) {
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("v-movhlps/lhps op2=%02x ip=%llx src=%u dst=%u next=%llx", insn.op2,
+                (unsigned long long) insn.start_ip, rm_id, reg_id, (unsigned long long) next_ip);
+        extern void gadget_amd64_v_movhlps_reg(void), gadget_amd64_v_movlhps_reg(void);
+        gen(state, (unsigned long) (insn.op2 == 0x12 ? gadget_amd64_v_movhlps_reg : gadget_amd64_v_movlhps_reg));
+        gen(state, (unsigned long) (rm_id | (reg_id << 4)));
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     // 0F 57 xorps / 66 0F 57 xorpd, mod==3: a 128-bit bitwise XOR either way, so
     // no operand-size-prefix gating (unlike the SSE2 integer ops above). A rep
     // prefix is #UD — left to the bridge.

@@ -6726,3 +6726,413 @@ amd64_gen_test_mem_imm test_mem_imm64, 8
     amd64_gen_cmov_mem \cond, \cond, , 8
     amd64_gen_cmov_mem \cond, \cond, n, 8
 .endr
+
+# ===========================================================================
+# Round 3b: the SSE2 integer family with register AND memory sources, the
+# shuffles (table-driven), pextrw/pinsrw, comis/ucomis, movhlps/movlhps.
+#
+# Conventions (as the vector gadgets above): reg forms take one operand word,
+# src xmm id in bits 0-3 and dst in 4-7, touch only cpu->xmm[] and leave the
+# GPR cache alone (gret 1). Mem forms take [meta][disp][next_ip] with the dst
+# xmm id in meta bits 8-11 and read 16 bytes through amd64_vread_prep 16
+# (gret 3); gen.c flushes the reg cache and rip before them. NEON v0-v3 are
+# scratch and dead after gret.
+# ===========================================================================
+
+# dst = dst OP src, one NEON instruction over the given arrangement.
+.macro amd64_v_nbin name, op, arr
+    .gadget amd64_v_\name\()_reg
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        add  x11, _cpu, CPU_xmm
+        add  x9, x11, x9, lsl 4
+        add  x10, x11, x10, lsl 4
+        ldr  q0, [x10]
+        ldr  q1, [x9]
+        \op  v0.\arr, v0.\arr, v1.\arr
+        str  q0, [x10]
+        gret 1
+.endm
+.macro amd64_v_nbin_mem name, op, arr
+    .gadget amd64_v_\name\()_mem
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep 16, \name\()_mem
+        ldp  x12, x13, [x9]
+        fmov d1, x12
+        mov  v1.d[1], x13
+        add  x14, _cpu, CPU_xmm
+        add  x14, x14, x10, lsl 4
+        ldr  q0, [x14]
+        \op  v0.\arr, v0.\arr, v1.\arr
+        str  q0, [x14]
+        gret 3
+        amd64_vread_bullshit 16, \name\()_mem
+.endm
+# (paddw/psubusw/pcmpeqb/por/punpckl* already have _mem gadgets above.)
+# The operand order matters for the non-commutative ones: cmgt dst,src is
+# "dst > src" = pcmpgt; sub dst,src; zip2 dst,src interleaves the high halves
+# with dst's element first, which is punpckh's order.
+amd64_v_nbin     paddb,     add,    16b
+amd64_v_nbin_mem paddb,     add,    16b
+amd64_v_nbin     paddd,     add,    4s
+amd64_v_nbin_mem paddd,     add,    4s
+amd64_v_nbin_mem paddq,     add,    2d
+amd64_v_nbin_mem psubb,     sub,    16b
+amd64_v_nbin     psubw,     sub,    8h
+amd64_v_nbin_mem psubw,     sub,    8h
+amd64_v_nbin     psubd,     sub,    4s
+amd64_v_nbin_mem psubd,     sub,    4s
+amd64_v_nbin_mem psubq,     sub,    2d
+amd64_v_nbin     psubusb,   uqsub,  16b
+amd64_v_nbin_mem psubusb,   uqsub,  16b
+amd64_v_nbin     paddusb,   uqadd,  16b
+amd64_v_nbin_mem paddusb,   uqadd,  16b
+amd64_v_nbin     paddusw,   uqadd,  8h
+amd64_v_nbin_mem paddusw,   uqadd,  8h
+amd64_v_nbin     pcmpeqw,   cmeq,   8h
+amd64_v_nbin_mem pcmpeqw,   cmeq,   8h
+amd64_v_nbin     pcmpeqd,   cmeq,   4s
+amd64_v_nbin_mem pcmpeqd,   cmeq,   4s
+amd64_v_nbin     pcmpgtb,   cmgt,   16b
+amd64_v_nbin_mem pcmpgtb,   cmgt,   16b
+amd64_v_nbin     pcmpgtw,   cmgt,   8h
+amd64_v_nbin_mem pcmpgtw,   cmgt,   8h
+amd64_v_nbin     pcmpgtd,   cmgt,   4s
+amd64_v_nbin_mem pcmpgtd,   cmgt,   4s
+amd64_v_nbin     pminub,    umin,   16b
+amd64_v_nbin_mem pminub,    umin,   16b
+amd64_v_nbin     pmaxub,    umax,   16b
+amd64_v_nbin_mem pmaxub,    umax,   16b
+amd64_v_nbin     pminsw,    smin,   8h
+amd64_v_nbin_mem pminsw,    smin,   8h
+amd64_v_nbin     pmaxsw,    smax,   8h
+amd64_v_nbin_mem pmaxsw,    smax,   8h
+amd64_v_nbin     pavgb,     urhadd, 16b
+amd64_v_nbin_mem pavgb,     urhadd, 16b
+amd64_v_nbin     pavgw,     urhadd, 8h
+amd64_v_nbin_mem pavgw,     urhadd, 8h
+amd64_v_nbin     pmullw,    mul,    8h
+amd64_v_nbin_mem pmullw,    mul,    8h
+amd64_v_nbin     pand,      and,    16b
+amd64_v_nbin_mem pand,      and,    16b
+amd64_v_nbin_mem pxor,      eor,    16b
+amd64_v_nbin     punpckhbw, zip2,   16b
+amd64_v_nbin_mem punpckhbw, zip2,   16b
+amd64_v_nbin     punpckhwd, zip2,   8h
+amd64_v_nbin_mem punpckhwd, zip2,   8h
+amd64_v_nbin     punpckhdq, zip2,   4s
+amd64_v_nbin_mem punpckhdq, zip2,   4s
+amd64_v_nbin     punpckhqdq, zip2,  2d
+amd64_v_nbin_mem punpckhqdq, zip2,  2d
+
+# pandn: dst = ~dst & src = bic src, dst (bic Vd, Vn, Vm = Vn & ~Vm).
+.gadget amd64_v_pandn_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x11, _cpu, CPU_xmm
+    add  x9, x11, x9, lsl 4
+    add  x10, x11, x10, lsl 4
+    ldr  q0, [x10]
+    ldr  q1, [x9]
+    bic  v0.16b, v1.16b, v0.16b
+    str  q0, [x10]
+    gret 1
+.gadget amd64_v_pandn_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    ubfx x10, x8, 8, 4
+    amd64_vmem_addr
+    amd64_vread_prep 16, pandn_mem
+    ldp  x12, x13, [x9]
+    fmov d1, x12
+    mov  v1.d[1], x13
+    add  x14, _cpu, CPU_xmm
+    add  x14, x14, x10, lsl 4
+    ldr  q0, [x14]
+    bic  v0.16b, v1.16b, v0.16b
+    str  q0, [x14]
+    gret 3
+    amd64_vread_bullshit 16, pandn_mem
+
+# The multi-instruction bodies share one reg/mem frame: \body sees v0 = dst,
+# v1 = src and leaves the result in v0.
+.macro amd64_v_nbody name, body
+    .gadget amd64_v_\name\()_reg
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        add  x11, _cpu, CPU_xmm
+        add  x9, x11, x9, lsl 4
+        add  x10, x11, x10, lsl 4
+        ldr  q0, [x10]
+        ldr  q1, [x9]
+        \body
+        str  q0, [x10]
+        gret 1
+    .gadget amd64_v_\name\()_mem
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep 16, \name\()_mem
+        ldp  x12, x13, [x9]
+        fmov d1, x12
+        mov  v1.d[1], x13
+        add  x14, _cpu, CPU_xmm
+        add  x14, x14, x10, lsl 4
+        ldr  q0, [x14]
+        \body
+        str  q0, [x14]
+        gret 3
+        amd64_vread_bullshit 16, \name\()_mem
+.endm
+# pmuludq: two 32x32->64 products of the LOW dword of each qword lane.
+.macro amd64_vb_pmuludq
+    uzp1 v2.4s, v0.4s, v0.4s
+    uzp1 v3.4s, v1.4s, v1.4s
+    umull v0.2d, v2.2s, v3.2s
+.endm
+amd64_v_nbody pmuludq, amd64_vb_pmuludq
+# packuswb: dst = {sat_u8(dst.8h), sat_u8(src.8h)}; packsswb/packssdw signed.
+.macro amd64_vb_packuswb
+    sqxtun  v2.8b, v0.8h
+    sqxtun2 v2.16b, v1.8h
+    mov  v0.16b, v2.16b
+.endm
+amd64_v_nbody packuswb, amd64_vb_packuswb
+.macro amd64_vb_packsswb
+    sqxtn  v2.8b, v0.8h
+    sqxtn2 v2.16b, v1.8h
+    mov  v0.16b, v2.16b
+.endm
+amd64_v_nbody packsswb, amd64_vb_packsswb
+.macro amd64_vb_packssdw
+    sqxtn  v2.4h, v0.4s
+    sqxtn2 v2.8h, v1.4s
+    mov  v0.16b, v2.16b
+.endm
+amd64_v_nbody packssdw, amd64_vb_packssdw
+# psadbw: per 8-byte half, the sum of absolute byte differences into a 16-bit
+# value in the low bits of each qword lane.
+.macro amd64_vb_psadbw
+    uabdl  v2.8h, v0.8b, v1.8b
+    uabdl2 v3.8h, v0.16b, v1.16b
+    uaddlv s2, v2.8h
+    uaddlv s3, v3.8h
+    fmov w12, s2
+    fmov w13, s3
+    fmov d0, x12
+    mov  v0.d[1], x13
+.endm
+amd64_v_nbody psadbw, amd64_vb_psadbw
+# pmaddwd: adjacent signed 16x16 products summed into dwords.
+.macro amd64_vb_pmaddwd
+    smull  v2.4s, v0.4h, v1.4h
+    smull2 v3.4s, v0.8h, v1.8h
+    addp   v0.4s, v2.4s, v3.4s
+.endm
+amd64_v_nbody pmaddwd, amd64_vb_pmaddwd
+
+# Shuffles, table driven: gen.c turns the imm8 into a 16-byte tbl index vector
+# (two operand words) at compile time. tbl2 indexes a {dst, src} pair (0-31,
+# for shufps/shufpd: low lanes from dst, high lanes from src); tbl1 indexes
+# the source alone (pshufd/pshuflw/pshufhw). Reg: [packed][idx_lo][idx_hi],
+# gret 3. Mem: [meta][disp][next_ip][idx_lo][idx_hi], gret 5.
+.gadget amd64_v_tbl2_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x11, _cpu, CPU_xmm
+    add  x9, x11, x9, lsl 4
+    add  x10, x11, x10, lsl 4
+    ldr  q0, [x10]
+    ldr  q1, [x9]
+    ldr  q2, [_ip, 8]
+    tbl  v0.16b, {v0.16b, v1.16b}, v2.16b
+    str  q0, [x10]
+    gret 3
+.gadget amd64_v_tbl2_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    ubfx x10, x8, 8, 4
+    amd64_vmem_addr
+    amd64_vread_prep 16, tbl2_mem
+    ldp  x12, x13, [x9]
+    fmov d1, x12
+    mov  v1.d[1], x13
+    add  x14, _cpu, CPU_xmm
+    add  x14, x14, x10, lsl 4
+    ldr  q0, [x14]
+    ldr  q2, [_ip, 24]
+    tbl  v0.16b, {v0.16b, v1.16b}, v2.16b
+    str  q0, [x14]
+    gret 5
+    amd64_vread_bullshit 16, tbl2_mem
+.gadget amd64_v_tbl1_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x11, _cpu, CPU_xmm
+    add  x9, x11, x9, lsl 4
+    add  x10, x11, x10, lsl 4
+    ldr  q1, [x9]
+    ldr  q2, [_ip, 8]
+    tbl  v0.16b, {v1.16b}, v2.16b
+    str  q0, [x10]
+    gret 3
+.gadget amd64_v_tbl1_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    ubfx x10, x8, 8, 4
+    amd64_vmem_addr
+    amd64_vread_prep 16, tbl1_mem
+    ldp  x12, x13, [x9]
+    fmov d1, x12
+    mov  v1.d[1], x13
+    add  x14, _cpu, CPU_xmm
+    add  x14, x14, x10, lsl 4
+    ldr  q2, [_ip, 24]
+    tbl  v0.16b, {v1.16b}, v2.16b
+    str  q0, [x14]
+    gret 5
+    amd64_vread_bullshit 16, tbl1_mem
+
+# pextrw r32, xmm, imm8 (66 0F C5): a halfword out of the xmm image, zero-
+# extended into the GPR. Flush style (writes a GPR).
+# packed = src xmm(0-3) | dst gpr(4-7) | lane(8-10). gret 1.
+.gadget amd64_v_pextrw
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    ubfx x11, x8, 8, 3
+    add  x12, _cpu, CPU_xmm
+    add  x12, x12, x9, lsl 4
+    ldrh w13, [x12, x11, lsl 1]
+    add  x14, _cpu, CPU_amd64_regs
+    str  x13, [x14, x10, lsl 3]
+    gret 1
+# pinsrw xmm, r32, imm8 (66 0F C4, mod==3): the low halfword of the GPR into
+# lane imm&7. packed = src gpr(0-3) | dst xmm(4-7) | lane(8-10). gret 1.
+.gadget amd64_v_pinsrw_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    ubfx x11, x8, 8, 3
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x9, lsl 3]
+    add  x12, _cpu, CPU_xmm
+    add  x12, x12, x10, lsl 4
+    strh w13, [x12, x11, lsl 1]
+    gret 1
+# pinsrw xmm, m16, imm8: [meta][disp][next_ip][lane]. gret 4.
+.gadget amd64_v_pinsrw_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    ubfx x10, x8, 8, 4
+    amd64_vmem_addr
+    amd64_vread_prep 2, pinsrw_mem
+    ldrh w13, [x9]
+    ldr  x11, [_ip, 24]
+    add  x12, _cpu, CPU_xmm
+    add  x12, x12, x10, lsl 4
+    strh w13, [x12, x11, lsl 1]
+    gret 4
+    amd64_vread_bullshit 2, pinsrw_mem
+
+# comiss/ucomiss (0F 2F/2E) and comisd/ucomisd (66 ...): ZF/PF/CF from an
+# ordered compare -- unordered sets all three, less sets CF, equal sets ZF --
+# and OF/SF/AF cleared. Written straight into eflags (and the CF/OF bytes),
+# lazy bits cleared. \fcmp is "fcmp s0, s1" or "fcmp d0, d1".
+.macro amd64_v_comis_flags
+    /* NZCV after fcmp: unordered -> C=1,V=1; lt -> N=1; eq -> Z=1; gt -> C=1 */
+    mov  w15, 0
+    b.vc 1f
+    mov  w15, (1 | (1 << 2) | (1 << 6))     /* unordered: CF|PF|ZF */
+    b    3f
+1:  b.pl 2f
+    mov  w15, 1                              /* less: CF */
+    b    3f
+2:  b.ne 3f
+    mov  w15, (1 << 6)                       /* equal: ZF */
+3:  ldr  w17, [_cpu, CPU_eflags]
+    mov  w16, (1 | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11))
+    bic  w17, w17, w16
+    orr  w17, w17, w15
+    str  w17, [_cpu, CPU_eflags]
+    and  w16, w15, 1
+    strb w16, [_cpu, CPU_cf]
+    strb wzr, [_cpu, CPU_of]
+    ldrb w16, [_cpu, CPU_flags_res]
+    bic  w16, w16, (ZF_RES | SF_RES | PF_RES | AF_OPS)
+    strb w16, [_cpu, CPU_flags_res]
+.endm
+.macro amd64_v_gen_comis name, vbytes
+    .gadget amd64_v_\name\()_reg
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        add  x11, _cpu, CPU_xmm
+        add  x9, x11, x9, lsl 4
+        add  x10, x11, x10, lsl 4
+    .if \vbytes == 4
+        ldr  s0, [x10]
+        ldr  s1, [x9]
+        fcmp s0, s1
+    .else
+        ldr  d0, [x10]
+        ldr  d1, [x9]
+        fcmp d0, d1
+    .endif
+        amd64_v_comis_flags
+        gret 1
+    .gadget amd64_v_\name\()_mem
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep \vbytes, \name\()_mem
+        add  x14, _cpu, CPU_xmm
+        add  x14, x14, x10, lsl 4
+    .if \vbytes == 4
+        ldr  s1, [x9]
+        ldr  s0, [x14]
+        fcmp s0, s1
+    .else
+        ldr  d1, [x9]
+        ldr  d0, [x14]
+        fcmp d0, d1
+    .endif
+        amd64_v_comis_flags
+        gret 3
+        amd64_vread_bullshit \vbytes, \name\()_mem
+.endm
+amd64_v_gen_comis comiss, 4
+amd64_v_gen_comis comisd, 8
+
+# movhlps (0F 12, mod==3): dst.low = src.high. movlhps (0F 16, mod==3):
+# dst.high = src.low. packed = src(0-3) | dst(4-7). gret 1.
+.gadget amd64_v_movhlps_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x11, _cpu, CPU_xmm
+    add  x9, x11, x9, lsl 4
+    add  x10, x11, x10, lsl 4
+    ldr  x12, [x9, 8]
+    str  x12, [x10]
+    gret 1
+.gadget amd64_v_movlhps_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x11, _cpu, CPU_xmm
+    add  x9, x11, x9, lsl 4
+    add  x10, x11, x10, lsl 4
+    ldr  x12, [x9]
+    str  x12, [x10, 8]
+    gret 1
