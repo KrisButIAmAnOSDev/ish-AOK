@@ -6990,6 +6990,35 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
 #endif
 
     // imul reg, rm (0F AF): high-reg / memory / 16-bit forms bridge to the helper.
+    // 0F B1 CMPXCHG [mem], reg, 32/64-bit, memory destination. Before the
+    // 0f-rm-helper arm, which otherwise claims it. The byte form (B0) and the
+    // 0x66 form keep bridging. A LOCK prefix changes nothing a single thread
+    // can observe and the helper is atomic regardless, so it is accepted.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            amd64_modrm_mod(insn.modrm) != 3 && insn.op2 == 0xb1) {
+        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        extern void gadget_amd64_cmpxchg_mem(void);
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("cmpxchg-mem ip=%llx size=%u next=%llx",
+                (unsigned long long) insn.start_ip, size, (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen(state, (unsigned long) gadget_amd64_cmpxchg_mem);
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen(state, (unsigned long) size);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     // 0F 40+cc CMOVcc r, r/m -- register source (mod==3). Before the
     // 0f-rm-helper arm, same as SETcc. The destination is written even when the
     // condition is false (see the gadget), which is what emu/amd64_interp.c had

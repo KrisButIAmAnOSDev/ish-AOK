@@ -4303,6 +4303,9 @@ static bool amd64_locked_alu(struct cpu_state *cpu, struct tlb *tlb,
 // ---------------------------------------------------------------------------
 static bool amd64_locked_xchg(struct cpu_state *cpu, struct tlb *tlb,
         qword_t guest_addr, unsigned size, qword_t value, qword_t *old_out);
+static bool amd64_locked_cmpxchg(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t guest_addr, unsigned size, qword_t expected, qword_t desired,
+        qword_t *old_out, bool *swapped_out);
 
 int amd64_jit_locked_alu_slow(struct cpu_state *cpu, struct tlb *tlb,
         qword_t guest_addr, unsigned size, unsigned alu_op, qword_t rhs) {
@@ -4315,6 +4318,33 @@ int amd64_jit_locked_xchg_slow(struct cpu_state *cpu, struct tlb *tlb,
         qword_t guest_addr, unsigned size, qword_t value, qword_t *old_out) {
     if (!amd64_locked_xchg(cpu, tlb, guest_addr, size, value, old_out))
         return INT_PF;
+    return 0;
+}
+
+// The whole CMPXCHG r/m, reg -- compare RAX with [mem], swap in the source
+// register if they are equal, otherwise load [mem] into RAX; flags come from
+// the compare (RAX - dst). amd64_locked_cmpxchg does the atomic swap (host CAS
+// when aligned, the global-mutex path when misaligned), and this wrapper adds
+// the flag and RAX/ZF bookkeeping the interpreter's own copy does inline, so
+// the native gadget stays a thin address-computing shell. The lock prefix does
+// not change the result a single thread sees, so both the locked and the plain
+// memory form route here.
+int amd64_jit_cmpxchg(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t guest_addr, unsigned size, qword_t src) {
+    qword_t acc = amd64_reg_get(cpu, amd64_rax, size);
+    qword_t dst = 0;
+    bool swapped = false;
+    if (!amd64_locked_cmpxchg(cpu, tlb, guest_addr, size, acc, src, &dst, &swapped))
+        return INT_PF;
+    qword_t result = amd64_trunc(acc - dst, size);
+    amd64_set_sub_flags(cpu, acc, dst, result, size);
+    if (swapped) {
+        cpu->zf = 1;
+    } else {
+        amd64_reg_set(cpu, amd64_rax, size, dst);
+        cpu->zf = 0;
+    }
+    cpu->zf_res = 0;   // ZF was just written explicitly, not deferred
     return 0;
 }
 

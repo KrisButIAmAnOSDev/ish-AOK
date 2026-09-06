@@ -4832,6 +4832,41 @@ amd64_gen_mov_imm_mem mov_imm_mem16, 2
 amd64_gen_mov_imm_mem mov_imm_mem32, 4
 amd64_gen_mov_imm_mem mov_imm_mem64, 8
 
+# CMPXCHG [mem], reg (0F B1), 32/64-bit -- the atomic compare-exchange that
+# every mutex and lock-free structure is built on; 6.1% of remaining bridges.
+# The gadget is a thin shell: it computes the address, fetches the source
+# register, and calls amd64_jit_cmpxchg, which owns the compare / conditional
+# swap / RAX-or-ZF bookkeeping and routes the swap itself through the same
+# host-CAS-or-mutex primitive the interpreter uses. Same pattern as pcmpistri:
+# the block stays native, the fiddly atomic core stays in verified C.
+#
+# _cpu is x1 and _tlb is x2, so the argument setup reads them BEFORE x1/x2 are
+# overwritten (the trap that bit both the pcmpistri and the lock_imm gadgets).
+# Operands: [meta][disp][next_ip][size]. gret 4.
+.gadget amd64_cmpxchg_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr                  /* x9 = guest effective address */
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4               /* src reg id */
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x12, lsl 3]      /* src value, read while _cpu is intact */
+    ldr  x11, [_ip, 24]              /* size in bits */
+    save_c
+    mov  x3, x11                     /* size */
+    mov  x4, x13                     /* src */
+    mov  x0, _cpu                    /* cpu   (reads x1) */
+    sub  x1, _tlb, TLB_entries       /* tlb   (reads x2) */
+    mov  x2, x9                      /* addr  (x2 now free) */
+    bl   NAME(amd64_jit_cmpxchg)
+    mov  x19, x0
+    restore_c
+    cbnz x19, 9f
+    gret 4
+9:  ldr  x0, [_ip, 16]
+    mov  eip, w0
+    b    jit_ret
+
 amd64_gen_imm_arith imm_arith32, 4, 31
 amd64_gen_imm_arith imm_arith64, 8, 63
 
