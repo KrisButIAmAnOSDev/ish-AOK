@@ -6247,3 +6247,263 @@ amd64_gen_imul_mem imul_mem32, 4, 0
 amd64_gen_imul_mem imul_mem64, 8, 0
 amd64_gen_imul_mem imul_imm_mem32, 4, 1
 amd64_gen_imul_mem imul_imm_mem64, 8, 1
+
+# ===========================================================================
+# Round 2: the bit-test family, any-register IMUL, CMP [mem], reg.
+# Flush style throughout (register cache flushed and invalidated before).
+# ===========================================================================
+
+# Set CF (and nothing else) from w14 (0/1): the CPU_cf byte the jump macro
+# reads, and bit 0 of eflags. BT/BTS/BTR/BTC define only CF; the interpreter
+# collapses the lazy flags first and leaves the rest as they were.
+.macro amd64_set_cf_only
+    strb w14, [_cpu, CPU_cf]
+    ldr  w17, [_cpu, CPU_eflags]
+    bic  w17, w17, 1
+    orr  w17, w17, w14
+    str  w17, [_cpu, CPU_eflags]
+.endm
+
+# Apply the bit op: x13 = value, x11 = bit (0..63), x8 bits 4-5 = op
+# (0 bt, 1 bts, 2 btr, 3 btc). Out: w14 = CF, x15 = new value (== x13 for bt).
+.macro amd64_bt_apply
+    lsr  x14, x13, x11
+    and  w14, w14, 1
+    mov  x16, 1
+    lsl  x16, x16, x11
+    ubfx x12, x8, 4, 2
+    mov  x15, x13
+    cmp  x12, 1
+    b.ne 1f
+    orr  x15, x13, x16               /* bts */
+    b    4f
+1:  cmp  x12, 2
+    b.ne 2f
+    bic  x15, x13, x16               /* btr */
+    b    4f
+2:  cmp  x12, 3
+    b.ne 4f
+    eor  x15, x13, x16               /* btc */
+4:
+.endm
+
+# BT/BTS/BTR/BTC r/m, r|imm8, register operand.
+# packed(0) = rm(0-3) | op(4-5) | is64(6) | idx_is_imm(7) | idx_reg(8-11) | imm(16-23).
+# The bit index is taken modulo the operand size, for both index forms. gret 1.
+.gadget amd64_bt_reg
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    add  x10, _cpu, CPU_amd64_regs
+    ldr  x13, [x10, x9, lsl 3]       /* value */
+    tbnz x8, 7, 1f
+    ubfx x11, x8, 8, 4
+    ldr  x11, [x10, x11, lsl 3]      /* index register */
+    b    2f
+1:  ubfx x11, x8, 16, 8              /* imm8 index */
+2:  tbnz x8, 6, 3f
+    and  x11, x11, 31
+    mov  w13, w13
+    b    4f
+3:  and  x11, x11, 63
+4:  amd64_bt_apply
+    ubfx x12, x8, 4, 2
+    cbz  x12, 5f                     /* bt: no write */
+    tbnz x8, 6, 6f
+    mov  w15, w15                    /* 32-bit result zero-extends */
+6:  str  x15, [x10, x9, lsl 3]
+5:  amd64_set_cf_only
+    gret 1
+
+# Memory operand. Operands: [meta][disp][next_ip][packed], packed = op(4-5) |
+# idx_is_imm(7) | idx_reg(8-11) | imm(16-23); the width is the gadget's.
+# Address rule: the register index is sign-extended to the operand size and its
+# element part (index >> log2 size) strides memory by the operand width; the
+# imm8 form addresses only the operand itself (bit = imm mod size, no stride --
+# hardware, checked on camd; the interpreter had this wrong too). The bit is
+# index mod size.
+# Computes the adjusted guest address in x9 and the bit in x11 before any prep.
+.macro amd64_bt_mem_index vbytes
+    ldr  x8, [_ip, 24]
+    tbnz x8, 7, 1f
+    ubfx x11, x8, 8, 4
+    add  x10, _cpu, CPU_amd64_regs
+    ldr  x11, [x10, x11, lsl 3]
+.if \vbytes == 4
+    sxtw x11, w11                    /* signed 32-bit index */
+    asr  x12, x11, 5
+    add  x9, x9, x12, lsl 2
+    and  x11, x11, 31
+.else
+    asr  x12, x11, 6
+    add  x9, x9, x12, lsl 3
+    and  x11, x11, 63
+.endif
+    b    2f
+1:  ubfx x11, x8, 16, 8              /* imm8: bit = imm mod size, NO memory stride */
+.if \vbytes == 4
+    and  x11, x11, 31
+.else
+    and  x11, x11, 63
+.endif
+2:
+.endm
+
+# BT [mem], idx: read only. gret 4.
+.macro amd64_gen_bt_mem name, vbytes
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_bt_mem_index \vbytes
+    mov  x0, x11                     /* bit survives the prep (x0 is not touched by it) */
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w13, [x9]
+.else
+    ldr  x13, [x9]
+.endif
+    lsr  x14, x13, x0
+    and  w14, w14, 1
+    amd64_set_cf_only
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+amd64_gen_bt_mem bt_mem32, 4
+amd64_gen_bt_mem bt_mem64, 8
+
+# BTS/BTR/BTC [mem], idx: dual-prep RMW. Only x0 is proven to survive a prep
+# (the imm_arith frame), and the prep slow path uses x19 itself, so the bit
+# rides in the top byte of x0 next to the (48-bit) guest address, and CF in
+# the top byte of x10 next to the result across the write prep. gret 4.
+.macro amd64_gen_btx_mem name, vbytes
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_bt_mem_index \vbytes
+    orr  x0, x9, x11, lsl 56         /* x0 = adjusted guest addr | bit << 56 */
+    amd64_vread_prep \vbytes, \name\()_r
+.if \vbytes == 4
+    ldr  w13, [x9]
+.else
+    ldr  x13, [x9]
+.endif
+    ldr  x8, [_ip, 24]
+    lsr  x11, x0, 56                 /* bit */
+    amd64_bt_apply
+    amd64_set_cf_only                /* flags before the write, as imm_arith does */
+.if \vbytes == 4
+    mov  w10, w15                    /* result -> x10 (survives the write prep) */
+.else
+    mov  x10, x15
+.endif
+    and  x9, x0, 0xffffffffffffff    /* guest addr */
+    amd64_vwrite_prep \vbytes, \name\()_w
+.if \vbytes == 4
+    str  w10, [x9]
+.else
+    str  x10, [x9]
+.endif
+    amd64_vwrite_done \vbytes, \name\()_w
+    gret 4
+    amd64_vread_bullshit \vbytes, \name\()_r
+    amd64_vwrite_bullshit \vbytes, \name\()_w
+.endm
+amd64_gen_btx_mem btx_mem32, 4
+amd64_gen_btx_mem btx_mem64, 8
+
+# IMUL for any register pair: the same multiply and CF=OF rule as
+# amd64_imul_body, reading and writing cpu->amd64_regs (flush style) so
+# r8-r15 work. In: x13 = src, x10 = other factor, x9 = dst slot, x12 = size.
+.macro amd64_imul_any_core
+    cmp  x12, 64
+    b.eq 8001f
+    sxtw x13, w13
+    sxtw x10, w10
+    mul  x14, x13, x10
+    sxtw x15, w14
+    cmp  x15, x14
+    cset w16, ne
+    mov  w15, w14
+    b    8002f
+8001:
+    mul  x15, x13, x10
+    smulh x14, x13, x10
+    asr  x17, x15, 63
+    cmp  x14, x17
+    cset w16, ne
+8002:
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x9, lsl 3]
+    strb w16, [_cpu, CPU_cf]
+    strb w16, [_cpu, CPU_of]
+    ldr  w17, [_cpu, CPU_eflags]
+    mov  w14, (1 | (1 << 11))
+    bic  w17, w17, w14
+    cbz  w16, 8003f
+    orr  w17, w17, w14
+8003:
+    str  w17, [_cpu, CPU_eflags]
+.endm
+
+# imul reg, rm (0F AF), reg form, any registers. packed(0) = dst(8-11) | src(12-15) |
+# size(16-22). gret 1.
+.gadget amd64_imul_reg_any
+    ldr  x8, [_ip]
+    ubfx x9, x8, 8, 4
+    ubfx x11, x8, 12, 4
+    ubfx x12, x8, 16, 7
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x11, lsl 3]
+    ldr  x10, [x14, x9, lsl 3]
+    amd64_imul_any_core
+    gret 1
+
+# imul reg, rm, imm (69/6B), reg form, any registers. packed(0) as above, imm(8). gret 2.
+.gadget amd64_imul_imm_any
+    ldr  x8, [_ip]
+    ldr  x10, [_ip, 8]
+    ubfx x9, x8, 8, 4
+    ubfx x11, x8, 12, 4
+    ubfx x12, x8, 16, 7
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x11, lsl 3]
+    amd64_imul_any_core
+    gret 2
+
+# CMP [mem], reg (0x39), 32/64: flags only, so the read path (a compare
+# against a read-only page must not fault as a write). lhs = memory, rhs =
+# register, the same eager addsub flags as regmem_cmp with the operands in
+# the other order. Operands: [meta][disp][next_ip][reg]. gret 4.
+.macro amd64_gen_cmp_memreg name, vbytes, sbit
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 4
+    ldr  w13, [x9]
+.else
+    ldr  x13, [x9]
+.endif
+    ldr  x12, [_ip, 24]
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x10, [x14, x12, lsl 3]
+.if \vbytes == 4
+    mov  w13, w13
+    mov  w10, w10
+    subs w15, w13, w10
+    cset w14, cc
+    cset w16, vs
+    mov  w15, w15
+.else
+    subs x15, x13, x10
+    cset w14, cc
+    cset w16, vs
+.endif
+    amd64_cached_set_addsub_flags \sbit
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+amd64_gen_cmp_memreg cmp_memreg32, 4, 31
+amd64_gen_cmp_memreg cmp_memreg64, 8, 63
