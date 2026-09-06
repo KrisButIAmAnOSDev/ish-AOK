@@ -21,8 +21,11 @@ void sockrestart_end_listen(struct fd *sock);
 void sockrestart_begin_listen_wait(struct fd *sock);
 void sockrestart_end_listen_wait(struct fd *sock);
 bool sockrestart_should_restart_listen_wait(int);
-void sockrestart_on_suspend(void);
-void sockrestart_on_resume(void);
+// Both return how many listening sockets they handled, so the caller can log
+// it. A save of 0 and a restore of 0 are the two states that look identical
+// from outside and mean completely different things.
+unsigned sockrestart_on_suspend(void);
+unsigned sockrestart_on_resume(void);
 
 struct fd_sockrestart {
     struct list listen;

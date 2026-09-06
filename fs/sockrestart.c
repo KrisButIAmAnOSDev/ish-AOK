@@ -93,9 +93,21 @@ static struct list saved_sockets = LIST_INITIALIZER(saved_sockets);
 
 // these should only be called from the main thread, but it's easiest to just lock for the whole time
 
-void sockrestart_on_suspend() {
+unsigned sockrestart_on_suspend() {
     lock(&sockrestart_lock, 0);
-    assert(list_empty(&saved_sockets));
+    // Idempotent, not asserted. This is now called when the app is
+    // BACKGROUNDED rather than when suspension is imminent, because iOS can
+    // tear the host sockets down before any "about to suspend" callback runs --
+    // which is exactly how the first version of this failed on a device: the
+    // listener died, the save had not happened yet, and resume had nothing to
+    // rebuild. Backgrounding can be reported more than once (per scene, and
+    // again if the app never actually suspends), so a second call with a
+    // populated list means "already saved" and must not abort.
+    if (!list_empty(&saved_sockets)) {
+        unlock(&sockrestart_lock);
+        return 0;
+    }
+    unsigned saved_count = 0;
     struct fd *sock;
     list_for_each_entry(&listen_fds, sock, sockrestart.listen) {
         struct saved_socket *saved = malloc(sizeof(struct saved_socket));
@@ -111,11 +123,13 @@ void sockrestart_on_suspend() {
         saved->name_len = sizeof(saved->name);
         getsockname(sock->real_fd, (struct sockaddr *) &saved->name, &saved->name_len);
         list_add(&saved_sockets, &saved->saved);
+        saved_count++;
     }
     unlock(&sockrestart_lock);
+    return saved_count;
 }
 
-void sockrestart_on_resume() {
+unsigned sockrestart_on_resume() {
     lock(&sockrestart_lock, 0);
     unsigned restored = 0;
     struct saved_socket *saved, *tmp;
@@ -127,6 +141,17 @@ void sockrestart_on_resume() {
                     saved->name_addr.sa_family, saved->type, saved->proto, strerror(errno));
             goto thank_u_next;
         }
+        // The socket being replaced is still open at saved->sock->real_fd --
+        // it is only closed by the dup2 below, and it cannot be closed sooner
+        // without giving up the fd number the server is using. So the address
+        // may still be considered taken, and a plain bind would fail with
+        // EADDRINUSE. This whole path had never run before, so nothing had
+        // ever surfaced that.
+        int reuse = 1;
+        setsockopt(new_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(new_sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
         if (bind(new_sock, (struct sockaddr *) &saved->name, saved->name_len) < 0) {
             printk("WARNING: rebinding socket failed: %s\n", strerror(errno));
             close(new_sock);
@@ -164,4 +189,5 @@ thank_u_next:
         }
     }
     unlock(&sockrestart_lock);
+    return restored;
 }
