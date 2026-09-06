@@ -228,6 +228,18 @@ bool jit_fuse_set_by_name(enum jit_fuse_arch arch, const char *name, bool on);
 
 bool amd64_jit_is_enabled(void);
 void amd64_jit_set_enabled(bool enabled);
+// Block-compile accounting for the amd64 frontend, published through
+// /proc/ish/amd64_jit. Every compile attempt ends in exactly one of these
+// three, so `attempts - successes - fallbacks` is the OOM count -- which is
+// what makes a reported zero trustworthy rather than merely quiet.
+//
+// It exists because the interpreter is being retired and "does the JIT ever
+// fail to compile a block?" is the question that decides what a failure has to
+// become. ISH_TRACE_AMD64_JIT_STATS only prints its histogram at eight or more
+// fallbacks and only to stderr, so it cannot tell a genuine zero from a small
+// number, which is the distinction that matters here.
+void amd64_jit_compile_stats(unsigned long *attempts, unsigned long *successes,
+        unsigned long *fallbacks);
 bool i386_single_step_comm_matches(const char *comm);
 void i386_single_step_comm_set(const char *comm);
 void i386_single_step_comm_get(char *buf, size_t bufsize);

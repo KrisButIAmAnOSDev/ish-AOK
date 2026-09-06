@@ -580,6 +580,17 @@ static int proc_ish_update_mem_release_probe(struct proc_entry *UNUSED(entry), s
 
 static int proc_ish_show_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%s\n", amd64_jit_preference_get() ? "on" : "off");
+    // Block-compile accounting, process-wide since boot. `fallbacks` is the
+    // number of blocks the JIT could not translate and handed to the
+    // interpreter, so it is the measure of how much of the amd64 interpreter
+    // is still load-bearing -- read it after a workload rather than inferring
+    // it from the absence of ISH_TRACE_AMD64_JIT_STATS output, which stays
+    // silent below eight fallbacks.
+    unsigned long attempts = 0, successes = 0, fallbacks = 0;
+    amd64_jit_compile_stats(&attempts, &successes, &fallbacks);
+    proc_printf(buf, "compile attempts   %lu\n", attempts);
+    proc_printf(buf, "compile successes  %lu\n", successes);
+    proc_printf(buf, "interp fallbacks   %lu\n", fallbacks);
     return 0;
 }
 
