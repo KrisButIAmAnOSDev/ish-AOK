@@ -482,6 +482,16 @@ static void amd64_jit_note_compile_fallback(const struct gen_state *state, guest
         amd64_jit_dump_fallback_histogram(total);
 }
 
+void amd64_jit_compile_stats(unsigned long *attempts, unsigned long *successes,
+        unsigned long *fallbacks) {
+    if (attempts != NULL)
+        *attempts = atomic_load_explicit(&amd64_jit_compile_attempts, memory_order_relaxed);
+    if (successes != NULL)
+        *successes = atomic_load_explicit(&amd64_jit_compile_successes, memory_order_relaxed);
+    if (fallbacks != NULL)
+        *fallbacks = atomic_load_explicit(&amd64_jit_compile_fallbacks, memory_order_relaxed);
+}
+
 bool amd64_jit_is_enabled(void) {
     return atomic_load_explicit(&amd64_jit_enabled, memory_order_relaxed);
 }
@@ -3123,12 +3133,11 @@ rearm_amd64:
         amd64_jit_debug("frontend exec block ip=%llx end=%llx",
                 (unsigned long long) ip,
                 (unsigned long long) block->end_addr);
-        amd64_jit_debug("frontend block slots 0=%lx 1=%lx 2=%lx 3=%lx helper=%lx",
+        amd64_jit_debug("frontend block slots 0=%lx 1=%lx 2=%lx 3=%lx",
                 block->used > 0 ? block->code[0] : 0,
                 block->used > 1 ? block->code[1] : 0,
                 block->used > 2 ? block->code[2] : 0,
-                block->used > 3 ? block->code[3] : 0,
-                (unsigned long) amd64_step_to_interrupt_jit);
+                block->used > 3 ? block->code[3] : 0);
         {
             // Gate on the debug master switch like the i386 frontend
             // (3558ee46): amd64_cc1_jit_trace_enabled is an out-of-line
@@ -3138,9 +3147,7 @@ rearm_amd64:
             struct cpu_state before_block_cpu;
             if (cc1_trace)
                 before_block_cpu = frame->cpu;
-        amd64_jit_bridge_set_tlb(tlb);
         interrupt = jit_enter(block, frame, tlb);
-        amd64_jit_bridge_set_tlb(NULL);
             if (cc1_trace)
                 amd64_cc1_jit_trace_record(block->addr, tlb, &before_block_cpu, &frame->cpu, interrupt);
         }

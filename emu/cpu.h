@@ -20,36 +20,18 @@ int cpu_run_to_interrupt_amd64(struct cpu_state *cpu, struct tlb *tlb);
 // aarch64_guest_plan.md patch 5 — interpreter-only, no native gadget
 // engine yet (that's patch 8, jit/guest-arm64/).
 int cpu_run_to_interrupt_arm64(struct cpu_state *cpu, struct tlb *tlb);
-int amd64_step_to_interrupt_jit(struct cpu_state *cpu, struct tlb *tlb);
-int amd64_step_to_interrupt_jit_bridge(struct cpu_state *cpu);
-int amd64_jit_ret(struct cpu_state *cpu, struct tlb *tlb);
 int amd64_jit_ret_imm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long imm16);
 int amd64_jit_leave(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long pop_size, unsigned long next_ip);
-int amd64_jit_push_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg, unsigned long next_ip);
-int amd64_jit_pop_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg, unsigned long next_ip);
 int amd64_jit_pop_rm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
-int amd64_jit_bswap(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg_size, unsigned long next_ip);
 int amd64_jit_push_flags(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long push_size, unsigned long next_ip);
 int amd64_jit_pop_flags(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long pop_size, unsigned long next_ip);
-int amd64_jit_push_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long value, unsigned long next_ip);
-int amd64_jit_xchg_rax_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg_size, unsigned long next_ip);
 int amd64_jit_xchg_rm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
-int amd64_jit_jmp_abs(struct cpu_state *cpu, struct tlb *tlb, unsigned long target);
-int amd64_jit_call_abs(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long target, unsigned long next_ip);
-int amd64_jit_jcc_abs(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long cc, unsigned long target, unsigned long next_ip);
 int amd64_jit_syscall(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
 int amd64_jit_rdtsc(struct cpu_state *cpu, struct tlb *tlb,
@@ -61,8 +43,6 @@ int amd64_jit_xgetbv(struct cpu_state *cpu, struct tlb *tlb,
 int amd64_jit_port_io(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long insn_ip);
 int amd64_jit_moffs_accum(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_sign_extend(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
 int amd64_jit_string_op(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
@@ -96,7 +76,6 @@ int amd64_jit_fe_group(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
 int amd64_jit_ff_group(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
-void amd64_jit_bridge_set_tlb(struct tlb *tlb);
 void cpu_poke(struct cpu_state *cpu);
 void dump_amd64_cc1_trace(const struct cpu_state *cpu);
 void dump_amd64_as_trace_task(const struct task *task);
