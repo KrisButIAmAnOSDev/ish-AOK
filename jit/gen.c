@@ -6719,8 +6719,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                     insn.operand_size_prefix, insn.address_size_prefix);
         gen_amd64_helper_tlb_2_retint(state, amd64_jit_string_op,
                 (unsigned long) insn.opcode, (unsigned long) next_ip);
-        gen_exit(state);
-        return false;
+        // The helper runs the whole (REP) string op in C and returns INT_NONE
+        // with the registers advanced, or INT_TIMER with rip at the instruction
+        // when poked mid-way (the retint gadget exits on anything but INT_NONE).
+        // Neither needs the block to end here: continue, like any other gadget
+        // that calls a C twin. Ending it cost a block boundary per memcpy.
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
     }
 
     // Native XCHG reg, [mem] (0x87, mod!=3, 32/64-bit). Implicitly locked on
