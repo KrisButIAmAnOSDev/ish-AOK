@@ -629,12 +629,49 @@ static void test_cmov_false_zero_extends(void) {
     test_logf("cmov_false_zero_extends: ok\n");
 }
 
+// Locked RMW in a fork child, on pages the child has not written yet. After
+// fork every private page is copy-on-write, and the JIT's atomic gadgets
+// (lock imm, xchg, cmpxchg) take their host pointer from the nofault
+// translation, which refuses a not-yet-writable page: the C helper returns
+// INT_PF and the gadget must deliver it so the kernel breaks COW and the
+// instruction retries. Until 2026-09-06 three gadget shells exited that path
+// with INT_NONE instead, so the fault vanished and a CAS loop in a fresh child
+// spun forever (amd64_regress itself wedged for half an hour under the JIT).
+// Reading the page first is deliberate: it puts a read entry in the TLB, the
+// shape the failure needs.
+static uint32_t fork_cow_v = 5, fork_cow_w = 5, fork_cow_x = 5;
+static void test_fork_cow_atomics(void) {
+    pid_t pid = fork();
+    if (pid < 0) { failf("fork cow atomics: fork", 0, 0, 0, 0, 0, 0); return; }
+    if (pid == 0) {
+        volatile uint32_t sink = fork_cow_v + fork_cow_w + fork_cow_x;
+        (void) sink;
+        uint32_t exp = 5;
+        int ok = __atomic_compare_exchange_n(&fork_cow_v, &exp, 11u, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&fork_cow_w, 6, __ATOMIC_SEQ_CST);
+        uint32_t old = __atomic_exchange_n(&fork_cow_x, 11u, __ATOMIC_SEQ_CST);
+        long i;
+        for (i = 0; i < 1000000; i++) {
+            exp = __atomic_load_n(&fork_cow_v, __ATOMIC_RELAXED);
+            if (__atomic_compare_exchange_n(&fork_cow_v, &exp, exp + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                break;
+        }
+        _exit((ok == 1 && fork_cow_v == 12 && fork_cow_w == 11 && old == 5 && fork_cow_x == 11 && i == 0) ? 0 : 1);
+    }
+    int st = -1;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        failf("fork cow atomics: child", (uint64_t) st, 0, 0, 0, 0, 0);
+    if (fork_cow_v != 5 || fork_cow_w != 5 || fork_cow_x != 5)
+        failf("fork cow atomics: parent saw child writes", fork_cow_v, fork_cow_w, fork_cow_x, 5, 5, 5);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--exec-child") == 0)
         return helper_exec_child();
 
     test_init(argc, argv);
     test_cross_page_private_store();
+    test_fork_cow_atomics();
     test_exec_loader_zero(argv);
     test_exec_loader_straddle();
     test_fcntl_lock_close_race();

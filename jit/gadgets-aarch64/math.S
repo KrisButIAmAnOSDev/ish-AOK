@@ -4733,9 +4733,8 @@ amd64_gen_regmem_logic regmem_logic64, 8, 64
     cbnz x19, 9f
     gret 5
 9:  /* a fault: report it the way the segfault path does */
-    ldr  x0, [_ip, 16]
-    mov  eip, w0
-    b    jit_ret
+    mov  x0, x19                     /* the helper's interrupt (INT_PF): deliver it */
+    b    jit_exit
     amd64_vwrite_bullshit \vbytes, \name
 .endm
 
@@ -4792,9 +4791,8 @@ amd64_gen_lock_imm lock_imm64, 8, 63, 64
     restore_c
     cbnz x19, 9f
     gret 3
-9:  ldr  x0, [_ip, 16]
-    mov  eip, w0
-    b    jit_ret
+9:  mov  x0, x19                     /* the helper's interrupt (INT_PF): deliver it */
+    b    jit_exit
     amd64_vwrite_bullshit \vbytes, \name
 .endm
 
@@ -4863,9 +4861,8 @@ amd64_gen_mov_imm_mem mov_imm_mem64, 8
     restore_c
     cbnz x19, 9f
     gret 4
-9:  ldr  x0, [_ip, 16]
-    mov  eip, w0
-    b    jit_ret
+9:  mov  x0, x19                     /* the helper's interrupt (INT_PF): deliver it */
+    b    jit_exit
 
 amd64_gen_imm_arith imm_arith32, 4, 31
 amd64_gen_imm_arith imm_arith64, 8, 63
