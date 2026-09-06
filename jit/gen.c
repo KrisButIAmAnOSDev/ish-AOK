@@ -351,6 +351,7 @@ static void gen_amd64_emit_rip(struct gen_state *state, guest_addr_t rip) {
 #endif
 }
 
+
 static void gen_amd64_flush_reg_cache(struct gen_state *state) {
 #if defined(__aarch64__)
     if (state->amd64_reg_cache_valid && state->amd64_reg_cache_dirty) {
@@ -7306,6 +7307,90 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     }
 
 #if defined(__aarch64__)
+    // CMOVcc r, [mem] (0F 40+cc, mod!=3), 32/64: the register form's condition
+    // gadgets with the source read from memory (gadget_amd64_cmov[n]_<cond>_mem32/64).
+    if (!insn.address_size_prefix && !insn.lock_prefix && !insn.operand_size_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.two_byte_opcode && insn.has_modrm &&
+            insn.op2 >= 0x40 && insn.op2 <= 0x4f && amd64_modrm_mod(insn.modrm) != 3) {
+        extern void gadget_amd64_cmov_o_mem4(void), gadget_amd64_cmov_c_mem4(void),
+                gadget_amd64_cmov_z_mem4(void), gadget_amd64_cmov_cz_mem4(void),
+                gadget_amd64_cmov_s_mem4(void), gadget_amd64_cmov_p_mem4(void),
+                gadget_amd64_cmov_sxo_mem4(void), gadget_amd64_cmov_sxoz_mem4(void),
+                gadget_amd64_cmovn_o_mem4(void), gadget_amd64_cmovn_c_mem4(void),
+                gadget_amd64_cmovn_z_mem4(void), gadget_amd64_cmovn_cz_mem4(void),
+                gadget_amd64_cmovn_s_mem4(void), gadget_amd64_cmovn_p_mem4(void),
+                gadget_amd64_cmovn_sxo_mem4(void), gadget_amd64_cmovn_sxoz_mem4(void),
+                gadget_amd64_cmov_o_mem8(void), gadget_amd64_cmov_c_mem8(void),
+                gadget_amd64_cmov_z_mem8(void), gadget_amd64_cmov_cz_mem8(void),
+                gadget_amd64_cmov_s_mem8(void), gadget_amd64_cmov_p_mem8(void),
+                gadget_amd64_cmov_sxo_mem8(void), gadget_amd64_cmov_sxoz_mem8(void),
+                gadget_amd64_cmovn_o_mem8(void), gadget_amd64_cmovn_c_mem8(void),
+                gadget_amd64_cmovn_z_mem8(void), gadget_amd64_cmovn_cz_mem8(void),
+                gadget_amd64_cmovn_s_mem8(void), gadget_amd64_cmovn_p_mem8(void),
+                gadget_amd64_cmovn_sxo_mem8(void), gadget_amd64_cmovn_sxoz_mem8(void);
+        static void (* const cmovm4[16])(void) = {
+            gadget_amd64_cmov_o_mem4, gadget_amd64_cmovn_o_mem4, gadget_amd64_cmov_c_mem4, gadget_amd64_cmovn_c_mem4,
+            gadget_amd64_cmov_z_mem4, gadget_amd64_cmovn_z_mem4, gadget_amd64_cmov_cz_mem4, gadget_amd64_cmovn_cz_mem4,
+            gadget_amd64_cmov_s_mem4, gadget_amd64_cmovn_s_mem4, gadget_amd64_cmov_p_mem4, gadget_amd64_cmovn_p_mem4,
+            gadget_amd64_cmov_sxo_mem4, gadget_amd64_cmovn_sxo_mem4, gadget_amd64_cmov_sxoz_mem4, gadget_amd64_cmovn_sxoz_mem4,
+        };
+        static void (* const cmovm8[16])(void) = {
+            gadget_amd64_cmov_o_mem8, gadget_amd64_cmovn_o_mem8, gadget_amd64_cmov_c_mem8, gadget_amd64_cmovn_c_mem8,
+            gadget_amd64_cmov_z_mem8, gadget_amd64_cmovn_z_mem8, gadget_amd64_cmov_cz_mem8, gadget_amd64_cmovn_cz_mem8,
+            gadget_amd64_cmov_s_mem8, gadget_amd64_cmovn_s_mem8, gadget_amd64_cmov_p_mem8, gadget_amd64_cmovn_p_mem8,
+            gadget_amd64_cmov_sxo_mem8, gadget_amd64_cmovn_sxo_mem8, gadget_amd64_cmov_sxoz_mem8, gadget_amd64_cmovn_sxoz_mem8,
+        };
+        unsigned cc = insn.op2 & 0xf;
+        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned dst_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("cmov-mem ip=%llx cc=%x dst=%u size=%u next=%llx",
+                (unsigned long long) insn.start_ip, cc, dst_id, size,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen(state, (unsigned long) (size == 64 ? cmovm8[cc] : cmovm4[cc]));
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen(state, (unsigned long) dst_id);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+    // movaps/movups (0F 28/29, 0F 10/11) and movapd/movupd (66 ...) register-register:
+    // a whole-xmm copy either way, gadget_amd64_v_mov128_reg. 28/10 read rm into
+    // reg; 29/11 the other way round. F3/F2 forms are movss/movsd (partial), not here.
+    if (!insn.address_size_prefix && !insn.lock_prefix && !insn.fs_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.two_byte_opcode && insn.has_modrm &&
+            amd64_modrm_mod(insn.modrm) == 3 &&
+            (insn.op2 == 0x28 || insn.op2 == 0x29 || insn.op2 == 0x10 || insn.op2 == 0x11)) {
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        bool to_rm = insn.op2 == 0x29 || insn.op2 == 0x11;
+        unsigned src = to_rm ? reg_id : rm_id, dst = to_rm ? rm_id : reg_id;
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("v-movaps-reg ip=%llx op2=%02x src=%u dst=%u next=%llx",
+                (unsigned long long) insn.start_ip, insn.op2, src, dst,
+                (unsigned long long) next_ip);
+        extern void gadget_amd64_v_mov128_reg(void);
+        gen(state, (unsigned long) gadget_amd64_v_mov128_reg);
+        gen(state, (unsigned long) (src | (dst << 4)));
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+#endif
+#if defined(__aarch64__)
     // Native BSF/BSR (0F BC/BD) r, r/m, 32/64, no REP (REP = TZCNT/LZCNT, which keep
     // bridging). Register source: gadget_amd64_bitscan_reg; memory: bitscan_mem32/64.
     if (!insn.address_size_prefix && !insn.lock_prefix && !insn.operand_size_prefix &&
@@ -8844,6 +8929,70 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             return true;
 #endif
         }
+#if defined(__aarch64__)
+        // Native TEST [mem], imm (0xf6 /0 byte, 0xf7 /0 16/32/64), mod!=3, no LOCK:
+        // flags only, read path. The immediate follows the addressing bytes. This
+        // sits ABOVE the arm's `state->amd64_ip = next_ip`: decode_mem_meta parses
+        // from amd64_ip + 1, which must still be the opcode here.
+        if (!insn.lock_prefix && amd64_modrm_mod(insn.modrm) != 3) {
+            unsigned long meta, disp;
+            guest_addr_t mem_next;
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &mem_next)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            unsigned long value;
+            if (size == 8) {
+                uint8_t i;
+                if (!tlb_read(tlb, mem_next, &i, sizeof(i))) {
+                    state->amd64_ip = state->amd64_orig_ip;
+                    state->amd64_fallback_to_interp = true;
+                    return false;
+                }
+                value = i;
+                mem_next += sizeof(i);
+            } else if (size == 16) {
+                uint16_t i;
+                if (!tlb_read(tlb, mem_next, &i, sizeof(i))) {
+                    state->amd64_ip = state->amd64_orig_ip;
+                    state->amd64_fallback_to_interp = true;
+                    return false;
+                }
+                value = i;
+                mem_next += sizeof(i);
+            } else {
+                int32_t i;
+                if (!tlb_read(tlb, mem_next, &i, sizeof(i))) {
+                    state->amd64_ip = state->amd64_orig_ip;
+                    state->amd64_fallback_to_interp = true;
+                    return false;
+                }
+                value = insn.rex.w ? (unsigned long) (qword_t) (sqword_t) i
+                                   : (unsigned long) (uint32_t) i;
+                mem_next += sizeof(i);
+            }
+            next_ip = mem_next;
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("test-mem-imm ip=%llx size=%u value=%llx next=%llx",
+                    (unsigned long long) insn.start_ip, size, (unsigned long long) value,
+                    (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            extern void gadget_amd64_test_mem_imm8(void), gadget_amd64_test_mem_imm16(void),
+                    gadget_amd64_test_mem_imm32(void), gadget_amd64_test_mem_imm64(void);
+            gen(state, (unsigned long) (size == 8 ? gadget_amd64_test_mem_imm8
+                                      : size == 16 ? gadget_amd64_test_mem_imm16
+                                      : size == 32 ? gadget_amd64_test_mem_imm32
+                                                   : gadget_amd64_test_mem_imm64));
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            gen(state, value);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+#endif
         state->amd64_ip = next_ip;
         amd64_jit_debug("grp3-test-helper ip=%llx opcode=%02x modrm=%02x next=%llx",
                 (unsigned long long) insn.start_ip,
@@ -8921,6 +9070,31 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 gen_amd64_defer_rip(state, next_ip);
                 return true;
             }
+        }
+#endif
+#if defined(__aarch64__)
+        // Native one-operand MUL/IMUL/DIV/IDIV (0xf7 /4-/7), register operand, 32/64:
+        // gadget_amd64_grp3_muldiv, asm fast paths for the shapes compilers emit and
+        // amd64_jit_grp3_muldiv in C for the rest (128-bit dividends, #DE), whose
+        // interrupt the gadget delivers through jit_exit. Byte/16-bit and memory
+        // operands keep bridging.
+        if (insn.opcode == 0xf7 && !insn.fs_prefix && !insn.operand_size_prefix &&
+                amd64_modrm_mod(insn.modrm) == 3 && amd64_modrm_reg(insn.modrm) >= 4) {
+            unsigned size = insn.rex.w ? 64 : 32;
+            unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+            unsigned long packed = (unsigned long) rm_id |
+                ((unsigned long) amd64_modrm_reg(insn.modrm) << 4) |
+                (size == 64 ? (1ul << 8) : 0ul);
+            amd64_jit_debug("grp3-muldiv ip=%llx grp=%u rm=%u size=%u next=%llx",
+                    (unsigned long long) insn.start_ip, amd64_modrm_reg(insn.modrm), rm_id,
+                    size, (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            extern void gadget_amd64_grp3_muldiv(void);
+            gen(state, (unsigned long) gadget_amd64_grp3_muldiv);
+            gen(state, packed);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
         }
 #endif
         amd64_jit_debug("grp3-op-helper ip=%llx opcode=%02x modrm=%02x next=%llx",

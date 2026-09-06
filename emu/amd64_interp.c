@@ -3644,26 +3644,13 @@ static inline bool amd64_read_rm(struct cpu_state *cpu, struct tlb *tlb,
 static inline bool amd64_write_rm(struct cpu_state *cpu, struct tlb *tlb,
         const struct amd64_modrm *modrm, bool fs_prefix, unsigned size, qword_t value);
 
-static inline int amd64_grp3_muldiv(struct cpu_state *cpu, struct tlb *tlb,
-        const struct amd64_modrm *modrm, bool fs_prefix, unsigned size) {
-    qword_t src;
-    if (!amd64_read_rm(cpu, tlb, modrm, fs_prefix, size, &src))
-        return INT_PF;
-
-    switch (modrm->reg) {
-    case 2: {
-        qword_t result = amd64_trunc(~src, size);
-        if (!amd64_write_rm(cpu, tlb, modrm, fs_prefix, size, result))
-            return INT_PF;
-        return INT_NONE;
-    }
-    case 3: {
-        qword_t result = amd64_trunc(0 - src, size);
-        if (!amd64_write_rm(cpu, tlb, modrm, fs_prefix, size, result))
-            return INT_PF;
-        amd64_set_sub_flags(cpu, 0, src, result, size);
-        return INT_NONE;
-    }
+// The one-operand MUL/IMUL/DIV/IDIV (F6/F7 /4-/7) on an already-read source.
+// Split out of amd64_grp3_muldiv so the JIT's gadget can hand it the shapes
+// its fast paths do not take (a 128-bit dividend, #DE); returns the
+// interrupt to raise, INT_NONE when done.
+static inline int amd64_grp3_muldiv_src(struct cpu_state *cpu, unsigned group,
+        unsigned size, qword_t src) {
+    switch (group) {
     case 4:
         switch (size) {
         case 8: {
@@ -3853,6 +3840,47 @@ static inline int amd64_grp3_muldiv(struct cpu_state *cpu, struct tlb *tlb,
         }
     default:
         return INT_UNDEFINED;
+    }
+}
+
+// Returns the raw interrupt code: INT_NONE (-1) when done, else the interrupt
+// to raise. INT_DIV is vector 0, so "nonzero means fault" -- the convention the
+// atomic helpers use, where only INT_PF can come back -- does not work here.
+int amd64_jit_grp3_muldiv(struct cpu_state *cpu, unsigned group, unsigned size, qword_t src) {
+    static int trace = -1;
+    if (trace < 0) trace = getenv("ISH_TRACE_AMD64_BRIDGES") != NULL;
+    qword_t in_rax = cpu->amd64_regs[amd64_rax], in_rdx = cpu->amd64_regs[amd64_rdx];
+    int r = amd64_grp3_muldiv_src(cpu, group, size, src);
+    if (trace)
+        fprintf(stderr, "[muldiv] cpu=%p grp=%u size=%u src=%llx rax=%llx rdx=%llx -> r=%d rax=%llx rdx=%llx\n",
+                (void *) cpu, group, size, (unsigned long long) src, (unsigned long long) in_rax,
+                (unsigned long long) in_rdx, r, (unsigned long long) cpu->amd64_regs[amd64_rax],
+                (unsigned long long) cpu->amd64_regs[amd64_rdx]);
+    return r;
+}
+
+static inline int amd64_grp3_muldiv(struct cpu_state *cpu, struct tlb *tlb,
+        const struct amd64_modrm *modrm, bool fs_prefix, unsigned size) {
+    qword_t src;
+    if (!amd64_read_rm(cpu, tlb, modrm, fs_prefix, size, &src))
+        return INT_PF;
+
+    switch (modrm->reg) {
+    case 2: {
+        qword_t result = amd64_trunc(~src, size);
+        if (!amd64_write_rm(cpu, tlb, modrm, fs_prefix, size, result))
+            return INT_PF;
+        return INT_NONE;
+    }
+    case 3: {
+        qword_t result = amd64_trunc(0 - src, size);
+        if (!amd64_write_rm(cpu, tlb, modrm, fs_prefix, size, result))
+            return INT_PF;
+        amd64_set_sub_flags(cpu, 0, src, result, size);
+        return INT_NONE;
+    }
+    default:
+        return amd64_grp3_muldiv_src(cpu, modrm->reg, size, src);
     }
 }
 

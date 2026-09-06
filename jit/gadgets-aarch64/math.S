@@ -6507,3 +6507,222 @@ amd64_gen_btx_mem btx_mem64, 8
 .endm
 amd64_gen_cmp_memreg cmp_memreg32, 4, 31
 amd64_gen_cmp_memreg cmp_memreg64, 8, 63
+
+# ===========================================================================
+# Round 3a: one-operand MUL/IMUL/DIV/IDIV, TEST [mem], imm, CMOVcc r, [mem].
+# ===========================================================================
+
+# MUL/IMUL/DIV/IDIV r/m (F7 /4-/7), register operand, 32/64. Flush style.
+# packed(0) = rm(0-3) | group(4-6) | is64(8). Fast paths cover the shapes
+# compilers emit: 32-bit divides (edx:eax always fits 64 bits), a 64-bit DIV
+# with rdx == 0, a 64-bit IDIV whose rdx is the sign of rax (the cqo idiom).
+# Everything else -- a real 128-bit dividend, a zero divisor, the MIN/-1
+# case -- goes to amd64_jit_grp3_muldiv in C, whose nonzero return (INT_DIV)
+# (INT_DIV, which is vector 0, so the C twin returns the raw code and INT_NONE
+# means done) is delivered through jit_exit exactly like a page fault. MUL/IMUL set
+# CF=OF=overflow and nothing else; DIV/IDIV leave the flags alone. gret 1.
+.macro amd64_muldiv_flags
+    strb w16, [_cpu, CPU_cf]
+    strb w16, [_cpu, CPU_of]
+    ldr  w17, [_cpu, CPU_eflags]
+    mov  w14, (1 | (1 << 11))
+    bic  w17, w17, w14
+    cbz  w16, 8001f
+    orr  w17, w17, w14
+8001:
+    str  w17, [_cpu, CPU_eflags]
+.endm
+
+.gadget amd64_grp3_muldiv
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 3               /* group: 4 mul, 5 imul, 6 div, 7 idiv */
+    add  x11, _cpu, CPU_amd64_regs
+    ldr  x12, [x11, x9, lsl 3]       /* src */
+    ldr  x13, [x11]                  /* rax */
+    ldr  x14, [x11, 16]              /* rdx */
+    cmp  x10, 4
+    b.eq 4f
+    cmp  x10, 5
+    b.eq 5f
+    tbnz x8, 8, 1f
+    /* ---- 32-bit divides: dividend = edx:eax as one 64-bit value ---- */
+    mov  w12, w12
+    cbz  w12, 9f                     /* #DE: let C raise it */
+    mov  w13, w13
+    lsl  x15, x14, 32
+    orr  x15, x15, x13               /* dividend */
+    cmp  x10, 6
+    b.ne 2f
+    udiv x16, x15, x12               /* DIV: quotient must fit 32 bits */
+    lsr  x17, x16, 32
+    cbnz x17, 9f
+    msub x17, x16, x12, x15          /* remainder */
+    b    3f
+2:  sxtw x12, w12                    /* IDIV: signed dividend / signed divisor */
+    sdiv x16, x15, x12
+    sxtw x17, w16
+    cmp  x17, x16
+    b.ne 9f                          /* quotient out of int32 range: #DE */
+    msub x17, x16, x12, x15
+3:  mov  w16, w16
+    mov  w17, w17
+    str  x16, [x11]
+    str  x17, [x11, 16]
+    gret 1
+1:  /* ---- 64-bit divides ---- */
+    cbz  x12, 9f
+    cmp  x10, 6
+    b.ne 6f
+    cbnz x14, 9f                     /* DIV with rdx != 0: 128-bit dividend -> C */
+    udiv x16, x13, x12
+    msub x17, x16, x12, x13
+    b    7f
+6:  asr  x17, x13, 63
+    cmp  x17, x14
+    b.ne 9f                          /* IDIV with a real 128-bit dividend -> C */
+    cmn  x12, 1
+    b.ne 60f
+    mov  x17, 1
+    lsl  x17, x17, 63
+    cmp  x13, x17
+    b.eq 9f                          /* MIN / -1: #DE */
+60: sdiv x16, x13, x12
+    msub x17, x16, x12, x13
+7:  str  x16, [x11]
+    str  x17, [x11, 16]
+    gret 1
+4:  /* ---- MUL: rdx:rax = rax * src, CF=OF = high part != 0 ---- */
+    tbnz x8, 8, 40f
+    umull x15, w13, w12
+    lsr  x16, x15, 32
+    mov  w15, w15
+    str  x15, [x11]
+    str  x16, [x11, 16]
+    cmp  x16, 0
+    cset w16, ne
+    amd64_muldiv_flags
+    gret 1
+40: mul  x15, x13, x12
+    umulh x16, x13, x12
+    str  x15, [x11]
+    str  x16, [x11, 16]
+    cmp  x16, 0
+    cset w16, ne
+    amd64_muldiv_flags
+    gret 1
+5:  /* ---- IMUL one operand: signed, CF=OF = high part is not the sign of the low ---- */
+    tbnz x8, 8, 50f
+    smull x15, w13, w12              /* signed 64-bit product of eax * src */
+    sxtw x17, w15
+    cmp  x17, x15
+    cset w16, ne                     /* overflow: the low dword does not sign-extend to it */
+    lsr  x17, x15, 32                /* edx = high dword, zero-extended */
+    mov  w15, w15                    /* eax = low dword */
+    str  x15, [x11]
+    str  x17, [x11, 16]
+    amd64_muldiv_flags
+    gret 1
+50: mul  x15, x13, x12
+    smulh x17, x13, x12
+    str  x15, [x11]
+    str  x17, [x11, 16]
+    asr  x15, x15, 63
+    cmp  x15, x17
+    cset w16, ne
+    amd64_muldiv_flags
+    gret 1
+9:  /* ---- slow / trapping cases: C twin, then deliver its interrupt ---- */
+    save_c
+    mov  x0, _cpu                    /* reads x1 first */
+    mov  x3, x12                     /* src */
+    mov  w2, 32
+    tbz  x8, 8, 90f
+    mov  w2, 64
+90: mov  w1, w10                     /* group */
+    bl   NAME(amd64_jit_grp3_muldiv)
+    sxtw x19, w0                     /* C returns int in w0: the top half of x0 is junk */
+    restore_c
+    cmn  x19, 1                      /* INT_NONE (-1) = done; INT_DIV is vector 0, so */
+    b.ne 91f                         /* "nonzero" would read a divide fault as success */
+    gret 1
+91: mov  x0, x19
+    b    jit_exit
+
+# TEST [mem], imm (F6 /0 byte, F7 /0 16/32/64): flags only, read path. The
+# immediate is already sized/extended by gen.c. Operands:
+# [meta][disp][next_ip][imm]. gret 4.
+.macro amd64_gen_test_mem_imm name, vbytes
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep \vbytes, \name
+.if \vbytes == 1
+    ldrb w13, [x9]
+.elseif \vbytes == 2
+    ldrh w13, [x9]
+.elseif \vbytes == 4
+    ldr  w13, [x9]
+.else
+    ldr  x13, [x9]
+.endif
+    ldr  x10, [_ip, 24]
+    and  x15, x13, x10
+    mov  x11, (\vbytes * 8)
+    amd64_cached_set_logic_flags x15, x11
+    gret 4
+    amd64_vread_bullshit \vbytes, \name
+.endm
+amd64_gen_test_mem_imm test_mem_imm8, 1
+amd64_gen_test_mem_imm test_mem_imm16, 2
+amd64_gen_test_mem_imm test_mem_imm32, 4
+amd64_gen_test_mem_imm test_mem_imm64, 8
+
+# CMOVcc r, [mem] (0F 40+cc, mod!=3), 32/64: the register form's condition
+# evaluation with the source read from memory. The load happens whether or
+# not the move is taken (as on hardware, so a bad address faults either way).
+# Operands: [meta][disp][next_ip][dst]. gret 4.
+.macro amd64_gen_cmov_mem name, cond, pol, vbytes
+    .gadget amd64_cmov\pol\()_\name\()_mem\vbytes
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        amd64_vmem_addr
+        amd64_vread_prep \vbytes, cmov\pol\()_\name\()_mem\vbytes
+    .if \vbytes == 4
+        ldr  w9, [x9]
+    .else
+        ldr  x9, [x9]
+    .endif
+        mov  x0, x9                  /* source value (x0 is free after the prep) */
+        amd64_do_jump \cond, 1f
+        .ifc \pol,n
+            mov  x16, 1
+        .else
+            mov  x16, 0
+        .endif
+        b    2f
+    1:
+        .ifc \pol,n
+            mov  x16, 0
+        .else
+            mov  x16, 1
+        .endif
+    2:  ldr  x12, [_ip, 24]          /* dst slot */
+        add  x14, _cpu, CPU_amd64_regs
+        ldr  x10, [x14, x12, lsl 3]  /* current dst */
+        cmp  x16, 0
+        csel x15, x0, x10, ne        /* taken ? src : dst */
+    .if \vbytes == 4
+        mov  w15, w15                /* 32-bit: zero-extend either way */
+    .endif
+        str  x15, [x14, x12, lsl 3]
+        gret 4
+        amd64_vread_bullshit \vbytes, cmov\pol\()_\name\()_mem\vbytes
+.endm
+.irp cond, o,c,z,cz,s,p,sxo,sxoz
+    amd64_gen_cmov_mem \cond, \cond, , 4
+    amd64_gen_cmov_mem \cond, \cond, n, 4
+    amd64_gen_cmov_mem \cond, \cond, , 8
+    amd64_gen_cmov_mem \cond, \cond, n, 8
+.endr
