@@ -4293,6 +4293,31 @@ static bool amd64_locked_alu(struct cpu_state *cpu, struct tlb *tlb,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Exported for the JIT's native atomic gadgets. Their aligned fast path is an
+// ldaxr/stlxr loop in assembly; a MISALIGNED locked access (legal on x86, if
+// slow) cannot use exclusives and comes here instead, which is exactly the
+// path the interpreter takes for it -- x86_atomic_rmw's global-mutex branch --
+// so the two engines stay atomic with respect to each other. Returns 0, or an
+// interrupt to raise.
+// ---------------------------------------------------------------------------
+static bool amd64_locked_xchg(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t guest_addr, unsigned size, qword_t value, qword_t *old_out);
+
+int amd64_jit_locked_alu_slow(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t guest_addr, unsigned size, unsigned alu_op, qword_t rhs) {
+    if (!amd64_locked_alu(cpu, tlb, guest_addr, size, alu_op, rhs))
+        return INT_PF;
+    return 0;
+}
+
+int amd64_jit_locked_xchg_slow(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t guest_addr, unsigned size, qword_t value, qword_t *old_out) {
+    if (!amd64_locked_xchg(cpu, tlb, guest_addr, size, value, old_out))
+        return INT_PF;
+    return 0;
+}
+
 // LOCK INC / LOCK DEC [addr]. INC and DEC set every arithmetic flag EXCEPT
 // CF, which they preserve -- the caller-visible reason this is not just
 // amd64_locked_alu with rhs = 1.

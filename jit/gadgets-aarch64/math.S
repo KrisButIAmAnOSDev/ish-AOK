@@ -4612,6 +4612,195 @@ amd64_gen_regmem_cmp   regmem_cmp64,   8, 63
 amd64_gen_regmem_logic regmem_logic32, 4, 32
 amd64_gen_regmem_logic regmem_logic64, 8, 64
 
+# ---------------------------------------------------------------------------
+# LOCK <alu> [mem], imm -- the atomic imm-to-mem family: lock add/or/and/sub/xor.
+#
+# 25 bridge sites on the pthread workload were exactly this: `lock addq $1,
+# (%rax)` style counters. The i386 JIT has had native LL/SC atomics for years
+# (do_op_size_atomic above); amd64 had none, and the "lock (atomic path
+# bridges)" comments described a gap, not a design.
+#
+# Aligned fast path: amd64_vwrite_prep resolves a real host pointer (an aligned
+# access never crosses a page, so the cross-page staging buffer -- which could
+# never be atomic -- is unreachable here), then an ldaxr/stlxr loop recomputes
+# the op on every retry, exactly as the i386 template does. Flags come from the
+# FINAL successful iteration's operands, via the same macros the non-atomic
+# gadgets use, so they are bit-identical to those.
+#
+# Misaligned: x86 permits a locked access at any alignment (it is just slow);
+# aarch64 exclusives fault on it. So the misaligned case calls
+# amd64_jit_locked_alu_slow, which is the interpreter's own global-mutex path
+# -- the two engines therefore stay atomic with respect to each other. Note
+# the i386 gadget merely TRACES misalignment and then issues the ldaxr anyway;
+# this does better.
+#
+# Operands: [meta][disp][next_ip][imm][group]. gret 5. group is the x86 ALU
+# group (0 add, 1 or, 4 and, 5 sub, 6 xor) and doubles as amd64_locked_alu's
+# op number.
+# ---------------------------------------------------------------------------
+.macro amd64_gen_lock_imm name, vbytes, sbit, ssize
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr                  /* x9 = guest effective address */
+    tst  x9, (\vbytes - 1)
+    b.ne 8f                          /* misaligned -> mutex path in C */
+    mov  x0, x9
+    amd64_vwrite_prep \vbytes, \name /* x9 = host addr (aligned => contained) */
+    ldr  x10, [_ip, 24]              /* rhs = immediate */
+    ldr  x11, [_ip, 32]              /* group */
+    dmb  ish
+.if \vbytes == 4
+    mov  w10, w10
+1:  ldaxr w13, [x9]                  /* lhs = current [mem] */
+    cmp  x11, 0
+    b.eq 2f
+    cmp  x11, 5
+    b.eq 3f
+    cmp  x11, 4
+    b.eq 4f
+    cmp  x11, 6
+    b.eq 5f
+    orr  w15, w13, w10               /* 1: or */
+    b    6f
+2:  adds w15, w13, w10
+    cset w14, cs
+    cset w16, vs
+    b    6f
+3:  subs w15, w13, w10
+    cset w14, cc
+    cset w16, vs
+    b    6f
+4:  and  w15, w13, w10
+    b    6f
+5:  eor  w15, w13, w10
+6:  stlxr w12, w15, [x9]
+    cbnz w12, 1b
+    mov  w15, w15
+.else
+1:  ldaxr x13, [x9]
+    cmp  x11, 0
+    b.eq 2f
+    cmp  x11, 5
+    b.eq 3f
+    cmp  x11, 4
+    b.eq 4f
+    cmp  x11, 6
+    b.eq 5f
+    orr  x15, x13, x10
+    b    6f
+2:  adds x15, x13, x10
+    cset w14, cs
+    cset w16, vs
+    b    6f
+3:  subs x15, x13, x10
+    cset w14, cc
+    cset w16, vs
+    b    6f
+4:  and  x15, x13, x10
+    b    6f
+5:  eor  x15, x13, x10
+6:  stlxr w12, x15, [x9]
+    cbnz w12, 1b
+.endif
+    dmb  ish
+    /* flags: arith groups use the add/sub macro (x13 lhs, x10 rhs, x15 res,
+       w14 CF, w16 OF); logic groups use the logic macro (clears CF/OF). */
+    cmp  x11, 0
+    b.eq 7f
+    cmp  x11, 5
+    b.eq 7f
+    mov  x11, \ssize
+    amd64_cached_set_logic_flags x15, x11
+    gret 5
+7:  amd64_cached_set_addsub_flags \sbit
+    gret 5
+8:  /* misaligned: amd64_jit_locked_alu_slow(cpu, tlb, addr, size, op, rhs).
+       _cpu is x1 and _tlb is x2, so BOTH must be read before x1/x2 are set as
+       arguments -- writing x2 (addr) first destroys _tlb, which is the bug that
+       aimed this call at a guest address minus 0x50. Read them, then clobber. */
+    save_c
+    mov  x9, x9                      /* addr already in x9 */
+    mov  x3, \ssize                  /* size, from a scratch reg */
+    ldr  x4, [_ip, 32]               /* op */
+    ldr  x5, [_ip, 24]               /* rhs */
+    mov  x0, _cpu                    /* x0 = cpu (reads x1) */
+    sub  x1, _tlb, TLB_entries       /* x1 = tlb base (reads x2), x1 was cpu */
+    mov  x2, x9                      /* x2 = addr, x2 was _tlb, now free */
+    bl   NAME(amd64_jit_locked_alu_slow)
+    mov  x19, x0
+    restore_c
+    cbnz x19, 9f
+    gret 5
+9:  /* a fault: report it the way the segfault path does */
+    ldr  x0, [_ip, 16]
+    mov  eip, w0
+    b    jit_ret
+    amd64_vwrite_bullshit \vbytes, \name
+.endm
+
+amd64_gen_lock_imm lock_imm32, 4, 31, 32
+amd64_gen_lock_imm lock_imm64, 8, 63, 64
+
+# ---------------------------------------------------------------------------
+# XCHG reg, [mem] -- implicitly locked on x86, always. 45 bridge sites: this
+# is what a spinlock release compiles to. Aligned fast path is an exclusive
+# swap loop; misaligned goes to the interpreter's mutex path. No flags.
+# Operands: [meta][disp][next_ip], reg id in meta bits 8-11. gret 3.
+# ---------------------------------------------------------------------------
+.macro amd64_gen_xchg_mem name, vbytes, ssize
+.gadget amd64_\name
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    tst  x9, (\vbytes - 1)
+    b.ne 8f
+    amd64_vwrite_prep \vbytes, \name
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4               /* reg id */
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x10, [x14, x12, lsl 3]      /* value to store */
+    dmb  ish
+.if \vbytes == 4
+1:  ldaxr w13, [x9]
+    stlxr w11, w10, [x9]
+    cbnz w11, 1b
+    mov  w13, w13
+.else
+1:  ldaxr x13, [x9]
+    stlxr w11, x10, [x9]
+    cbnz w11, 1b
+.endif
+    dmb  ish
+    str  x13, [x14, x12, lsl 3]      /* old value -> reg (zero-extended) */
+    gret 3
+8:  /* misaligned XCHG: amd64_jit_locked_xchg_slow(cpu, tlb, addr, size, value,
+       old_out). Stage the args that read _cpu(x1)/_tlb(x2) via CPU_amd64_regs
+       BEFORE overwriting x1/x2, same ordering trap as the lock_imm path. */
+    save_c
+    mov  x3, \ssize                  /* size */
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4               /* reg id */
+    add  x14, _cpu, CPU_amd64_regs   /* reads _cpu (x1) while still valid */
+    ldr  x4, [x14, x12, lsl 3]       /* value */
+    add  x5, x14, x12, lsl 3         /* old_out = &regs[reg] */
+    mov  x0, _cpu                    /* x0 = cpu */
+    sub  x1, _tlb, TLB_entries       /* x1 = tlb base */
+    mov  x2, x9                      /* x2 = addr */
+    bl   NAME(amd64_jit_locked_xchg_slow)
+    mov  x19, x0
+    restore_c
+    cbnz x19, 9f
+    gret 3
+9:  ldr  x0, [_ip, 16]
+    mov  eip, w0
+    b    jit_ret
+    amd64_vwrite_bullshit \vbytes, \name
+.endm
+
+amd64_gen_xchg_mem xchg_mem32, 4, 32
+amd64_gen_xchg_mem xchg_mem64, 8, 64
+
 amd64_gen_imm_arith imm_arith32, 4, 31
 amd64_gen_imm_arith imm_arith64, 8, 63
 
@@ -4677,7 +4866,23 @@ amd64_gen_imm_logic imm_logic64, 8, 64
     ldr  x9, [_ip, 8]                /* disp */
     amd64_vmem_addr                  /* x9 = effective address */
     amd64_vread_prep \vbytes, \name  /* x9 = host addr of [mem] */
-.if \vbytes == 4
+.if \vbytes == 2
+    /* 16-bit: compare in a 32-bit register on zero-extended halves; CF is the
+       unsigned borrow out of bit 16 and OF the signed overflow at bit 15, both
+       read from the 16-bit result rather than the host's 32-bit flags. */
+    ldrh w13, [x9]                   /* lhs = [mem] (16-bit, zero-extended) */
+    ldr  x10, [_ip, 24]             /* rhs = immediate (sign-extended) */
+    and  w10, w10, 0xffff
+    sub  w15, w13, w10
+    lsr  w14, w15, 16               /* borrow: bit 16 set iff lhs < rhs */
+    and  w14, w14, 1
+    eor  w16, w13, w10               /* OF = (lhs^rhs) & (lhs^res), bit 15 */
+    eor  w17, w13, w15
+    and  w16, w16, w17
+    lsr  w16, w16, 15
+    and  w16, w16, 1
+    and  w15, w15, 0xffff
+.elseif \vbytes == 4
     ldr  w13, [x9]                   /* lhs = [mem] (32-bit) */
     ldr  x10, [_ip, 24]             /* rhs = immediate */
     mov  w13, w13
@@ -4699,6 +4904,8 @@ amd64_gen_imm_logic imm_logic64, 8, 64
 .endm
 
 amd64_gen_imm_cmp imm_cmp32, 4, 31
+# 16-bit CMP [mem], imm (66 83 /7): 28 bridge sites, purely the operand-size form.
+amd64_gen_imm_cmp imm_cmp16, 2, 15
 amd64_gen_imm_cmp imm_cmp64, 8, 63
 
 # amd64 CMP byte [mem], imm8 (0x80 /7), mod!=3 -- the byte sibling of imm_cmp, the

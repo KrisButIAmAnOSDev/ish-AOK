@@ -6631,6 +6631,38 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return false;
     }
 
+    // Native XCHG reg, [mem] (0x87, mod!=3, 32/64-bit). Implicitly locked on
+    // x86 whether or not the prefix is written, so it is the spinlock-release
+    // idiom -- 45 bridge sites on the pthread workload. The gadget does an
+    // exclusive swap loop when aligned and hands a misaligned access to the
+    // interpreter's mutex path from inside, keeping both engines atomic with
+    // respect to each other. Byte/16-bit forms and the FS-prefixed form keep
+    // bridging for now.
+    if (!insn.two_byte_opcode && !insn.address_size_prefix &&
+            !insn.fs_prefix && !insn.operand_size_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
+            amd64_modrm_mod(insn.modrm) != 3 && insn.opcode == 0x87) {
+        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        extern void gadget_amd64_xchg_mem32(void), gadget_amd64_xchg_mem64(void);
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("xchg-mem ip=%llx size=%u next=%llx",
+                (unsigned long long) insn.start_ip, size, (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen(state, (unsigned long) (size == 64 ? gadget_amd64_xchg_mem64 : gadget_amd64_xchg_mem32));
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             (insn.opcode == 0x86 || insn.opcode == 0x87)) {
@@ -10410,15 +10442,25 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     // crypt hot-loop bottleneck (it block-bridged); its flags use the same
     // amd64_cached_set_addsub_flags as native CMP 0x3b/0x39 so they are bit-exact.
     // adc/sbb-imm (/2,/3), byte (0x80) and 16-bit keep bridging.
+    // fs_prefix is accepted: amd64_vmem_addr adds cpu->tls_ptr for the FS bit,
+    // and `cmpq $0, %fs:...` / `addl $1, %fs:...` are how TLS flags and counters
+    // get touched -- opcode 83 was 5.4% of the remaining bridges.
+    // lock_prefix and operand_size_prefix are accepted here and sorted out
+    // below: LOCK on the five RMW groups goes to the native LL/SC gadgets,
+    // and 0x66 is only taken for CMP (imm_cmp16). Everything else with either
+    // prefix falls through to the bridge as before.
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
-            !insn.fs_prefix && !insn.lock_prefix && !insn.operand_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             amd64_modrm_mod(insn.modrm) != 3 &&
             (insn.opcode == 0x81 || insn.opcode == 0x83) &&
+            (!insn.operand_size_prefix || amd64_modrm_reg(insn.modrm) == 7) &&
+            (!insn.lock_prefix || (amd64_modrm_reg(insn.modrm) != 7 &&
+                                   amd64_modrm_reg(insn.modrm) != 2 &&
+                                   amd64_modrm_reg(insn.modrm) != 3)) &&
             (amd64_modrm_reg(insn.modrm) == 0 || amd64_modrm_reg(insn.modrm) == 1 ||
              amd64_modrm_reg(insn.modrm) == 4 || amd64_modrm_reg(insn.modrm) == 5 ||
              amd64_modrm_reg(insn.modrm) == 6 || amd64_modrm_reg(insn.modrm) == 7)) {
-        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned size = insn.rex.w ? 64 : (insn.operand_size_prefix ? 16 : 32);
         unsigned group = amd64_modrm_reg(insn.modrm);
         bool is_logic = group == 1 || group == 4 || group == 6;
         bool is_cmp = group == 7;
@@ -10439,7 +10481,21 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             imm = imm8;
             next_ip += sizeof(imm8);
         } else {
-            int32_t imm32;
+            // With a 0x66 prefix, 0x81 carries an imm16, not an imm32. Reading
+            // four bytes here put next_ip two bytes past the instruction and
+            // desynced the whole block -- cc1 segfaulted on the very next
+            // compile. 0x83 is imm8 at every operand size and never had this.
+            if (insn.operand_size_prefix) {
+                int16_t imm16;
+                if (!tlb_read(tlb, next_ip, &imm16, sizeof(imm16))) {
+                    state->amd64_ip = state->amd64_orig_ip;
+                    state->amd64_fallback_to_interp = true;
+                    return false;
+                }
+                imm = imm16;
+                next_ip += sizeof(imm16);
+            } else {
+                        int32_t imm32;
             if (!tlb_read(tlb, next_ip, &imm32, sizeof(imm32))) {
                 state->amd64_ip = state->amd64_orig_ip;
                 state->amd64_fallback_to_interp = true;
@@ -10447,6 +10503,7 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             }
             imm = imm32;
             next_ip += sizeof(imm32);
+            }
         }
         state->amd64_ip = next_ip;
         amd64_jit_debug("imm-alu ip=%llx grp=%u logic=%d cmp=%d size=%u imm=%lx meta=%lx disp=%lx next=%llx",
@@ -10459,8 +10516,9 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 gadget_amd64_imm_cmp32(void), gadget_amd64_imm_cmp64(void);
         if (is_cmp) {
             // CMP: flags only, no store -> imm_cmp gadget (meta/disp/next_ip/imm).
-            gen(state, (unsigned long) (size == 64
-                        ? gadget_amd64_imm_cmp64 : gadget_amd64_imm_cmp32));
+            extern void gadget_amd64_imm_cmp16(void);
+            gen(state, (unsigned long) (size == 64 ? gadget_amd64_imm_cmp64
+                        : size == 16 ? gadget_amd64_imm_cmp16 : gadget_amd64_imm_cmp32));
             gen(state, meta);
             gen(state, disp);
             gen(state, (unsigned long) next_ip);
@@ -10471,6 +10529,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 g = size == 64 ? gadget_amd64_imm_logic64 : gadget_amd64_imm_logic32;
             else
                 g = size == 64 ? gadget_amd64_imm_arith64 : gadget_amd64_imm_arith32;
+            if (insn.lock_prefix) {
+                // The atomic variant: same operand layout, LL/SC core, and a
+                // misaligned access falls to the interpreter's mutex path from
+                // inside the gadget, so the two engines stay atomic together.
+                extern void gadget_amd64_lock_imm32(void), gadget_amd64_lock_imm64(void);
+                g = size == 64 ? gadget_amd64_lock_imm64 : gadget_amd64_lock_imm32;
+            }
             gen(state, (unsigned long) g);
             gen(state, meta);
             gen(state, disp);
