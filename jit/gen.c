@@ -6854,6 +6854,39 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         // reg-imm gadget with AL as the slot, and TEST AL/EAX/RAX, imm (a8/a9) to
         // the reg-imm TEST gadget -- together these were 46% of what cc1 still
         // bridged. adc/sbb (14/1c) and 16-bit keep bridging.
+        // 16-bit accumulator forms (66 05/0d/25/2d/35/3d, 66 a9): the gadgets the 16-bit
+        // modrm forms already use -- w16_alu_reg_imm for ADD/SUB/CMP, the size-agnostic
+        // logic reg-imm for OR/AND/XOR, the reg-imm TEST -- with AX as the register.
+        // `cmp ax, imm16` alone was 40% of what cc1 still bridged after round 3.
+        if (size == 16 && (is_test || op == 0 || op == 1 || op == 4 || op == 5 ||
+                           op == 6 || op == 7)) {
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("accum-imm16-direct ip=%llx op=%u test=%d value=%llx next=%llx",
+                    (unsigned long long) insn.start_ip, op, is_test,
+                    (unsigned long long) value, (unsigned long long) next_ip);
+            gen_amd64_ensure_reg_cache(state);
+            if (is_test) {
+                extern void gadget_amd64_cached_test_reg_imm(void);
+                gen(state, (unsigned long) gadget_amd64_cached_test_reg_imm);
+                gen(state, 16ul << 4);                 // rm 0 = AX
+                gen(state, value);
+            } else if (op == 1 || op == 4 || op == 6) {
+                extern void gadget_amd64_cached_logic_reg_imm(void);
+                gen(state, (unsigned long) gadget_amd64_cached_logic_reg_imm);
+                gen(state, (unsigned long) insn.opcode | ((unsigned long) op << 8) | (16ul << 16));
+                gen(state, value);
+                gen_amd64_mark_reg_cache_dirty(state);
+            } else {
+                extern void gadget_amd64_w16_alu_reg_imm(void);
+                gen(state, (unsigned long) gadget_amd64_w16_alu_reg_imm);
+                gen(state, (unsigned long) op);        // group | dst 0 (AX)
+                gen(state, value);
+                if (op != 7)
+                    gen_amd64_mark_reg_cache_dirty(state);
+            }
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
         if (size == 8 && !is_test &&
                 (op == 0 || op == 1 || op == 4 || op == 5 || op == 6 || op == 7)) {
             state->amd64_ip = next_ip;
@@ -7391,15 +7424,34 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     }
 #endif
 #if defined(__aarch64__)
-    // Native BSF/BSR (0F BC/BD) r, r/m, 32/64, no REP (REP = TZCNT/LZCNT, which keep
-    // bridging). Register source: gadget_amd64_bitscan_reg; memory: bitscan_mem32/64.
+    // lfence / mfence / sfence (0F AE /5,/6,/7, mod==3): ordering only, which the
+    // guest's single-threaded-per-cpu view already has; no gadget, just advance.
     if (!insn.address_size_prefix && !insn.lock_prefix && !insn.operand_size_prefix &&
-            insn.rep_mode == amd64_jit_rep_none && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.fs_prefix && insn.rep_mode == amd64_jit_rep_none && insn.two_byte_opcode &&
+            insn.has_modrm && insn.op2 == 0xae && amd64_modrm_mod(insn.modrm) == 3 &&
+            amd64_modrm_reg(insn.modrm) >= 5) {
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("fence-nop ip=%llx next=%llx",
+                (unsigned long long) insn.start_ip, (unsigned long long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+    // Native BSF/BSR (0F BC/BD) r, r/m, 32/64, and with REP their TZCNT/LZCNT forms.
+    // Register source: gadget_amd64_bitscan_reg; memory: bitscan_mem32/64.
+    if (!insn.address_size_prefix && !insn.lock_prefix && !insn.operand_size_prefix &&
+            (insn.rep_mode == amd64_jit_rep_none || insn.rep_mode == amd64_jit_repz) &&
+            insn.two_byte_opcode && insn.has_modrm &&
             (insn.op2 == 0xbc || insn.op2 == 0xbd) &&
             (amd64_modrm_mod(insn.modrm) != 3 || !insn.fs_prefix)) {
         unsigned size = insn.rex.w ? 64 : 32;
         unsigned dst_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
         unsigned long is_bsr = insn.op2 == 0xbd ? (1ul << 16) : 0ul;
+        unsigned long cz = insn.rep_mode == amd64_jit_repz ? (1ul << 18) : 0ul;   // TZCNT / LZCNT
         if (amd64_modrm_mod(insn.modrm) == 3) {
             unsigned src_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
             if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
@@ -7414,7 +7466,7 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             gen_amd64_flush_reg_cache(state);
             extern void gadget_amd64_bitscan_reg(void);
             gen(state, (unsigned long) gadget_amd64_bitscan_reg);
-            gen(state, (unsigned long) src_id | ((unsigned long) dst_id << 4) | is_bsr |
+            gen(state, (unsigned long) src_id | ((unsigned long) dst_id << 4) | is_bsr | cz |
                     (size == 64 ? (1ul << 17) : 0ul));
             gen_amd64_defer_rip(state, next_ip);
             return true;
@@ -7437,7 +7489,7 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         gen(state, meta);
         gen(state, disp);
         gen(state, (unsigned long) next_ip);
-        gen(state, ((unsigned long) dst_id << 4) | is_bsr);
+        gen(state, ((unsigned long) dst_id << 4) | is_bsr | cz);
         gen_amd64_defer_rip(state, next_ip);
         return true;
     }
@@ -10125,6 +10177,20 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         // Byte SHL/SHR/SAR r/m8 by 1 (0xd0) or CL (0xd2), mod==3, flush style. The
         // gadget forms the byte pointer itself: AH/CH/DH/BH are byte 1 of the slot
         // four below when no REX is present. ROL/ROR/RCL/RCR bytes keep bridging.
+        // 16-bit SHL/SHR/SAR by 1 (66 d1) or CL (66 d3), mod==3: gadget_amd64_shift16.
+        if (size == 16 && (group == 4 || group == 5 || group == 7)) {
+            unsigned long p16 = (unsigned long) rm_id | ((unsigned long) group << 4) |
+                (1ul << 8) | ((insn.opcode == 0xd3) ? (1ul << 17) : 0ul);
+            amd64_jit_debug("shift16-count ip=%llx op=%02x grp=%u rm=%u next=%llx",
+                    (unsigned long long) insn.start_ip, insn.opcode, group, rm_id,
+                    (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            extern void gadget_amd64_shift16(void);
+            gen(state, (unsigned long) gadget_amd64_shift16);
+            gen(state, p16);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
         if (size == 8 && (group == 4 || group == 5 || group == 7)) {
             unsigned raw_rm = amd64_modrm_rm(insn.modrm);
             bool is_high = !insn.rex.present && raw_rm >= 4;
@@ -10535,6 +10601,20 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
 #if defined(__aarch64__)
         // Byte SHL/SHR/SAR r/m8, imm8 (0xc0 /4,/5,/7), mod==3: gadget_amd64_shift8 with
         // the count in the packed word (masked by 31 there, as the hardware does).
+        // 16-bit SHL/SHR/SAR r/m16, imm8 (66 c1 /4,/5,/7), mod==3.
+        if (insn.opcode == 0xc1 && size == 16 && (group == 4 || group == 5 || group == 7)) {
+            unsigned long p16 = (unsigned long) rm_id | ((unsigned long) group << 4) |
+                ((value & 0xff) << 8);
+            amd64_jit_debug("shift16-imm ip=%llx grp=%u rm=%u imm=%llx next=%llx",
+                    (unsigned long long) insn.start_ip, group, rm_id,
+                    (unsigned long long) value, (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            extern void gadget_amd64_shift16(void);
+            gen(state, (unsigned long) gadget_amd64_shift16);
+            gen(state, p16);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
         if (insn.opcode == 0xc0 && (group == 4 || group == 5 || group == 7)) {
             unsigned raw_rm = amd64_modrm_rm(insn.modrm);
             bool is_high = !insn.rex.present && raw_rm >= 4;
@@ -11272,10 +11352,33 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     // Native CMP [mem], reg (0x39), 32/64, mod!=3: flags only, so the read path --
     // the rm-destination direction that the regmem arm leaves out only because the
     // others are RMW.
+    // Native CMP r16, [mem] (66 3b), mod!=3: read path, the 16-bit flag rule.
     if (!insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
-            !insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.operand_size_prefix && !insn.rex.w && insn.rep_mode == amd64_jit_rep_none &&
+            insn.has_modrm && amd64_modrm_mod(insn.modrm) != 3 && insn.opcode == 0x3b) {
+        unsigned long meta, disp;
+        if (!gen_amd64_decode_mem_meta(state, tlb, &insn, 16, &meta, &disp, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("regmem-cmp16 ip=%llx next=%llx",
+                (unsigned long long) insn.start_ip, (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        extern void gadget_amd64_regmem_cmp16(void);
+        gen(state, (unsigned long) gadget_amd64_regmem_cmp16);
+        gen(state, meta);
+        gen(state, disp);
+        gen(state, (unsigned long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+    if (!insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_rep_none &&
             insn.has_modrm && amd64_modrm_mod(insn.modrm) != 3 && insn.opcode == 0x39) {
-        unsigned size = insn.rex.w ? 64 : 32;
+        unsigned size = insn.rex.w ? 64 : (insn.operand_size_prefix ? 16 : 32);
         unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
         unsigned long meta, disp;
         if (!gen_amd64_decode_mem_meta(state, tlb, &insn, size, &meta, &disp, &next_ip)) {
@@ -11289,8 +11392,10 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 (unsigned long long) next_ip);
         gen_amd64_flush_reg_cache(state);
         gen_amd64_flush_rip(state);
-        extern void gadget_amd64_cmp_memreg32(void), gadget_amd64_cmp_memreg64(void);
+        extern void gadget_amd64_cmp_memreg32(void), gadget_amd64_cmp_memreg64(void),
+                gadget_amd64_cmp_memreg16(void);
         gen(state, (unsigned long) (size == 64 ? gadget_amd64_cmp_memreg64
+                                  : size == 16 ? gadget_amd64_cmp_memreg16
                                                : gadget_amd64_cmp_memreg32));
         gen(state, meta);
         gen(state, disp);
@@ -11431,13 +11536,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
     // get touched -- opcode 83 was 5.4% of the remaining bridges.
     // lock_prefix and operand_size_prefix are accepted here and sorted out
     // below: LOCK on the five RMW groups goes to the native LL/SC gadgets,
-    // and 0x66 is only taken for CMP (imm_cmp16). Everything else with either
-    // prefix falls through to the bridge as before.
+    // and 0x66 is taken for every group (imm_cmp16, imm_arith16, imm_logic16)
+    // except with LOCK. Everything else with either prefix bridges as before.
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             amd64_modrm_mod(insn.modrm) != 3 &&
             (insn.opcode == 0x81 || insn.opcode == 0x83) &&
-            (!insn.operand_size_prefix || amd64_modrm_reg(insn.modrm) == 7) &&
+            (!insn.operand_size_prefix || !insn.lock_prefix) &&
             (!insn.lock_prefix || (amd64_modrm_reg(insn.modrm) != 7 &&
                                    amd64_modrm_reg(insn.modrm) != 2 &&
                                    amd64_modrm_reg(insn.modrm) != 3)) &&
@@ -11509,10 +11614,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             gen(state, (unsigned long) imm);
         } else {
             void (*g)(void);
+            extern void gadget_amd64_imm_logic16(void), gadget_amd64_imm_arith16(void);
             if (is_logic)
-                g = size == 64 ? gadget_amd64_imm_logic64 : gadget_amd64_imm_logic32;
+                g = size == 64 ? gadget_amd64_imm_logic64
+                  : size == 16 ? gadget_amd64_imm_logic16 : gadget_amd64_imm_logic32;
             else
-                g = size == 64 ? gadget_amd64_imm_arith64 : gadget_amd64_imm_arith32;
+                g = size == 64 ? gadget_amd64_imm_arith64
+                  : size == 16 ? gadget_amd64_imm_arith16 : gadget_amd64_imm_arith32;
             if (insn.lock_prefix) {
                 // The atomic variant: same operand layout, LL/SC core, and a
                 // misaligned access falls to the interpreter's mutex path from

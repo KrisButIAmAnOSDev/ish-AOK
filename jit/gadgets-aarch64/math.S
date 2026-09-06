@@ -6118,19 +6118,21 @@ _gadget_array_start fused_test32
     amd64_vread_bullshit 1, byte_alu_memreg_r
     amd64_vwrite_bullshit 1, byte_alu_memreg_w
 
-# BSF (0F BC) / BSR (0F BD) r, r/m, 32/64, no REP prefix (TZCNT/LZCNT keep
-# bridging: they redefine what a zero source means). A zero source sets ZF and
-# leaves the destination alone, exactly as the interpreter does; otherwise ZF is
-# cleared and the destination gets the bit index (zero-extended into the slot,
-# which is also the 32-bit rule). CF/OF/SF/AF/PF are architecturally undefined
-# and are left untouched. ZF goes into eflags and its lazy bit is cleared.
-# Body inputs: x10 = source (already zero-extended for 32-bit), x12 = dst slot,
-# x8 bit 16 = BSR. Clobbers x11, x14, x15, x16, x17.
+# BSF (0F BC) / BSR (0F BD) r, r/m, 32/64, and with a REP prefix TZCNT / LZCNT.
+# Body inputs: x10 = source (zero-extended for 32-bit), x12 = dst slot, x8 bit 16
+# = reverse (BSR/LZCNT), bit 17 = 64-bit, bit 18 = count zeroes (TZCNT/LZCNT).
+# BSF/BSR: a zero source sets ZF and leaves the destination alone, as the
+# interpreter does; otherwise ZF is cleared and the destination gets the bit
+# index. TZCNT/LZCNT: CF = (source == 0), the result is the operand size for a
+# zero source or the count otherwise, ZF = (result == 0), destination always
+# written. Nothing else is touched (architecturally undefined). ZF/CF go into
+# eflags (and the CF byte); the lazy ZF bit is cleared.
 .macro amd64_bitscan_body
     ldrb w11, [_cpu, CPU_flags_res]
     bic  w11, w11, ZF_RES
     strb w11, [_cpu, CPU_flags_res]
     ldr  w17, [_cpu, CPU_eflags]
+    tbnz x8, 18, .Lbs_cz_\@
     cbnz x10, .Lbs_nonzero_\@
     orr  w17, w17, ZF_FLAG
     str  w17, [_cpu, CPU_eflags]
@@ -6149,10 +6151,41 @@ _gadget_array_start fused_test32
 .Lbs_store_\@:
     add  x14, _cpu, CPU_amd64_regs
     str  x15, [x14, x12, lsl 3]
+    b    .Lbs_done_\@
+.Lbs_cz_\@:
+    mov  x16, 32
+    tbz  x8, 17, .Lbs_cz_sized_\@
+    mov  x16, 64
+.Lbs_cz_sized_\@:
+    cbz  x10, .Lbs_cz_zero_\@
+    tbnz x8, 16, .Lbs_lz_\@
+    rbit x15, x10                    /* TZCNT */
+    clz  x15, x15
+    b    .Lbs_cz_res_\@
+.Lbs_lz_\@:
+    clz  x15, x10                    /* LZCNT: leading zeros within the operand */
+    sub  x15, x15, 64
+    add  x15, x15, x16
+    b    .Lbs_cz_res_\@
+.Lbs_cz_zero_\@:
+    mov  x15, x16                    /* zero source: the operand size */
+.Lbs_cz_res_\@:
+    cmp  x10, 0
+    cset w14, eq                     /* CF = source == 0 */
+    strb w14, [_cpu, CPU_cf]
+    bic  w17, w17, 1                 /* 0x41 is not a logical immediate: two steps */
+    bic  w17, w17, ZF_FLAG
+    orr  w17, w17, w14
+    cmp  x15, 0
+    cset w14, eq                     /* ZF = result == 0 */
+    orr  w17, w17, w14, lsl 6
+    str  w17, [_cpu, CPU_eflags]
+    add  x14, _cpu, CPU_amd64_regs
+    str  x15, [x14, x12, lsl 3]
 .Lbs_done_\@:
 .endm
 
-# Register source. packed(0) = src(0-3) | dst(4-7) | is_bsr(16) | is64(17). gret 1.
+# Register source. packed(0) = src(0-3) | dst(4-7) | is_bsr(16) | is64(17) | cz(18). gret 1.
 .gadget amd64_bitscan_reg
     ldr  x8, [_ip]
     and  x11, x8, 0xf
@@ -6165,7 +6198,7 @@ _gadget_array_start fused_test32
     gret 1
 
 # Memory source. Operands: [meta][disp][next_ip][packed], packed = dst(4-7) |
-# is_bsr(16); the width is the gadget's. gret 4.
+# is_bsr(16) | cz(18); the width is the gadget's (bit 17 set here). gret 4.
 .macro amd64_gen_bitscan_mem name, vbytes
 .gadget amd64_\name
     ldr  x8, [_ip]
@@ -6178,6 +6211,9 @@ _gadget_array_start fused_test32
     ldr  x10, [x9]
 .endif
     ldr  x8, [_ip, 24]
+.if \vbytes == 8
+    orr  x8, x8, (1 << 17)
+.endif
     ubfx x12, x8, 4, 4
     amd64_bitscan_body
     gret 4
@@ -7136,3 +7172,181 @@ amd64_v_gen_comis comisd, 8
     ldr  x12, [x9]
     str  x12, [x10, 8]
     gret 1
+
+# ===========================================================================
+# Round 4: the 16-bit family (imm-to-mem arith/logic, CMP mem<->r16, shifts),
+# TZCNT/LZCNT as a mode of the bit-scan gadgets, fences need no gadget.
+#
+# 16-bit flag rule (as imm_cmp16): compute on zero-extended halves in a
+# 32-bit register; CF is bit 16 of the raw result (borrow/carry out of bit
+# 15), OF is ((lhs ^ rhs) & (lhs ^ res)) bit 15 for a subtract and
+# (~(lhs ^ rhs) & (lhs ^ res)) bit 15 for an add; the stored result is the
+# low 16 bits, and ZF/SF(15)/PF/AF come from amd64_cached_set_addsub_flags 15.
+# ===========================================================================
+
+# w13 = lhs (0..0xffff), w10 = rhs (0..0xffff), x9 = group (0 add, 5 sub).
+# Out: w15 = 16-bit result, w14 = CF, w16 = OF; x13/x10 preserved for the
+# flag macro's AF.
+.macro amd64_w16_addsub
+    cmp  x9, 0
+    b.eq 1f
+    sub  w15, w13, w10
+    lsr  w14, w15, 16
+    and  w14, w14, 1
+    eor  w16, w13, w10
+    eor  w17, w13, w15
+    and  w16, w16, w17
+    b    2f
+1:  add  w15, w13, w10
+    lsr  w14, w15, 16
+    and  w14, w14, 1
+    eor  w16, w13, w10
+    eor  w17, w13, w15
+    bic  w16, w17, w16
+2:  lsr  w16, w16, 15
+    and  w16, w16, 1
+    and  w15, w15, 0xffff
+.endm
+
+# op word [mem], imm (66 81 /0,/5 imm16; 66 83 /0,/5 imm8 sign-extended),
+# mod!=3, no LOCK. Dual-prep RMW. Operands: meta/disp/next_ip/imm/group, gret 5.
+.gadget amd64_imm_arith16
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    mov  x0, x9
+    amd64_vread_prep 2, imm_arith16_r
+    ldrh w13, [x9]
+    ldr  x10, [_ip, 24]
+    and  w10, w10, 0xffff
+    ldr  x9, [_ip, 32]
+    amd64_w16_addsub
+    amd64_cached_set_addsub_flags 15
+    mov  x10, x15
+    mov  x9, x0
+    amd64_vwrite_prep 2, imm_arith16_w
+    strh w10, [x9]
+    amd64_vwrite_done 2, imm_arith16_w
+    gret 5
+    amd64_vread_bullshit 2, imm_arith16_r
+    amd64_vwrite_bullshit 2, imm_arith16_w
+
+# or/and/xor word [mem], imm (66 81/83 /1,/4,/6). gret 5.
+.gadget amd64_imm_logic16
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    mov  x0, x9
+    amd64_vread_prep 2, imm_logic16_r
+    ldrh w13, [x9]
+    ldr  x10, [_ip, 24]
+    and  w10, w10, 0xffff
+    ldr  x9, [_ip, 32]
+    cmp  x9, 4
+    b.eq 1f
+    cmp  x9, 6
+    b.eq 2f
+    orr  w15, w13, w10
+    b    3f
+1:  and  w15, w13, w10
+    b    3f
+2:  eor  w15, w13, w10
+3:  and  w15, w15, 0xffff
+    mov  x11, 16
+    amd64_cached_set_logic_flags x15, x11
+    mov  x10, x15
+    mov  x9, x0
+    amd64_vwrite_prep 2, imm_logic16_w
+    strh w10, [x9]
+    amd64_vwrite_done 2, imm_logic16_w
+    gret 5
+    amd64_vread_bullshit 2, imm_logic16_r
+    amd64_vwrite_bullshit 2, imm_logic16_w
+
+# CMP word [mem], r16 (66 39): lhs = memory, rhs = register. [meta][disp][next_ip][reg], gret 4.
+.gadget amd64_cmp_memreg16
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep 2, cmp_memreg16
+    ldrh w13, [x9]
+    ldr  x12, [_ip, 24]
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x10, [x14, x12, lsl 3]
+    and  w10, w10, 0xffff
+    mov  x9, 5
+    amd64_w16_addsub
+    amd64_cached_set_addsub_flags 15
+    gret 4
+    amd64_vread_bullshit 2, cmp_memreg16
+
+# CMP r16, word [mem] (66 3b): lhs = register, rhs = memory. [meta][disp][next_ip], reg in
+# meta bits 8-11, gret 3.
+.gadget amd64_regmem_cmp16
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    amd64_vmem_addr
+    amd64_vread_prep 2, regmem_cmp16
+    ldrh w10, [x9]
+    ldr  x8, [_ip]
+    ubfx x12, x8, 8, 4
+    add  x14, _cpu, CPU_amd64_regs
+    ldr  x13, [x14, x12, lsl 3]
+    and  w13, w13, 0xffff
+    mov  x9, 5
+    amd64_w16_addsub
+    amd64_cached_set_addsub_flags 15
+    gret 3
+    amd64_vread_bullshit 2, regmem_cmp16
+
+# SHL/SHR/SAR r/m16 by 1 (66 d1), CL (66 d3) or imm8 (66 c1), mod==3. Same shape as
+# shift8 with a 16-bit width: count masked by 31, CF the last bit out (0 past
+# the width), OF for count 1 only, result written into the low 16 bits.
+# packed = rm(0-3) | group(4-7) | count(8-15) | use_cl(17). gret 1.
+.gadget amd64_shift16
+    ldr  x8, [_ip]
+    and  x11, x8, 0xf
+    ubfx x9, x8, 4, 4
+    ubfx x10, x8, 8, 8
+    add  x13, _cpu, CPU_amd64_regs
+    tbz  x8, 17, 1f
+    ldrb w10, [x13, 8]               /* CL */
+1:  add  x11, x13, x11, lsl 3        /* &regs[rm] */
+    and  x10, x10, 31
+    cbz  x10, 9f
+    ldrh w13, [x11]                  /* operand, zero-extended */
+    cmp  x9, 4
+    b.eq 3f
+    cmp  x9, 5
+    b.eq 4f
+    sxth w13, w13                    /* SAR on the sign-extended value */
+    asr  w15, w13, w10
+    sub  w12, w10, 1
+    lsr  w14, w13, w12
+    b    5f
+3:  lsl  w15, w13, w10               /* SHL */
+    mov  w12, 16
+    sub  w12, w12, w10
+    lsr  w14, w13, w12               /* CF = bit (16-count); 0 past 16 */
+    b    5f
+4:  lsr  w15, w13, w10               /* SHR */
+    sub  w12, w10, 1
+    lsr  w14, w13, w12
+5:  and  w14, w14, 1
+    mov  w16, 0
+    cmp  x10, 1
+    b.ne 6f
+    cmp  x9, 4
+    b.eq 7f
+    cmp  x9, 5
+    b.eq 8f
+    b    6f
+7:  lsr  w16, w15, 15                /* SHL: OF = bit15(res) ^ CF */
+    and  w16, w16, 1
+    eor  w16, w16, w14
+    b    6f
+8:  lsr  w16, w13, 15                /* SHR: OF = sign of the source */
+6:  and  w15, w15, 0xffff
+    strh w15, [x11]                  /* low 16 of the slot; upper 48 preserved */
+    amd64_cached_set_shift_flags 15
+9:  gret 1
