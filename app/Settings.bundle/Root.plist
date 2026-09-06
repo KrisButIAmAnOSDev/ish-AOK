@@ -62,7 +62,9 @@
 			<key>FooterText</key>
 			<string>Lets iSH-AOK move cold guest memory out to storage, so a large mostly-idle heap or a background process tree stops counting against the memory iOS allows the app. It will not make a working set that is genuinely too big run well.
 
-Off unless you turn it on: swapping writes to the device&apos;s flash, and the swap area takes up that much space in the app&apos;s container while it exists. Both settings take effect the next time iSH-AOK starts, and swap stays off until you have chosen a size as well as switched it on.</string>
+Off unless you turn it on: swapping writes to the device&apos;s flash, and the swap area takes up that much space in the app&apos;s container while it exists. Both settings take effect the next time iSH-AOK starts, and swap stays off until you have chosen a size as well as switched it on.
+
+The sizes offered here do not know how much room this device actually has. If there is not enough free space for the size you pick, iSH-AOK leaves swap off rather than quietly making a smaller area than you asked for; &quot;cat /proc/ish/swap&quot; in the guest says which of those happened.</string>
 		</dict>
 		<dict>
 			<key>Type</key>

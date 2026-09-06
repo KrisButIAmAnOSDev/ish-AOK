@@ -420,9 +420,23 @@ static void swap_disable_locked(void) {
     printk("swap: disabled\n");
 }
 
+// The last enable attempt, so a refusal can say WHY. Without this the only
+// guest-visible evidence that a user asked for swap and did not get it is
+// `enabled no`, which is indistinguishable from never having asked -- and the
+// most likely reason is the one the Settings picker cannot prevent: it offers
+// sizes up to 16 GB on a device that may not have 16 GB free, and swap_reserve
+// deliberately refuses rather than quietly handing back a smaller area.
+// Relaxed atomics: written once per enable attempt under swap_config_lock,
+// read by the status text with no lock, and a torn read here would only
+// mis-describe an already-failed enable.
+static _Atomic int swap_last_enable_err;
+static _Atomic uint64_t swap_last_enable_bytes;
+
 int swap_enable(uint64_t bytes) {
     lock(&swap_config_lock, 0);
     int err = swap_enable_locked(bytes);
+    atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
+    atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
     unlock(&swap_config_lock);
     return err;
 }
@@ -1214,6 +1228,27 @@ size_t swap_status_text(char *buf, size_t size) {
         return 0;
     struct swap_stats s;
     swap_get_stats(&s);
+
+    // Only says anything when an enable was actually attempted AND refused.
+    // A refusal with no explanation reads exactly like "swap was never turned
+    // on", and the most likely cause is invisible from in here: the Settings
+    // picker offers up to 16 GB whatever the device has free, and swap_reserve
+    // refuses rather than handing back a smaller area than was asked for.
+    char failure[160] = "";
+    int last_err = atomic_load_explicit(&swap_last_enable_err, memory_order_relaxed);
+    if (!s.enabled && last_err != 0) {
+        unsigned long long mb =
+            (unsigned long long) (atomic_load_explicit(&swap_last_enable_bytes,
+                    memory_order_relaxed) / (1024 * 1024));
+        const char *why = last_err == _ENOSPC ? "not enough free space for an area that size"
+            : last_err == _EINVAL ? "size not usable"
+            : last_err == _EBUSY  ? "the previous area is still draining"
+            : last_err == _ENOMEM ? "out of memory"
+            : "refused";
+        snprintf(failure, sizeof(failure),
+                 "last_enable      %llu MB requested, refused: %s\n", mb, why);
+    }
+
     int n = snprintf(buf, size,
         "enabled          %s\n"
         "state            %s\n"
@@ -1232,7 +1267,8 @@ size_t swap_status_text(char *buf, size_t size) {
         "direct_reclaim   %llu  (bytes freed for an allocation that would have failed)\n"
         "alloc_failures   %llu  (evictions refused, the area is full)\n"
         "no_area          %llu  (evictions refused, there is no area)\n"
-        "io_errors        %llu\n",
+        "io_errors        %llu\n"
+        "%s",
         s.enabled ? "yes" : "no",
         s.enabled ? "on" : (s.draining ? "off, draining" : "off"),
         (unsigned long long) s.slot_size,
@@ -1258,7 +1294,8 @@ size_t swap_status_text(char *buf, size_t size) {
         (unsigned long long) s.direct_reclaim_bytes,
         (unsigned long long) s.alloc_failures,
         (unsigned long long) s.no_area,
-        (unsigned long long) s.io_errors);
+        (unsigned long long) s.io_errors,
+        failure);
     if (n < 0)
         return 0;
     return (size_t) n >= size ? size - 1 : (size_t) n;
