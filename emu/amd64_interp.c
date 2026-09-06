@@ -8934,8 +8934,12 @@ restart_prefix:
                 cpu->amd64_rip = saved_rip;
                 return INT_GPF;
             }
-            if (amd64_cond_eval(cpu, op2 & 0xf))
-                amd64_reg_set(cpu, modrm.reg, op_size, src);
+            // Unconditional write -- see the note on the other CMOVcc copy:
+            // real x86-64 writes the destination even when the condition is
+            // false, and a 32-bit write zero-extends.
+            qword_t cmov_cur = amd64_reg_get(cpu, modrm.reg, op_size);
+            amd64_reg_set(cpu, modrm.reg, op_size,
+                          amd64_cond_eval(cpu, op2 & 0xf) ? src : cmov_cur);
             break;
         }
         if (op2 >= 0x90 && op2 <= 0x9f) {
@@ -14373,8 +14377,20 @@ int amd64_jit_0f_rm(struct cpu_state *cpu, struct tlb *tlb,
         qword_t src;
         if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, op_size, &src))
             goto amd64_0f_rm_pf;
-        if (amd64_cond_eval(cpu, op2 & 0xf))
-            amd64_reg_set(cpu, modrm.reg, op_size, src);
+        // The destination is written EVEN WHEN THE CONDITION IS FALSE. That is
+        // not a quirk of this emulator: on real x86-64 a 32-bit CMOVcc always
+        // writes its destination register, and a 32-bit write zero-extends, so
+        // a not-taken `cmovel` clears the upper 32 bits. Verified on real
+        // hardware -- dst 0xAAAAAAAAFFFFFFFF, condition false, result
+        // 0x00000000FFFFFFFF.
+        //
+        // Writing the current value back is a no-op at 16 and 64 bits (neither
+        // zero-extends), so one unconditional write is correct for every size,
+        // and skipping it was leaving the top half of the register holding
+        // whatever happened to be there.
+        qword_t cur = amd64_reg_get(cpu, modrm.reg, op_size);
+        amd64_reg_set(cpu, modrm.reg, op_size,
+                      amd64_cond_eval(cpu, op2 & 0xf) ? src : cur);
         cpu->amd64_rip = (qword_t) next_ip;
         amd64_sync_legacy_regs(cpu);
         return INT_NONE;

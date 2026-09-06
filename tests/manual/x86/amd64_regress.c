@@ -587,6 +587,48 @@ static void test_push_pop_lifo(void) {
     test_logf("push_pop_lifo: ok\n");
 }
 
+// CMOVcc writes its destination EVEN WHEN THE CONDITION IS FALSE, and a
+// 32-bit write zero-extends -- so a not-taken 32-bit cmov clears the upper half
+// of the register. Verified on real x86-64 hardware: destination
+// 0xAAAAAAAAFFFFFFFF with a false condition comes back 0x00000000FFFFFFFF.
+//
+// AOK got this wrong in BOTH of its CMOVcc implementations (emu/amd64_interp.c
+// has two copies), writing only when the condition held and leaving whatever
+// was in the top 32 bits. gcc emits cmov constantly, so the stale half was
+// reachable from ordinary compiled code.
+static void test_cmov_false_zero_extends(void) {
+    uint64_t dst = 0xAAAAAAAAFFFFFFFFull;
+    uint32_t src = 0x55667788u;
+    __asm__ volatile("cmpl $1, %2\n\t"      /* 0 == 1 is false */
+                     "cmovel %1, %k0"
+                     : "+r"(dst) : "r"(src), "r"(0) : "cc");
+    if (dst != 0x00000000FFFFFFFFull) {
+        failf("cmov_false_zero_extends", 0, dst, 0x00000000FFFFFFFFull, 0, 0, 0);
+        return;
+    }
+    // And the taken case must move AND zero-extend.
+    uint64_t dst2 = 0xAAAAAAAA11111111ull;
+    __asm__ volatile("cmpl $0, %2\n\t"      /* 0 == 0 is true */
+                     "cmovel %1, %k0"
+                     : "+r"(dst2) : "r"(src), "r"(0) : "cc");
+    if (dst2 != 0x0000000055667788ull) {
+        failf("cmov_true_zero_extends", 0, dst2, 0x0000000055667788ull, 0, 0, 0);
+        return;
+    }
+    // 64-bit operand size does NOT zero-extend anything; a false condition
+    // must leave the register completely untouched.
+    uint64_t dst3 = 0xAAAAAAAA11111111ull;
+    uint64_t src3 = 0x1122334455667788ull;
+    __asm__ volatile("cmpl $1, %2\n\t"
+                     "cmoveq %1, %0"
+                     : "+r"(dst3) : "r"(src3), "r"(0) : "cc");
+    if (dst3 != 0xAAAAAAAA11111111ull) {
+        failf("cmov_false_64bit_untouched", 0, dst3, 0xAAAAAAAA11111111ull, 0, 0, 0);
+        return;
+    }
+    test_logf("cmov_false_zero_extends: ok\n");
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--exec-child") == 0)
         return helper_exec_child();
@@ -597,6 +639,7 @@ int main(int argc, char **argv) {
     test_exec_loader_straddle();
     test_fcntl_lock_close_race();
     test_push_pop_lifo();
+    test_cmov_false_zero_extends();
     test_cc1_varargs_compile_stress();
     return finish_suite("amd64_regress");
 }
