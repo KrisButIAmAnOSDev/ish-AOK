@@ -2670,28 +2670,6 @@ amd64_v_scalar_double addsd, fadd
 # F2 0F 59 mulsd
 amd64_v_scalar_double mulsd, fmul
 
-# cvtsi2sd xmm, r/m (F2 0F 2A), reg-reg: xmm[dst].f64[0] = (double) signed GPR[src].
-# Operand: GPR src id bits 0-3, xmm dst id bits 4-7, REX.W in bit 8 (1=64-bit
-# source, 0=32-bit). gen.c flushes the reg cache first so cpu->amd64_regs is
-# current, then this reads the source straight from memory. scvtf matches the
-# interp's C (double) cast bit-for-bit. Only the low 64 bits of dst are written.
-.gadget amd64_v_cvtsi2sd_reg
-    ldr x8, [_ip]
-    and x9, x8, 0xf
-    ubfx x10, x8, 4, 4
-    add x12, _cpu, CPU_amd64_regs
-    add x12, x12, x9, lsl 3
-    tbz x8, 8, 1f
-    ldr x12, [x12]
-    scvtf d0, x12
-    b 2f
-1:  ldr w12, [x12]
-    scvtf d0, w12
-2:  add x13, _cpu, CPU_xmm
-    add x13, x13, x10, lsl 4
-    str d0, [x13]
-    gret 1
-
 # Packed byte op over the full 16 bytes of an xmm: cpu->xmm[dst] = xmm[dst] OP
 # xmm[src], via a single NEON .16b instruction. Used for the glibc strlen/memchr
 # SSE2 byte-scan that dominates crypt/login (pcmpeqb + psubb). Touches only
@@ -7350,3 +7328,172 @@ amd64_v_gen_comis comisd, 8
     strh w15, [x11]                  /* low 16 of the slot; upper 48 preserved */
     amd64_cached_set_shift_flags 15
 9:  gret 1
+
+# ===========================================================================
+# Scalar int <-> float conversions: F2/F3 0F 2A cvtsi2sd/cvtsi2ss, 0F 2C
+# cvttsd2si/cvttss2si, 0F 2D cvtsd2si/cvtss2si.
+#
+# x86 semantics, not aarch64's: a NaN or out-of-range source converts to the
+# integer indefinite (0x80000000 / 0x8000000000000000) where fcvtzs would
+# saturate. fcvtzs already yields 0x80000000 for anything below the range, so
+# only the high side and NaN need the substitute: after `fcmp src, 2^N` the
+# condition PL (N clear) is exactly "src >= 2^N or unordered". The rounding
+# forms (0F 2D) go through frintn first -- nearest-even, the x86 power-on
+# MXCSR.RC, which iSH does not model -- so the range check sees the ROUNDED
+# value: 2147483647.6 rounds to 2^31 and must be indefinite. cvtsi2sd/ss
+# write only the low lane (a d/s-sized store), the other lanes survive.
+#
+# Reg forms: packed = src(0-3) | dst(4-7) | REX.W(8), gret 1. Mem forms:
+# [meta][disp][next_ip], dst in meta bits 8-11, plus [w] as a 4th word for
+# the int destinations (gret 4); the int sources have per-width gadgets
+# (gret 3). All flush style: a GPR is read or written every time.
+# ===========================================================================
+
+# In: s0 (vbytes==4) or d0 = source, x12 bit 0 = REX.W. Out: x13 = result,
+# zero-extended when 32-bit. Clobbers x14, v0, v1.
+.macro amd64_v_f2i_convert vbytes, round
+    .if \vbytes == 4
+        .if \round
+            frintn s0, s0
+        .endif
+        tbnz x12, 0, 1f
+        fcvtzs w13, s0
+        mov  w14, 0x4f000000                 /* 2^31 as float */
+        fmov s1, w14
+        fcmp s0, s1
+        mov  w14, 0x80000000
+        csel w13, w14, w13, pl
+        b    2f
+1:      fcvtzs x13, s0
+        mov  w14, 0x5f000000                 /* 2^63 as float */
+        fmov s1, w14
+        fcmp s0, s1
+        mov  x14, 0x8000000000000000
+        csel x13, x14, x13, pl
+2:
+    .else
+        .if \round
+            frintn d0, d0
+        .endif
+        tbnz x12, 0, 1f
+        fcvtzs w13, d0
+        mov  x14, 0x41e0000000000000         /* 2^31 as double */
+        fmov d1, x14
+        fcmp d0, d1
+        mov  w14, 0x80000000
+        csel w13, w14, w13, pl
+        b    2f
+1:      fcvtzs x13, d0
+        mov  x14, 0x43e0000000000000         /* 2^63 as double */
+        fmov d1, x14
+        fcmp d0, d1
+        mov  x14, 0x8000000000000000
+        csel x13, x14, x13, pl
+2:
+    .endif
+.endm
+
+.macro amd64_v_gen_f2i name, vbytes, round
+    .gadget amd64_v_\name\()_reg
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        add  x11, _cpu, CPU_xmm
+        add  x9, x11, x9, lsl 4
+    .if \vbytes == 4
+        ldr  s0, [x9]
+    .else
+        ldr  d0, [x9]
+    .endif
+        ubfx x12, x8, 8, 1
+        amd64_v_f2i_convert \vbytes, \round
+        add  x14, _cpu, CPU_amd64_regs
+        str  x13, [x14, x10, lsl 3]
+        gret 1
+    .gadget amd64_v_\name\()_mem
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep \vbytes, \name\()_mem
+    .if \vbytes == 4
+        ldr  s0, [x9]
+    .else
+        ldr  d0, [x9]
+    .endif
+        ldr  x12, [_ip, 24]
+        amd64_v_f2i_convert \vbytes, \round
+        add  x14, _cpu, CPU_amd64_regs
+        str  x13, [x14, x10, lsl 3]
+        gret 4
+        amd64_vread_bullshit \vbytes, \name\()_mem
+.endm
+amd64_v_gen_f2i cvttsd2si, 8, 0
+amd64_v_gen_f2i cvttss2si, 4, 0
+amd64_v_gen_f2i cvtsd2si,  8, 1
+amd64_v_gen_f2i cvtss2si,  4, 1
+
+# cvtsi2sd (F2 0F 2A) / cvtsi2ss (F3 0F 2A): a signed 32-bit (w) or 64-bit (x)
+# GPR or memory source into the low lane of xmm[dst]. scvtf rounds per FPCR
+# (nearest-even), which is also what the interpreter's C cast does.
+.macro amd64_v_gen_i2f name, single
+    .gadget amd64_v_\name\()_reg
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        add  x12, _cpu, CPU_amd64_regs
+        ldr  x12, [x12, x9, lsl 3]
+        add  x13, _cpu, CPU_xmm
+        add  x13, x13, x10, lsl 4
+        tbnz x8, 8, 1f
+    .if \single
+        scvtf s0, w12
+        b    2f
+1:      scvtf s0, x12
+2:      str  s0, [x13]
+    .else
+        scvtf d0, w12
+        b    2f
+1:      scvtf d0, x12
+2:      str  d0, [x13]
+    .endif
+        gret 1
+    .gadget amd64_v_\name\()_mem32
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep 4, \name\()_mem32
+        ldr  w12, [x9]
+        add  x13, _cpu, CPU_xmm
+        add  x13, x13, x10, lsl 4
+    .if \single
+        scvtf s0, w12
+        str  s0, [x13]
+    .else
+        scvtf d0, w12
+        str  d0, [x13]
+    .endif
+        gret 3
+        amd64_vread_bullshit 4, \name\()_mem32
+    .gadget amd64_v_\name\()_mem64
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep 8, \name\()_mem64
+        ldr  x12, [x9]
+        add  x13, _cpu, CPU_xmm
+        add  x13, x13, x10, lsl 4
+    .if \single
+        scvtf s0, x12
+        str  s0, [x13]
+    .else
+        scvtf d0, x12
+        str  d0, [x13]
+    .endif
+        gret 3
+        amd64_vread_bullshit 8, \name\()_mem64
+.endm
+amd64_v_gen_i2f cvtsi2sd, 0
+amd64_v_gen_i2f cvtsi2ss, 1

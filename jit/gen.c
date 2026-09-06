@@ -8062,6 +8062,84 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
+    // ---- scalar int<->float conversions: F2/F3 0F 2A cvtsi2sd/cvtsi2ss (GPR or
+    // 4/8-byte memory source, width per REX.W), 0F 2C cvttsd2si/cvttss2si
+    // (truncate) and 0F 2D cvtsd2si/cvtss2si (round to nearest-even), xmm or
+    // 8/4-byte memory source, 32/64-bit GPR destination per REX.W. The gadgets
+    // give x86 results where fcvtzs would saturate: a NaN or out-of-range source
+    // becomes the integer indefinite. A GPR is read or written either way, so
+    // every form is flush style. 66 with F2/F3 is #UD and stays with the bridge.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            !insn.lock_prefix && !insn.operand_size_prefix &&
+            insn.rep_mode != amd64_jit_rep_none &&
+            (insn.op2 == 0x2a || insn.op2 == 0x2c || insn.op2 == 0x2d)) {
+        extern void gadget_amd64_v_cvtsi2sd_reg(void), gadget_amd64_v_cvtsi2sd_mem32(void),
+                gadget_amd64_v_cvtsi2sd_mem64(void);
+        extern void gadget_amd64_v_cvtsi2ss_reg(void), gadget_amd64_v_cvtsi2ss_mem32(void),
+                gadget_amd64_v_cvtsi2ss_mem64(void);
+        extern void gadget_amd64_v_cvttsd2si_reg(void), gadget_amd64_v_cvttsd2si_mem(void);
+        extern void gadget_amd64_v_cvttss2si_reg(void), gadget_amd64_v_cvttss2si_mem(void);
+        extern void gadget_amd64_v_cvtsd2si_reg(void), gadget_amd64_v_cvtsd2si_mem(void);
+        extern void gadget_amd64_v_cvtss2si_reg(void), gadget_amd64_v_cvtss2si_mem(void);
+        bool is_mem = amd64_modrm_mod(insn.modrm) != 3;
+        bool dbl = insn.rep_mode == amd64_jit_repnz;   // F2: double, F3: single
+        bool wide = insn.rex.w;
+        bool to_int = insn.op2 != 0x2a;
+        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
+        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
+        void (*gadget)(void);
+        unsigned src_bits;
+        if (!to_int) {
+            src_bits = wide ? 64 : 32;
+            gadget = !is_mem ? (dbl ? gadget_amd64_v_cvtsi2sd_reg : gadget_amd64_v_cvtsi2ss_reg)
+                   : wide ? (dbl ? gadget_amd64_v_cvtsi2sd_mem64 : gadget_amd64_v_cvtsi2ss_mem64)
+                          : (dbl ? gadget_amd64_v_cvtsi2sd_mem32 : gadget_amd64_v_cvtsi2ss_mem32);
+        } else {
+            bool trunc = insn.op2 == 0x2c;
+            src_bits = dbl ? 64 : 32;
+            gadget = !is_mem ? (trunc ? (dbl ? gadget_amd64_v_cvttsd2si_reg : gadget_amd64_v_cvttss2si_reg)
+                                      : (dbl ? gadget_amd64_v_cvtsd2si_reg : gadget_amd64_v_cvtss2si_reg))
+                             : (trunc ? (dbl ? gadget_amd64_v_cvttsd2si_mem : gadget_amd64_v_cvttss2si_mem)
+                                      : (dbl ? gadget_amd64_v_cvtsd2si_mem : gadget_amd64_v_cvtss2si_mem));
+        }
+        if (is_mem) {
+            unsigned long meta, disp;
+            if (!gen_amd64_decode_mem_meta(state, tlb, &insn, src_bits, &meta, &disp, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-cvt-mem op2=%02x dbl=%d w=%d ip=%llx meta=%lx next=%llx", insn.op2, dbl, wide,
+                    (unsigned long long) insn.start_ip, meta, (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen_amd64_flush_rip(state);
+            gen(state, (unsigned long) gadget);
+            gen(state, meta);
+            gen(state, disp);
+            gen(state, (unsigned long) next_ip);
+            if (to_int)
+                gen(state, wide ? 1ul : 0ul);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+        if (!insn.fs_prefix) {
+            if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+                state->amd64_ip = state->amd64_orig_ip;
+                state->amd64_fallback_to_interp = true;
+                return false;
+            }
+            state->amd64_ip = next_ip;
+            amd64_jit_debug("v-cvt-reg op2=%02x dbl=%d w=%d ip=%llx src=%u dst=%u next=%llx", insn.op2, dbl, wide,
+                    (unsigned long long) insn.start_ip, rm_id, reg_id, (unsigned long long) next_ip);
+            gen_amd64_flush_reg_cache(state);
+            gen(state, (unsigned long) gadget);
+            gen(state, (unsigned long) (rm_id | (reg_id << 4) | ((wide ? 1u : 0u) << 8)));
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+    }
+
     // 0F 57 xorps / 66 0F 57 xorpd, mod==3: a 128-bit bitwise XOR either way, so
     // no operand-size-prefix gating (unlike the SSE2 integer ops above). A rep
     // prefix is #UD — left to the bridge.
@@ -8320,36 +8398,6 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         gen(state, meta);
         gen(state, disp);
         gen(state, (unsigned long) next_ip);
-        gen_amd64_defer_rip(state, next_ip);
-        return true;
-    }
-
-
-    // F2 0F 2A cvtsi2sd xmm, r/m, mod==3: xmm[reg].f64[0] = (double) signed
-    // GPR[rm] (REX.W -> 64-bit source, else 32-bit), high 64 bits preserved. The
-    // source is a GPR, so flush the reg cache first to make cpu->amd64_regs
-    // current; the gadget then reads it from memory. F2 (cvtsi2sd) only; F3
-    // cvtsi2ss keeps bridging.
-    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
-            !insn.fs_prefix && !insn.lock_prefix &&
-            amd64_modrm_mod(insn.modrm) == 3 &&
-            !insn.operand_size_prefix && insn.rep_mode == amd64_jit_repnz &&
-            insn.op2 == 0x2a) {
-        extern void gadget_amd64_v_cvtsi2sd_reg(void);
-        unsigned reg_id = amd64_modrm_reg(insn.modrm) | (insn.rex.r ? 8 : 0);
-        unsigned rm_id = amd64_modrm_rm(insn.modrm) | (insn.rex.b ? 8 : 0);
-        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
-            state->amd64_ip = state->amd64_orig_ip;
-            state->amd64_fallback_to_interp = true;
-            return false;
-        }
-        state->amd64_ip = next_ip;
-        amd64_jit_debug("v-cvtsi2sd ip=%llx gpr=%u xmm=%u w=%d next=%llx",
-                (unsigned long long) insn.start_ip, rm_id, reg_id, insn.rex.w,
-                (unsigned long long) next_ip);
-        gen_amd64_flush_reg_cache(state);
-        gen(state, (unsigned long) gadget_amd64_v_cvtsi2sd_reg);
-        gen(state, (unsigned long) (rm_id | (reg_id << 4) | ((insn.rex.w ? 1ul : 0ul) << 8)));
         gen_amd64_defer_rip(state, next_ip);
         return true;
     }
