@@ -6768,7 +6768,25 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             state->amd64_fallback_to_interp = true;
             return false;
         }
-        if (!insn.lock_prefix && amd64_modrm_mod(insn.modrm) == 3) {
+        // The high-byte exclusion is in the CONDITION, not the body, and that
+        // is the whole fix. Without a REX prefix, encodings 4-7 name AH/CH/DH/BH
+        // rather than SPL/BPL/SIL/DIL, and gadget_amd64_xchg_reg_reg cannot
+        // express that -- but this used to be a `goto amd64_bridge_step` inside
+        // the branch, so the arm claimed the instruction and then de-JITted the
+        // entire block. Exactly the defect the 0x88/0x8a arm below documents
+        // having already been fixed this way, and measured: `xchg %ah, %bl`
+        // alone raises /proc/ish/amd64_jit's fallback count from 0 to 1, and
+        // 0x86 was 14 of the 16 block fallbacks a plain `cc -O2` produced.
+        //
+        // Falling through to the xchg-rm helper below keeps the block compiled
+        // for the cost of a C call, and amd64_jit_xchg_rm already implements
+        // high-byte semantics exactly -- amd64_reg_get_encoded8 /
+        // amd64_reg_set_encoded8 on the reg side and modrm.rex_present on the
+        // rm side.
+        if (!insn.lock_prefix && amd64_modrm_mod(insn.modrm) == 3 &&
+                !(insn.opcode == 0x86 && !insn.rex.present &&
+                  (amd64_modrm_reg(insn.modrm) >= 4 ||
+                   amd64_modrm_rm(insn.modrm) >= 4))) {
             unsigned reg_raw = amd64_modrm_reg(insn.modrm);
             unsigned rm_raw = amd64_modrm_rm(insn.modrm);
             unsigned reg_id = reg_raw | (insn.rex.r ? 8 : 0);
@@ -6776,9 +6794,6 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             unsigned size = insn.opcode == 0x86
                 ? 8
                 : (insn.operand_size_prefix ? 16 : (insn.rex.w ? 64 : 32));
-            if (insn.opcode == 0x86 && !insn.rex.present &&
-                    (reg_raw >= 4 || rm_raw >= 4))
-                goto amd64_bridge_step;
             state->amd64_ip = next_ip;
             amd64_jit_debug("xchg-reg-reg-direct ip=%llx opcode=%02x reg=%u rm=%u size=%u next=%llx",
                     (unsigned long long) insn.start_ip,
@@ -7033,7 +7048,19 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
-    if (!insn.operand_size_prefix && !insn.address_size_prefix &&
+    // The 0x66 (16-bit destination) forms come here too, and used to reach
+    // nothing at all. The comment on the native mem arm above said they "keep
+    // bridging to amd64_jit_movx below", but this arm excluded
+    // operand_size_prefix, so 66 0F B6/B7/BE/BF matched no arm, fell to
+    // amd64_bridge_step and de-JITted its block -- and amd64_jit_movx would
+    // have returned INT_UNDEFINED anyway, because it never consumed 0x66. So
+    // movzbw/movsbw worked ONLY through the whole-block interpreter fallback
+    // and would have become SIGILL the moment that fallback went away.
+    // Measured: `movsbw %al, %ax` and `movzbw %al, %ax` each raise the
+    // /proc/ish/amd64_jit fallback count from 0 to 1, and 0F BE was the other
+    // 2 of the 16 fallbacks in a plain `cc -O2`. amd64_jit_movx now decodes
+    // the prefix and writes a 16-bit destination.
+    if (!insn.address_size_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.two_byte_opcode &&
             (insn.op2 == 0xb6 || insn.op2 == 0xb7 ||
              insn.op2 == 0xbe || insn.op2 == 0xbf)) {

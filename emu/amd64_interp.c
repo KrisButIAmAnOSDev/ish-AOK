@@ -13892,6 +13892,7 @@ int amd64_jit_movx(struct cpu_state *cpu, struct tlb *tlb,
     struct amd64_rex_prefix rex = {0};
     struct amd64_modrm modrm;
     bool fs_prefix = false;
+    bool operand_size_prefix = false;
     byte_t byte;
     qword_t value;
     unsigned src_size;
@@ -13910,6 +13911,16 @@ int amd64_jit_movx(struct cpu_state *cpu, struct tlb *tlb,
             continue;
         if (byte == 0x64) {
             fs_prefix = true;
+            continue;
+        }
+        // 0x66 selects a 16-bit DESTINATION (movzbw/movswl's 16-bit cousins).
+        // It was not consumed here at all, so `byte` stayed 0x66 and the 0x0f
+        // check below returned INT_UNDEFINED -- this helper could not execute
+        // the forms jit/gen.c's comment claimed it was the bridge for. A REX
+        // prefix after 0x66 still wins for the 64-bit case, which is why w is
+        // tested first below.
+        if (byte == 0x66) {
+            operand_size_prefix = true;
             continue;
         }
         if (byte >= 0x40 && byte <= 0x4f) {
@@ -13932,7 +13943,10 @@ int amd64_jit_movx(struct cpu_state *cpu, struct tlb *tlb,
         goto amd64_movx_pf;
 
     src_size = (op2 == 0xb6 || op2 == 0xbe) ? 8 : 16;
-    dst_size = rex.w ? 64 : 32;
+    // REX.W beats 0x66, per the general operand-size rule. A 16-bit write
+    // merges into the destination and leaves bits 63:16 alone, which is what
+    // amd64_reg_set's size==16 case does.
+    dst_size = rex.w ? 64 : (operand_size_prefix ? 16 : 32);
     if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, src_size, &value))
         goto amd64_movx_pf;
     if (op2 == 0xbe || op2 == 0xbf)
