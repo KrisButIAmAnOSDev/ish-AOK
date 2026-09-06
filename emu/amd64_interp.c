@@ -10471,7 +10471,7 @@ restart_prefix:
             if (modrm.reg < 4 || modrm.reg > 7)
                 return INT_UNDEFINED;
             if (!amd64_read_bt_operand(cpu, tlb, &modrm, fs_prefix, op_size, imm8,
-                    true, false, &lhs, &addr, &bit))
+                    false, false, &lhs, &addr, &bit))
                 goto amd64_gpf_restore;
             collapse_flags(cpu);
             // /4 is BT, which writes nothing and so is never locked.
@@ -14610,7 +14610,7 @@ amd64_0f_rm_done:
         if (modrm.reg < 4 || modrm.reg > 7)
             return INT_UNDEFINED;
         if (!amd64_read_bt_operand(cpu, tlb, &modrm, fs_prefix, op_size, imm8,
-                true, false, &lhs, &addr, &bit))
+                false, false, &lhs, &addr, &bit))
             goto amd64_0f_rm_pf;
         collapse_flags(cpu);
         if (lock_prefix && !modrm.is_reg && modrm.reg != 4) {
