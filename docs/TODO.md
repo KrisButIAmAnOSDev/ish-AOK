@@ -1,8 +1,9 @@
 # iSH-AOK TODO
 
-Open work: bugs that are diagnosed but not fixed, reported issues, and features
-deferred on purpose. Each entry says what is already **established**, so nobody
-re-derives it, and what the **next step** actually is.
+Open work: bugs that are diagnosed but not fixed, reported issues, features
+deferred on purpose, and host capabilities worth exposing. Each entry says what
+is already **established**, so nobody re-derives it, and what the **next step**
+actually is.
 
 Started 2026-08-19, after the 549 release run.
 
@@ -2267,6 +2268,91 @@ Work exists on the branch `worktree-external-display-540`:
 **Deferred to a future release by the maintainer (2026-08-18): "the external
 display work is flawed".** The commit is NOT merged and must not be swept into a
 release by accident. Left on its branch deliberately.
+
+---
+
+## Host capabilities worth exposing
+
+What the iPhone and iPad hardware actually lets an app reach, and which parts
+are worth surfacing to the guest. Surveyed 2026-09-07.
+
+### Bluetooth LE -- the one radio that is genuinely open
+
+**Established.** CoreBluetooth's central role is available to every app with no
+MFi programme, no Apple-granted entitlement and no vendor agreement: scan,
+connect, discover services and characteristics, read/write/notify against any
+BLE peripheral. The peripheral role is open too, and `CBL2CAPChannel` (iOS 11+)
+gives a real bidirectional stream over LE credit-based flow control rather than
+characteristic ping-pong. Entry cost is one Info.plist key
+(`NSBluetoothAlwaysUsageDescription`) and a user prompt.
+
+Classic BR/EDR is closed in the other direction -- no RFCOMM, no SPP, no SDP,
+no HCI, no programmatic pairing. Bluetooth serial needs MFi through
+ExternalAccessory, the same gate as the port. Keyboards (HID) and audio (A2DP)
+are handled by the system and already work in AOK for free. Multipeer
+Connectivity and `Network.framework` peer-to-peer do use Bluetooth, but only
+between Apple devices. AccessorySetupKit (iOS 18+) narrows the permission
+prompt; it does not add capability.
+
+One hard limit: there are no Bluetooth addresses. CoreBluetooth hands out an
+opaque per-app UUID that differs between apps and rotates, so anything
+`hcitool`-shaped is impossible by construction. Throughput is kilobytes per
+second -- fine for sensors and control, useless for bulk transfer.
+
+**Next step** is a `/dev/bluetooth` character device on the `/dev/url` recipe
+([[dev-url-scheme-device]]), central role only to start: a line protocol for
+scan / connect / read / write / subscribe, plus a guest-side helper tool.
+app/LocationDevice.m is 190 lines for a read-only device; this one is read/write
+and stateful, so budget several hundred, plus the same five registration points.
+
+Two things to get right:
+
+- **Do not fake BlueZ.** `AF_BLUETOOTH`, HCI sockets and `bluetoothctl` would
+  mean synthesising controller-level events out of a GATT-level API, and the
+  result reports states no real controller produces -- exactly the failure in
+  [[capability-lies-are-load-bearing]]. Ship an AOK-native interface and
+  document it as one. A `bleak` backend on top is a reasonable follow-on.
+- **App Review will ask why a terminal wants Bluetooth.** The precedent is
+  already in the tree: AOK ships `/dev/location` and asks for location
+  permission on the same argument -- an opt-in device capability surfaced to a
+  scripting environment.
+
+### The Lightning / USB-C port -- mostly nothing to do
+
+**Established.** There is no raw USB access at any tier: no enumeration, no bulk
+transfers, no device nodes. What exists, in order of reachability:
+
+- **Free, no code.** USB Ethernet adapters (just a network interface -- the
+  wired device-testing link already rides this), USB and Bluetooth keyboards,
+  USB audio, external displays.
+- **Files plus security-scoped bookmarks.** iOS 13+ mounts USB storage into
+  Files, and a document picker can select a folder on it. **AOK already has
+  this** -- `iosfs` in app/iOSFS.m is exactly that mechanism. Limits: no block
+  device, no `mount(2)`, FAT/exFAT/APFS/HFS+ only, and bookmarks go stale on
+  unplug.
+- **ExternalAccessory (MFi).** Per-accessory protocol strings declared in
+  Info.plist, and the accessory needs Apple's auth chip. Not generic USB.
+- **DriverKit (iPadOS 16+, M-series only).** The
+  `com.apple.developer.driverkit.*` entitlements are granted by Apple per app
+  against a specific hardware justification, and they vanish in unsigned builds
+  ([[unsigned-ipa-drops-entitlements]]).
+
+Thunderbolt is not a separate thing to expose: the M-series iPad port is USB4,
+but there is no PCIe API on iPadOS. The device side is fully closed -- AOK
+cannot present itself to a connected Mac as USB serial or mass storage.
+
+**Verdict: no DriverKit work.** M-series iPad only, an entitlement Apple is
+unlikely to grant for this use case, and dead in sideloaded builds -- it would
+split the user base for a feature most users cannot run.
+
+**Next step**, if anything: polish `iosfs` for external volumes -- a sane story
+when the drive is unplugged mid-session and the bookmark goes stale, and a line
+in the docs saying a USB-C SSD can be mounted. Users do not know AOK already
+does this. A Redpark-backed `/dev/ttyUSB0` over ExternalAccessory would slot
+into the same dyndev recipe and is the one genuinely differentiating port
+feature -- iPad plus console cable -- but it needs specific hardware, Redpark's
+licensing terms, and it is dead code for everyone without the cable. Only worth
+it if the maintainer wants it personally.
 
 ---
 
