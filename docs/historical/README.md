@@ -14,6 +14,7 @@ archive.
 | --- | --- | --- |
 | [upstream-ish-changelog.md](upstream-ish-changelog.md) | upstream iSH's own TestFlight-era release notes, builds 33–48, cited by the book as a primary source | nothing; upstream stopped updating it before this fork existed |
 | [build_553_musts.md](build_553_musts.md) | the deferred-work list written during the 552 release run, for build 553 | `docs/build_554_musts.md` |
+| [todo-closed-549-550.md](todo-closed-549-550.md) | the closed entries from `docs/TODO.md`'s 549 and 550 cycles, split out on 2026-09-07 when they had grown to two thirds of that file | nothing; they are closed |
 
 ## The `build_<N>_musts.md` series
 
