@@ -151,6 +151,116 @@ else
     ck_skip locale-agrees "no /bin/bash in this root to compare against"
 fi
 
+echo "== the special traps must not see the state script =="
+# DEBUG, ERR and RETURN are CODE, not state: once armed they run before (DEBUG),
+# on failure of (ERR) and on return from (RETURN) every command that follows.
+# A forked child starts past the parse with nothing between the fork and the
+# command it was forked for. A re-launched one runs ~77 lines of `declare -x`,
+# `shopt` and function definitions first -- and used to arm these three traps in
+# the MIDDLE of that, so every one of those lines tripped them.
+#
+# Measured before the fix: `trap 'echo T' DEBUG; ( : )` fired 78 times against a
+# forked shell's 1, and the offset was a constant 77 at every re-launch site --
+# subshell, command substitution, pipeline element, null command. That makes
+# every DEBUG-trap-based tool (bashdb, a `trap ... DEBUG` profiler, a script that
+# counts commands) read garbage inside any of them.
+#
+# Two things fixed it and both are asserted here. The traps are emitted LAST,
+# after everything else the state restores; and they are emitted only under the
+# option that arms them in a real child -- trap.c's
+# reset_or_restore_signal_handlers clears SIG_TRAPPED for DEBUG and RETURN
+# unless `set -T', and for ERR unless `set -E', so without those a forked
+# subshell runs NO special trap at all and neither may this one.
+#
+# Asserted as AGREEMENT with the guest's own bash, run on the same script, for
+# the same reason the locale case is: the right answer is whatever a fork does,
+# not a number written down here.
+ck_oracle() {
+    n=$("$B" -c "$2" 2>&1 | tr '\n' ' ')
+    g=$(/bin/bash -c "$2" 2>&1 | tr '\n' ' ')
+    if [ "$n" = "$g" ]; then
+        pass=$((pass+1)); printf '  ok    %s\n' "$1"
+    else
+        fail=$((fail+1))
+        printf '  FAIL  %-30s bash [%s] native [%s]\n' "$1" "$g" "$n"
+    fi
+}
+
+if [ -x /bin/bash ]; then
+# The reported shapes. The command substitution is how it was first seen: the
+# trap output has to be collected and counted, because a subshell's own stdout
+# is the terminal and 78 lines of it scroll past unremarked.
+ck_oracle debug-comsub-builtin  'n=$( trap "echo T" DEBUG; ( : ); trap - DEBUG; : ); echo "$n"'
+ck_oracle debug-comsub-external 'n=$( trap "echo T" DEBUG; ( /bin/true ); trap - DEBUG; : ); echo "$n"'
+ck_oracle debug-comsub-nullcmd  'n=$( trap "echo T" DEBUG; {v}>/tmp/aok-dbg-1; trap - DEBUG; : ); echo "$n"'
+# ...and directly, where the count is small enough to read.
+ck_oracle debug-subshell        'trap "echo T" DEBUG; ( : ); trap - DEBUG; echo .'
+ck_oracle debug-subshell-two    'trap "echo T" DEBUG; ( :; : ); trap - DEBUG; echo .'
+ck_oracle debug-nested          'trap "echo T" DEBUG; ( ( : ) ); trap - DEBUG; echo .'
+ck_oracle debug-pipeline        'trap "echo T" DEBUG; : | cat; trap - DEBUG; echo .'
+ck_oracle debug-async           'trap "echo T" DEBUG; ( : ) & wait; trap - DEBUG; echo .'
+ck_oracle debug-group-in-pipe   'trap "echo T" DEBUG; { :; } | cat; trap - DEBUG; echo .'
+# $? nonzero at the boundary is a separate path through the state: it is the one
+# case that emits a status-restoring command AFTER the traps.
+ck_oracle debug-after-failure   'trap "echo T" DEBUG; false; ( : ); trap - DEBUG; echo .'
+ck_oracle err-subshell          'trap "echo E" ERR; ( : ); trap - ERR; echo .'
+ck_oracle err-after-failure     'trap "echo E" ERR; false; ( : ); trap - ERR; echo .'
+ck_oracle err-subshell-fails    'trap "echo E" ERR; ( false ); trap - ERR; echo .'
+ck_oracle return-subshell       'trap "echo R" RETURN; f(){ :; }; ( f ); trap - RETURN; echo .'
+
+# The other half: under -T and -E the traps DO cross, and must still not see the
+# state. A subshell and a command substitution announce their own commands (the
+# parent does not run the trap for them), so these are exact.
+ck_oracle T-debug-subshell      'set -T; trap "echo T" DEBUG; ( : ); trap - DEBUG; echo .'
+ck_oracle T-debug-subshell-two  'set -T; trap "echo T" DEBUG; ( :; : ); trap - DEBUG; echo .'
+ck_oracle T-debug-comsub        'set -T; trap "echo T" DEBUG; n=$( : ); trap - DEBUG; echo "[$n]"'
+ck_oracle T-return-subshell     'set -T; trap "echo R" RETURN; f(){ :; }; ( f ); trap - RETURN; echo .'
+ck_oracle E-err-subshell-ok     'set -E; trap "echo E" ERR; ( : ); trap - ERR; echo .'
+ck_oracle E-err-subshell-fails  'set -E; trap "echo E" ERR; ( false ); trap - ERR; echo .'
+ck_oracle E-err-comsub-fails    'set -E; trap "echo E" ERR; n=$( false ); trap - ERR; echo .'
+
+# KNOWN DIVERGENCE, deliberately not asserted: under `set -T', a re-launch from
+# execute_simple_command -- a pipeline element, an async simple command -- fires
+# DEBUG twice, because that site runs the trap and THEN calls make_child, so the
+# parent has announced the command and the re-parsing child announces it again.
+# `set -T; trap "echo T" DEBUG; : | cat' is 5 here and 3 in a fork. Closing it
+# means the child skipping counted fires on a signal from the parent, and a
+# mechanism that can SWALLOW a DEBUG fire is worse for a debugger than one that
+# adds one. See the divergence note above aok_serialize_state.
+
+echo "== errexit must not kill the child in its own prologue =="
+# The state restores $? with a trailing `(exit N)`, and `set -e' is restored
+# three lines above it -- so a subshell entered with a nonzero $? under errexit
+# exited in its prologue and never parsed the command it was spawned to run.
+# The shape below is the one that gets there: a failing command on the left of
+# `&&' leaves $? at 1 without tripping errexit, and every following subshell
+# then died. Measured: native bash printed NOTHING for the first two of these,
+# where a forked shell prints `hi done' -- the subshell died, and the parent
+# died with it under the same errexit. That is silent data loss, and it is why
+# the restore is now `(exit N) && :': a command on the left of `&&' is exempt
+# from both errexit and the ERR trap, and short-circuits, so $? is still N.
+ck_oracle errexit-subshell      'set -e; false && true; ( echo hi ); echo done'
+ck_oracle errexit-comsub        'set -e; false && true; n=$( echo hi ); echo "$n done"'
+ck_oracle errexit-and-err-trap  'set -e; trap "echo E" ERR; false && true; ( echo hi ); echo done'
+ck_oracle errexit-nullcmd       'set -e; false && true; {v}>/tmp/aok-dbg-2; echo done'
+# ...and with the ERR trap actually crossing, which is the combination that has
+# both halves live in the child: `set -E' arms it there, and the status restore
+# is the one command in the state that can fail. The `&&' exemption has to reach
+# into the subshell the restore spawns, not just the list in the child.
+ck_oracle errtrace-nonzero      'set -E; trap "echo E" ERR; false && true; ( echo hi ); echo done'
+ck_oracle errtrace-errexit      'set -Ee; trap "echo E" ERR; false && true; ( echo hi ); echo done'
+ck_oracle errtrace-comsub       'set -E; trap "echo E" ERR; false && true; n=$( echo hi ); echo "$n done"'
+ck_oracle errtrace-status       'set -E; trap "echo E" ERR; (exit 7) && :; ( echo rc=$? ); echo done'
+ck_oracle functrace-errtrace    'set -TE; trap "echo E" ERR; false && true; ( echo hi ); echo done'
+# ...while the status itself still crosses, which is what the restore is for.
+ck_oracle status-crosses        'false; ( echo rc=$? )'
+ck_oracle status-crosses-7      '(exit 7) && :; ( echo rc=$? )'
+ck_oracle status-crosses-comsub 'false; n=$( echo rc=$? ); echo "$n"'
+ck_oracle status-under-errexit  'set -e; (exit 7) && :; ( echo rc=$? ); echo done'
+else
+    ck_skip traps-and-errexit "no /bin/bash in this root to compare against"
+fi
+
 echo "== the state must not be published in /proc/PID/cmdline =="
 # A re-launched subshell used to carry the whole serialized state as argv[2] of
 # `bash -c`, and aok_relaunch_state emits `declare -x NAME='value'` for every

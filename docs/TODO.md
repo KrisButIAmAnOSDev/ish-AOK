@@ -56,6 +56,45 @@ diagnostic is still swallowed.
 bound. `tests/manual/exec_shebang_interpreter.c` is where the cases go; the
 oracle numbers above are the expectations.
 
+### Two things a re-launched bash subshell still gets wrong about `$?` and DEBUG
+
+Left open by the 2026-09-07 trap-ordering fix (`deps/bash/aok_fork.c`), which
+closed the large case: the special traps are now emitted last and only under the
+option that arms them in a real child, so a default shell agrees with a forked
+one exactly. `tests/manual/native_bash_fork_state.sh` asserts that against the
+guest's own bash. What is left is smaller and both halves come from the same
+place -- the `(exit N) && :` the state script uses to restore `$?`.
+
+**A nonzero `$?` at a subshell boundary costs a second re-launch.** `(exit N)`
+is a subshell, so restoring the status spawns a whole extra native bash.
+Measured on `build/devuan-arm64-test`, 20 iterations:
+
+| `$?` before `( : )` | wall |
+|---|---|
+| 0 (`true; ( : )`) | 74ms -- 3.7ms a subshell |
+| 1 (`false; ( : )`) | 131ms -- 6.5ms a subshell |
+
+Nothing in shell sets `$?` to an arbitrary value without a subshell, and it
+cannot move earlier in the script because every later line would overwrite it.
+The fix is to pass the status to our own bash the way `$$` already travels
+(`AOK_DOLLAR_VAR`, and `aok_relaunch_env` builds the envp) and apply it in C
+between the state and the command -- which means the command can no longer be
+appended to the state string, so it is a change to the bootstrap, not a one-
+liner. The `/bin/bash` fallback still needs the shell form.
+
+**Under `set -T`, some re-launches announce a command twice.** A re-launch from
+`execute_simple_command` -- a pipeline element, an async simple command -- fires
+the DEBUG trap in the parent (that site runs the trap and *then* calls
+`make_child`) and again in the child, which re-parses the text it was handed.
+`set -T; trap 'echo T' DEBUG; : | cat` fires 5 times against a fork's 3. `( )`
+and `$( )` are exact, because the parent does not announce those. The `(exit N)`
+restore adds one more when `$?` was nonzero. Only reachable under `-T`, which is
+what a DEBUG-trap debugger sets, so it is worth closing -- but the obvious
+mechanism (the child skipping a counted number of fires on a signal from the
+parent) can *swallow* a real fire if the count is ever wrong, which is worse for
+a debugger than an extra one. Fixing the `$?` path above removes one of the two
+sources for free.
+
 ### atop's accounting daemon wedges boot, and nothing after it starts
 
 Reported from a device 2026-09-03. Symptom looks like broken networking --

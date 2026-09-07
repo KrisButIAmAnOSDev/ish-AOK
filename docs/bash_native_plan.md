@@ -431,12 +431,31 @@ their reasons; the short form:
   which shows up as every command substitution in a login shell coming back
   empty.
 - **shopt before `set -o`**, because `shopt -u extdebug` turns off `-E` and `-T`.
-- **errexit and nounset last**, after the variables the state assigns.
+- **errexit and nounset before the traps**, after the variables the state
+  assigns.
+- **DEBUG, ERR and RETURN last of all, after everything else the state
+  restores**, because they are not state, they are code: once armed they run on
+  every command that follows, and what follows them in the middle of the script
+  is the rest of the script. Armed among the `declare -x` lines, a DEBUG trap
+  fired 78 times in a re-launched subshell against a forked shell's 1, at every
+  re-launch site, which is a constant 77 of pure noise for anything built on the
+  DEBUG trap — bashdb, a `trap ... DEBUG` profiler, a script that counts
+  commands. Fixed 2026-09-07.
+- **`$?` last, and as `(exit N) && :` rather than `(exit N)`**, because by that
+  point `set -e` has been restored and an ERR trap may be armed, and both react
+  to a command that fails. A command on the left of `&&` is exempt from both and
+  short-circuits, so the status is still N. Before this, a subshell entered with
+  a nonzero `$?` under `set -e` exited in its own prologue without ever parsing
+  the command it was spawned for: `set -e; false && true; ( echo hi )` printed
+  nothing where a forked shell prints `hi`.
 
 What must NOT cross matters as much: a forked child resets its traps
-(`reset_signal_handlers`), keeping only the ignored ones and DEBUG/ERR/RETURN,
-so sending the EXIT trap made it fire once per subshell and once per command
-substitution. `AOK_BASH_DUMP_STATE=1` prints what a child was handed, and is
+(`reset_signal_handlers`), so sending the EXIT trap made it fire once per
+subshell and once per command substitution. The three special traps are subtler
+than "they are inherited" — the tail of that same function clears `SIG_TRAPPED`
+for **DEBUG and RETURN unless `set -T`, and for ERR unless `set -E`**, so
+without those options a forked subshell runs none of them and neither may a
+re-launched one. `AOK_BASH_DUMP_STATE=1` prints what a child was handed, and is
 the first thing to reach for when one misbehaves.
 
 ### What is knowingly not the same
@@ -455,7 +474,25 @@ the first thing to reach for when one misbehaves.
   grandparent — same reason, and the same readonly obstacle.
 - **`trap -p` inside a child under-reports**: bash lists the strings of traps
   that are not armed there, and reproducing that would mean setting a trap and
-  disarming it, which an early-exiting child never reaches.
+  disarming it, which an early-exiting child never reaches. Since 2026-09-07
+  this covers DEBUG, ERR and RETURN too, which are unarmed in a child unless
+  `-T`/`-E` — they are no longer emitted in that case, so they are no longer
+  listed either. A trap that is listed but never runs is the cheap error; one
+  that runs where bash runs none was the expensive one.
+- **Under `set -T`, a re-launch from `execute_simple_command` fires the DEBUG
+  trap twice.** That site runs the trap and *then* calls `make_child`, so the
+  parent has already announced the command and the re-parsing child announces it
+  again; a forked child starts past the parse. `set -T; trap 'echo T' DEBUG;
+  : | cat` fires 5 times against a fork's 3. `( )` and `$( )` are exact — the
+  parent does not announce those. Closing it means the child skipping counted
+  DEBUG fires on a signal from the parent, and a mechanism that can *swallow* a
+  fire is worse for a debugger than one that adds one.
+- **A nonzero `$?` at a subshell boundary costs a second re-launch**, because
+  `(exit N)` in the state script is itself a subshell. Measured: 20 iterations
+  of `true; ( : )` 74ms against `false; ( : )` 131ms — 3.7ms a subshell against
+  6.5ms. Nothing in shell sets `$?` to an arbitrary value without a subshell,
+  so closing this means passing the status to our own bash the way `$$` is
+  passed, and applying it in C between the state and the command.
 
 ## Many shells at once: thread-local globals (2026-08-16)
 
