@@ -22,8 +22,12 @@ inventory, generated from `fs/proc/ish.c`.
 - `/proc/ish/i386_no_cache_comm` (file)
 - `/proc/ish/i386_single_step_comm` (file)
 - `/proc/ish/ips` (file)
+- `/proc/ish/mem_guard` (file)
+- `/proc/ish/mem_release_probe` (file)
 - `/proc/ish/riscv64_jit_fuse` (file)
 - `/proc/ish/roots` (file)
+- `/proc/ish/swap` (file)
+- `/proc/ish/swap_evict` (file)
 - `/proc/ish/version` (file)
 - `/proc/ish/workspace` (file)
 

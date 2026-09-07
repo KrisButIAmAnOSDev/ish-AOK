@@ -13,9 +13,9 @@ so a NULL check passes — editing it changes nothing.
 
 | table | entries | implemented | native dispatch | stubs |
 |---|--:|--:|--:|--:|
-| i386 | 352 | 315 | 0 | 37 |
-| amd64 | 325 | 290 | 1 | 34 |
-| arm64 / riscv64 | 312 | 223 | 2 | 87 |
+| i386 | 354 | 317 | 0 | 37 |
+| amd64 | 327 | 292 | 1 | 34 |
+| arm64 / riscv64 | 312 | 225 | 2 | 85 |
 
 riscv64 shares arm64's table: both are asm-generic ABIs with identical
 numbering (Chapter 7).
@@ -84,6 +84,7 @@ numbering (Chapter 7).
 | 81 | `sys_setgroups` | implemented |  |
 | 83 | `sys_symlink` | implemented |  |
 | 85 | `sys_readlink` | implemented |  |
+| 87 | `sys_swapon` | implemented |  |
 | 88 | `sys_reboot` | implemented |  |
 | 90 | `sys_mmap` | implemented |  |
 | 91 | `sys_munmap` | implemented |  |
@@ -103,6 +104,7 @@ numbering (Chapter 7).
 | 108 | `sys_fstat` | implemented |  |
 | 111 | `syscall_success_stub` | implemented | vhangup (tty-cleanup no-op) |
 | 114 | `sys_wait4` | implemented |  |
+| 115 | `sys_swapoff` | implemented |  |
 | 116 | `sys_sysinfo` | implemented |  |
 | 117 | `sys_ipc` | implemented |  |
 | 118 | `sys_fsync` | implemented |  |
@@ -541,6 +543,8 @@ numbering (Chapter 7).
 | 164 | `sys_settimeofday` | implemented |  |
 | 165 | `sys_mount` | implemented |  |
 | 166 | `sys_umount2` | implemented |  |
+| 167 | `sys_swapon` | implemented |  |
+| 168 | `sys_swapoff` | implemented |  |
 | 169 | `sys_reboot` | implemented |  |
 | 170 | `sys_sethostname` | implemented |  |
 | 171 | `sys_setdomainname` | implemented |  |
@@ -548,7 +552,7 @@ numbering (Chapter 7).
 | 187 | `syscall_success_stub` | implemented | readahead |
 | 200 | `sys_tkill` | implemented |  |
 | 201 | `sys_time_amd64` | implemented |  |
-| 202 | `sys_futex` | implemented |  |
+| 202 | `sys_futex_amd64_guest` | implemented |  |
 | 203 | `sys_sched_setaffinity` | implemented |  |
 | 204 | `sys_sched_getaffinity` | implemented |  |
 | 206 | `sys_io_setup` | implemented |  |
@@ -797,7 +801,7 @@ numbering (Chapter 7).
 | 95 | `sys_waitid` | implemented |  |
 | 96 | `sys_set_tid_address` | implemented |  |
 | 97 | `sys_unshare` | implemented |  |
-| 98 | `sys_futex` | implemented |  |
+| 98 | `sys_futex_amd64_guest` | implemented |  |
 | 99 | `sys_set_robust_list_amd64` | implemented |  |
 | 100 | `sys_get_robust_list_amd64` | implemented |  |
 | 101 | `sys_nanosleep_amd64` | implemented |  |
@@ -923,8 +927,8 @@ numbering (Chapter 7).
 | 221 | `sys_execve` | implemented |  |
 | 222 | `sys_mmap_amd64` | implemented |  |
 | 223 | `syscall_success_stub` | implemented | fadvise64 (advisory; ignored) |
-| 224 | `syscall_stub` | stub | returns ENOSYS, logged |
-| 225 | `syscall_stub` | stub | returns ENOSYS, logged |
+| 224 | `sys_swapon` | implemented |  |
+| 225 | `sys_swapoff` | implemented |  |
 | 226 | `sys_mprotect` | implemented |  |
 | 227 | `sys_msync` | implemented |  |
 | 228 | `sys_mlock` | implemented |  |

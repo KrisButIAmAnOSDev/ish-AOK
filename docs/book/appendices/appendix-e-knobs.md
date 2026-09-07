@@ -51,6 +51,10 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_GUEST_CPU_COUNT` | `platform/darwin.c` |
 | `ISH_GUEST_MEM_BUDGET_MB` | `platform/darwin.c`, `platform/linux.c` |
 | `ISH_GUEST_MEM_HEADROOM_MB` | `platform/darwin.c`, `platform/linux.c` |
+| `ISH_GUEST_MEM_PRESSURE` | `platform/darwin.c` |
+| `ISH_GUEST_SWAP_FAIL_READS` | `kernel/swap.c` |
+| `ISH_GUEST_SWAP_MB` | `kernel/swap.c` |
+| `ISH_GUEST_SWAP_WRITE_BUDGET_MB` | `kernel/swap.c` |
 | `ISH_HLE` | `main.c` |
 | `ISH_HLE_FP` | `jit/hle.c` |
 | `ISH_HLE_LOOPS` | `jit/hle.c` |
@@ -65,6 +69,7 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_JIT_TIMING` | `jit/jit.c`, `main.c` |
 | `ISH_LAZY_TRACE` | `emu/memory.c` |
 | `ISH_LOCKSTATS` | `main.c`, `util/lockstats.c` |
+| `ISH_MEM_NO_PAGE_PACKING` | `emu/memory.c` |
 | `ISH_MEM_QUARANTINE` | `emu/memory.c` |
 | `ISH_MIRROR_NO_MPROTECT` | `emu/memory.c` |
 | `ISH_MULTICORE` | `main.c` |
@@ -84,12 +89,16 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_RISCV64_NO_FUSE` | `jit/gen.c` |
 | `ISH_RISCV64_VENDOR_EXT` | `jit/riscv64_vendor_ext.c` |
 | `ISH_STALE_JIT_PEER` | `tests/manual/vfork_exec_stale_jit.c` |
+| `ISH_SWAP_NO_MADVISE` | `emu/memory.c` |
+| `ISH_SWAP_NO_MPROTECT` | `emu/memory.c` |
 | `ISH_TEST_FAIL_TASK_START_AFTER` | `kernel/task.c` |
 | `ISH_TEST_GUEST_CMD` | `main.c` |
 | `ISH_TEST_GUEST_LINGER_MS` | `main.c` |
 | `ISH_TEST_GUEST_TIMEOUT_MS` | `main.c` |
 | `ISH_TEST_GUEST_USER` | `main.c` |
 | `ISH_TEST_QUIESCE` | `main.c` |
+| `ISH_TEST_QUIESCE_DELAY_MS` | `main.c` |
+| `ISH_TEST_QUIESCE_HOLD_MS` | `main.c` |
 | `ISH_TEST_SECOND_MOUNT` | `tests/manual/mount_cross_dev.c` |
 | `ISH_TEST_WATCHDOG_SCALE` | `tests/manual/test_common.h` |
 | `ISH_TRACE_AMD64_AS` | `emu/amd64_interp.c` |
@@ -97,8 +106,9 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_TRACE_AMD64_AS_SOURCE` | `kernel/fs.c` |
 | `ISH_TRACE_AMD64_AS_STDERR` | `emu/amd64_interp.c` |
 | `ISH_TRACE_AMD64_BASH` | `emu/amd64_interp.c` |
+| `ISH_TRACE_AMD64_BRIDGES` | `emu/amd64_interp.c`, `jit/gen.c` |
 | `ISH_TRACE_AMD64_CC1` | `emu/amd64_interp.c` |
-| `ISH_TRACE_AMD64_JIT` | `emu/amd64_interp.c`, `emu/memory.c`, `jit/gen.c` (+1 more) |
+| `ISH_TRACE_AMD64_JIT` | `emu/memory.c`, `jit/gen.c`, `jit/jit.c` |
 | `ISH_TRACE_AMD64_JIT_STATS` | `emu/amd64_interp.c`, `jit/jit.c` |
 | `ISH_TRACE_AMD64_SUSPECT` | `emu/amd64_interp.c` |
 | `ISH_TRACE_AMD64_TTY` | `kernel/calls.c` |

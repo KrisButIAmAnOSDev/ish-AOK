@@ -4,7 +4,7 @@
 
 # Appendix F. The regression suite, annotated
 
-234 C programs in `tests/manual/`, of which **217 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
+243 C programs in `tests/manual/`, of which **226 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
 
 A row with a directory prefix is a per-architecture or accelerator test, kept
 in a subdirectory of `tests/manual/` and registered under that same prefix.
@@ -74,16 +74,19 @@ does not say what it is for.
 | `fibbonaci.c` | — |  |
 | `fifo_open_creat_deadlock.c` | yes | Regression test: open(O_WRONLY\|O_CREAT) of an EXISTING FIFO racing the reader's open(O_RDONLY) must not deadlock the whole filesystem. |
 | `file_perms.c` | yes | Ownership and sticky-bit enforcement on metadata changes and deletions. |
+| `fork_tgroup_reset.c` | yes | A forked child's process-wide resource ledger starts at zero. |
 | `forkexec.c` | — |  |
 | `fs_at_validation.c` | yes | Argument validation across the *at() family, copy_file_range and sendfile. Seven things AOK accepted that Linux rejects, and one that hung. |
 | `fs_conformance.c` | yes | fs_conformance.c — self-checking regression lock for the filesystem/VFS conformance fixes found by differential testing against real Linux (mint).... |
 | `fs_permission_rules.c` | yes | Five permission and path-resolution rules AOK got wrong, two of them security-relevant and two of them plainly visible at a shell prompt. |
+| `fs_remove_enoent_order.c` | yes | Which wins when the parent directory is unwritable: the permission check, or the fact that the final component is not there? |
 | `fsopen_move_mount.c` | yes | The "new mount API" (fsopen/fsconfig/fsmount/move_mount, kernel 5.2+): before this fix all four were silent ENOSYS stubs, so systemd >= 254's... |
 | `ftruncate_fd_mode.c` | yes | ftruncate(2) takes its permission from the DESCRIPTOR, not from the inode's mode bits. Linux's do_sys_ftruncate checks only FMODE_WRITE, and... |
 | `fuse_basic.c` | yes | fuse_basic.c — self-checking regression lock for iSH-AOK's FUSE support (fs/fuse.c): the /dev/fuse device, the "fuse" filesystem type, and the... |
 | `fuse_threaded_daemon.c` | yes | fuse_threaded_daemon.c — the FUSE daemon is a THREAD of the process using the mount, rather than a separate process. |
 | `futex_core.c` | yes |  |
 | `futex_robust_requeue.c` | yes | Three futex defects, one of which disabled an entire POSIX feature. |
+| `futex_timeout_duration.c` | yes | A futex timeout has to last as long as it was asked to last. |
 | `futex_validation.c` | yes | Three things futex(2) got wrong about its own arguments. |
 | `getdents.c` | — |  |
 | `getpeername_smallbuf.c` | yes | getpeername()/getsockname() with a small or zero-length caller buffer. |
@@ -104,6 +107,7 @@ does not say what it is for.
 | `keyctl_link.c` | yes | keyctl(KEYCTL_LINK, ...) must not ENOSYS: systemd-executor's setup_keyring() runs this for every service with the default KeyringMode=shared (link... |
 | `kmsg_stream.c` | yes | The kernel log, as the two files every syslog daemon opens. |
 | `looper.c` | — |  |
+| `madvise_lazy_reservation.c` | yes | A large anonymous mapping is MAPPED even before anything touches it. |
 | `mem_conformance.c` | yes | mem_conformance.c — self-checking regression lock for the memory-management conformance fixes found by differential testing against real Linux... |
 | `memchurn.c` | — | memchurn — models musl mallocng's mmap/munmap churn in a multithreaded process, the workload that makes AOK's mem-quiesce barrier "horrific". |
 | `memfd_mmap.c` | yes | memfd_create + mmap: anonymous memory-backed files. |
@@ -161,9 +165,11 @@ does not say what it is for.
 | `ptrace_thread_follow.c` | yes | ptrace_thread_follow: a tracer using PTRACE_O_TRACECLONE + wait4(__WALL) must be able to follow a CLONE_THREAD worker of its tracee. This is the... |
 | `pty_line_discipline.c` | yes | Covers a set of related pty/tty line-discipline gaps (the first three from issue #423 Tier 3): 1. ECHOKE vs plain ECHOK on VKILL -- and the fact... |
 | `random_seed.c` | yes |  |
+| `reparent_zombie_notify.c` | yes | A zombie handed to a new parent has to be announced to that new parent. |
 | `resource_limits_sched.c` | yes | Resource limits, scheduling policy, nice, and the half of getrusage that is not CPU time. |
 | `riscv64/jalr_retcache.c` | yes | jalr_retcache.c -- the riscv64 JIT's jalr target/return cache. |
 | `riscv64/ptrace_regset.c` | yes | ptrace_regset (riscv64-only): PTRACE_GETREGSET/SETREGSET(NT_PRSTATUS) must report and accept the real riscv64 register file. iSH-AOK's riscv64... |
+| `rusage_monotonic.c` | yes |  |
 | `scm_rights_pidfd.c` | yes |  |
 | `scm_rights_stress.c` | yes | AF_UNIX SCM_RIGHTS fd-passing must never desync AOK's two-channel bookkeeping (a host "sentinel" fd carrying the message + an internal struct-scm... |
 | `sendfile_vhangup.c` | yes | amd64 sendfile real copy (+ no SIGSYS on 64-bit count), and vhangup wired. |
@@ -201,6 +207,7 @@ does not say what it is for.
 | `stack_guard_gap.c` | yes | stack_guard_gap.c — regression for the stack growing into its neighbours (issue #521). |
 | `stat.c` | — |  |
 | `statx_mnt_id_timerfd.c` | yes | systemd >= 260 boot prerequisites: statx STATX_MNT_ID and timerfd TFD_TIMER_CANCEL_ON_SET. |
+| `subreaper_not_inherited.c` | yes | PR_SET_CHILD_SUBREAPER is per-process and does not survive fork. |
 | `syscall_wiring.c` | yes | Syscalls that were implemented but not reachable, because the per-ABI table entry was missing. The implementation existing is not the same as the... |
 | `sysctl_write_rules.c` | yes | What /proc/sys accepts, what it refuses, and what it admits to not having. |
 | `sysfs_cpu_topology.c` | yes | /sys/devices/system/cpu: per-CPU topology and cache attributes. |
@@ -235,6 +242,7 @@ does not say what it is for.
 | `wayland_scm_shm.c` | yes | Wayland substrate: SCM_RIGHTS fd-passing shape + memfd seals, the two emulator bugs found bringing up a real Wayland compositor (wlroots/cage) +... |
 | `x86/amd64_incdec.c` | yes | INC (FF /0) and DEC (FF /1) on a REGISTER operand -- the amd64 form that in long mode is the ONLY way to spell `inc`/`dec` of a register, because... |
 | `x86/amd64_regress.c` | yes |  |
+| `x86/amd64_singlestep.c` | yes | amd64 PTRACE_SINGLESTEP: one guest instruction per stop, on the JIT. |
 | `x86/atomic_cmpxchg32.c` | yes |  |
 | `x86/atomic_cmpxchg8b.c` | yes |  |
 | `x86/atomic_lock_contended.c` | yes | Do LOCK-prefixed instructions actually interlock? |
@@ -248,6 +256,7 @@ does not say what it is for.
 | `x86/cpuid_xsave.c` | yes | cpuid_xsave -- every CPUID feature bit AOK advertises must name an instruction the guest can actually execute. |
 | `x86/fpu_state_span.c` | yes | fpu_state_span -- the x87/SSE state-area instructions must validate EVERY byte of their memory operand, not just the first four. |
 | `x86/port_io_gpf.c` | yes | IN/OUT: the port-I/O opcodes e4/e5 (in al/eax, imm8), e6/e7 (out imm8, al/eax), ec/ed (in al/eax, dx) and ee/ef (out dx, al/eax). |
+| `x86/rep_interruptible.c` | yes | rep_interruptible.c -- a long REP string op must be interruptible, and must still be correct after being interrupted. |
 | `x86/x86_loop.c` | yes | LOOP (0xe2), LOOPE/LOOPZ (0xe1) and LOOPNE/LOOPNZ (0xe0). |
 | `x86/x87_fpu.c` | yes | x87 semantics that emulation got wrong in ways ordinary arithmetic tests miss: control-word precision, the status-word C2 bit, the memory form of... |
 
