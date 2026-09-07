@@ -66,6 +66,8 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long op2, unsigned long next_ip);
 int amd64_jit_grp3_test(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
+int amd64_jit_vex(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long lead, unsigned long start_ip);
 int amd64_jit_x87(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
 int amd64_jit_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb,

@@ -6211,6 +6211,39 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         (insn.fs_prefix ? 0x20 : 0) |
         (insn.rep_mode != amd64_jit_rep_none ? 0x40 : 0);
 
+    // VEX / EVEX (C4, C5, 62): the whole of AVX, AVX2 and AVX-512.
+    //
+    // There was no arm here at all, so every AVX instruction de-JITted its
+    // block. Nothing measured it, either: the musl test roots never take AVX
+    // paths, so a full regression-suite census showed zero C4/C5 fallbacks
+    // while a three-line vpxor/vpaddd probe showed one per block.
+    //
+    // In 64-bit mode these three bytes are unambiguous lead bytes -- LES/LDS
+    // do not exist in long mode -- and no legacy prefix or REX may precede
+    // them, so no further gating is needed.
+    //
+    // The instruction's LENGTH is not knowable here without decoding the entire
+    // VEX prefix, which is precisely the work being delegated. So the block is
+    // cut at this instruction (amd64_ip stays at its first byte), the helper is
+    // handed that address and advances rip itself, and the block ends. That is
+    // sound because cpu->amd64_rip is authoritative for amd64 and jit.c derives
+    // eip from it after every block, so the exit gadget's stale eip cannot win.
+    if (!insn.two_byte_opcode &&
+            (insn.opcode == 0xc4 || insn.opcode == 0xc5 || insn.opcode == 0x62)) {
+        state->amd64_ip = state->amd64_orig_ip;
+        amd64_jit_debug("vex-helper ip=%llx lead=%02x",
+                (unsigned long long) state->amd64_orig_ip, insn.opcode);
+        if (getenv("ISH_TRACE_AMD64_BRIDGES") != NULL)
+            fprintf(stderr, "[amd64-bridges] vex lead=%02x\n", insn.opcode);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_2_retint(state, amd64_jit_vex,
+                (unsigned long) insn.opcode,
+                (unsigned long) state->amd64_orig_ip);
+        gen_exit(state);
+        return false;
+    }
+
     // x87 (D8-DF), as a bridge into the interpreter's own amd64_handle_x87.
     //
     // This is the established design for x87 in this tree, not a compromise:
