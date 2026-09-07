@@ -229,6 +229,90 @@ int main(int argc, char **argv) {
         close(pf[1]);
     }
 
+    // ---- a short answer, rather than waiting for bytes nobody will send ----
+    //
+    // splice returns what it moved. Draining the full `count` instead is a hang
+    // whenever the caller is the only one who could supply the rest -- and that
+    // is not a corner case, it is how GNU cat copies. cat makes a pipe of its
+    // own and bounces the input through it:
+    //     pipe(p); splice(0, .., p[1], .., 65536); splice(p[0], .., 1, .., 65536)
+    // The second call asks a pipe holding three bytes for 65536, and the only
+    // writer of that pipe is cat, which will not write again until this call
+    // returns. AOK's copy engine looped for the other 65533 forever: every
+    // `echo hi | cat` and `cat <<EOF` in the system wedged, taking five of
+    // bash's own regression tests (alias, builtins, comsub, comsub-eof,
+    // comsub-posix) with them.
+    {
+        int pf[2];
+        ck("pipe", pipe(pf), 0);
+        ck("put three bytes in it", (long) write(pf[1], "abc", 3), 3);
+        int out = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ck("open the destination", out >= 0, 1);
+        // The write end stays OPEN across this call, exactly as cat holds it:
+        // there is no EOF coming to end the wait, only a short return.
+        ck("splice(pipe with 3 bytes -> file, asking 65536) answers 3",
+           do_splice(pf[0], NULL, out, NULL, 65536, 0), 3);
+        close(out);
+        char buf[16] = { 0 };
+        int chk = open(dst_path, O_RDONLY);
+        ck("  the three bytes landed", chk >= 0 ? (long) read(chk, buf, sizeof buf - 1) : -1, 3);
+        ck("  and are the right ones", strcmp(buf, "abc") == 0, 1);
+        if (chk >= 0)
+            close(chk);
+        close(pf[0]);
+        close(pf[1]);
+    }
+
+    // ---- and the same on the write side ------------------------------------
+    //
+    // The mirror image: splice a file into a pipe, asking for more than the
+    // pipe can hold. This is splice's canonical idiom -- file into a pipe, then
+    // pipe out to a socket, one thread doing both -- and the only reader of
+    // that pipe is the caller, waiting for this call to return. Filling the
+    // pipe and then waiting for room is the same deadlock from the other end.
+    // The bytes that did not fit must go back to the file's position, not be
+    // dropped: the caller resumes from where the short answer said it stopped.
+    {
+        int big = open(src_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ck("stage a file larger than a pipe", big >= 0, 1);
+        char meg[4096];
+        memset(meg, 'z', sizeof meg);
+        long staged = 0;
+        for (int i = 0; i < 256 && big >= 0; i++) {   // 1 MiB
+            long w = (long) write(big, meg, sizeof meg);
+            if (w != (long) sizeof meg) break;
+            staged += w;
+        }
+        ck("  1 MiB staged", staged, 1024 * 1024);
+        if (big >= 0)
+            close(big);
+
+        int in = open(src_path, O_RDONLY);
+        int pf[2];
+        ck("pipe", pipe(pf), 0);
+        // Seed the pipe first, so the room left in it is not a round number and
+        // the copy has to stop PART WAY through a chunk it has already read.
+        // That is the path that can lose data rather than merely hang: bytes
+        // taken out of the file and not written have to go back.
+        long seeded = (long) write(pf[1], meg, 4096);
+        ck("  seed the pipe so it cannot take a whole chunk", seeded, 4096);
+        long moved = do_splice(in, NULL, pf[1], NULL, 1024 * 1024, 0);
+        ck("splice(1 MiB file -> pipe) returns what fit, not a hang",
+           moved > 0 && moved < 1024 * 1024, 1);
+        test_logf("  %-56s got=%ld\n", "  bytes it took", moved);
+        // Nothing was taken out of the file that did not reach the pipe.
+        ck("  the file position matches what it moved",
+           (long) lseek(in, 0, SEEK_CUR), moved);
+        char buf[8192];
+        long drained = 0, n;
+        while (drained < seeded + moved && (n = (long) read(pf[0], buf, sizeof buf)) > 0)
+            drained += n;
+        ck("  and the pipe holds the seed plus exactly that many", drained, seeded + moved);
+        close(in);
+        close(pf[0]);
+        close(pf[1]);
+    }
+
     // ---- tee: implemented, or honestly absent ------------------------------
     {
         int pa[2], pb[2];
