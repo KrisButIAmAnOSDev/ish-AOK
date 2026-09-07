@@ -313,21 +313,174 @@ double avx_fp_apply(enum avx_fp_op op, double a, double b) {
     return 0;
 }
 
+// x86 NaN handling, done on the RAW BITS, because neither C nor the host FPU
+// reproduces it and the differences are invisible until you diff against real
+// silicon. Three separate things were wrong before this, all measured against
+// an x86_64 host:
+//
+//  1. The single-precision path computed in double and cast back. That
+//     round-trip QUIETS a signalling NaN, so VMAXPS returning src2 verbatim
+//     (which it must) returned 0x7fc000ff where hardware returns 0x7f8000ff.
+//  2. Division with NaN operands lost the SIGN: 0xffffffff / 0xffffffff gave
+//     0x7fffffff where hardware gives 0xffffffff. C says nothing about which
+//     NaN an operation returns, so relying on it was never going to hold.
+//  3. VSQRTPS of a negative returned a positive NaN instead of the x86 real
+//     indefinite. That one already had a fix for the SSE path
+//     (amd64_sse_sqrt_f32) which the VEX path did not use.
+//
+// The rules implemented, from the SDM's operand-precedence table:
+//  - ADD/SUB/MUL/DIV: a signalling NaN in src1 wins, quieted; else a
+//    signalling NaN in src2, quieted; else a quiet NaN in src1 unchanged;
+//    else a quiet NaN in src2 unchanged.
+//  - MIN/MAX: if EITHER operand is a NaN of any kind the result is src2
+//    UNCHANGED -- not quieted, not canonicalised. The same rule makes
+//    MIN/MAX of +0.0 and -0.0 return src2, which is why zeros are handled
+//    here too rather than left to the comparison.
+static inline bool avx_f32_is_nan(uint32_t b) {
+    return (b & 0x7f800000u) == 0x7f800000u && (b & 0x007fffffu) != 0;
+}
+static inline bool avx_f32_is_snan(uint32_t b) {
+    return avx_f32_is_nan(b) && (b & 0x00400000u) == 0;
+}
+static inline bool avx_f64_is_nan(uint64_t b) {
+    return (b & 0x7ff0000000000000ull) == 0x7ff0000000000000ull &&
+           (b & 0x000fffffffffffffull) != 0;
+}
+static inline bool avx_f64_is_snan(uint64_t b) {
+    return avx_f64_is_nan(b) && (b & 0x0008000000000000ull) == 0;
+}
+
+// Returns true and fills *out when x86 selects one of the operands' NaNs (or,
+// for MIN/MAX, src2) rather than computing anything.
+static bool avx_fp_nan_result32(enum avx_fp_op op, uint32_t a, uint32_t b,
+        uint32_t *out) {
+    if (op == AVX_FMIN || op == AVX_FMAX) {
+        bool zeros = (a & 0x7fffffffu) == 0 && (b & 0x7fffffffu) == 0;
+        if (avx_f32_is_nan(a) || avx_f32_is_nan(b) || zeros) {
+            *out = b;
+            return true;
+        }
+        return false;
+    }
+    if (avx_f32_is_snan(a)) { *out = a | 0x00400000u; return true; }
+    if (avx_f32_is_snan(b)) { *out = b | 0x00400000u; return true; }
+    if (avx_f32_is_nan(a))  { *out = a; return true; }
+    if (avx_f32_is_nan(b))  { *out = b; return true; }
+    // Invalid-operation cases with no NaN operand. x86 answers all of them with
+    // the real indefinite, 0xffc00000 -- SIGN SET -- where arm64 produces the
+    // positive default NaN 0x7fc00000. Measured: 0.0/0.0 differed by exactly
+    // that bit. Same divergence as sqrt of a negative, and it has to be listed
+    // explicitly because C says nothing about which NaN an operation yields.
+    {
+        bool az = (a & 0x7fffffffu) == 0, bz = (b & 0x7fffffffu) == 0;
+        bool ai = (a & 0x7fffffffu) == 0x7f800000u;
+        bool bi = (b & 0x7fffffffu) == 0x7f800000u;
+        bool invalid =
+            (op == AVX_FDIV && ((az && bz) || (ai && bi))) ||
+            (op == AVX_FMUL && ((az && bi) || (ai && bz))) ||
+            (op == AVX_FADD && ai && bi && ((a ^ b) & 0x80000000u) != 0) ||
+            (op == AVX_FSUB && ai && bi && ((a ^ b) & 0x80000000u) == 0);
+        if (invalid) { *out = 0xffc00000u; return true; }
+    }
+    return false;
+}
+
+static bool avx_fp_nan_result64(enum avx_fp_op op, uint64_t a, uint64_t b,
+        uint64_t *out) {
+    if (op == AVX_FMIN || op == AVX_FMAX) {
+        bool zeros = (a & 0x7fffffffffffffffull) == 0 &&
+                     (b & 0x7fffffffffffffffull) == 0;
+        if (avx_f64_is_nan(a) || avx_f64_is_nan(b) || zeros) {
+            *out = b;
+            return true;
+        }
+        return false;
+    }
+    if (avx_f64_is_snan(a)) { *out = a | 0x0008000000000000ull; return true; }
+    if (avx_f64_is_snan(b)) { *out = b | 0x0008000000000000ull; return true; }
+    if (avx_f64_is_nan(a))  { *out = a; return true; }
+    if (avx_f64_is_nan(b))  { *out = b; return true; }
+    {
+        bool az = (a & 0x7fffffffffffffffull) == 0;
+        bool bz = (b & 0x7fffffffffffffffull) == 0;
+        bool ai = (a & 0x7fffffffffffffffull) == 0x7ff0000000000000ull;
+        bool bi = (b & 0x7fffffffffffffffull) == 0x7ff0000000000000ull;
+        bool invalid =
+            (op == AVX_FDIV && ((az && bz) || (ai && bi))) ||
+            (op == AVX_FMUL && ((az && bi) || (ai && bz))) ||
+            (op == AVX_FADD && ai && bi &&
+                ((a ^ b) & 0x8000000000000000ull) != 0) ||
+            (op == AVX_FSUB && ai && bi &&
+                ((a ^ b) & 0x8000000000000000ull) == 0);
+        if (invalid) { *out = 0xfff8000000000000ull; return true; }
+    }
+    return false;
+}
+
+// x86 SQRT of a negative (non-NaN) operand is the real indefinite --
+// 0xffc00000 / 0xfff8000000000000, sign bit SET. arm64 yields a positive NaN
+// there. A NaN input falls through to the host, which quiets it as x86 does,
+// and -0.0 is not < 0 so sqrt(-0) = -0 as required.
+float avx_sqrt_f32(float x) {
+    if (x < 0.0f) {
+        uint32_t bits = 0xffc00000u;
+        float r;
+        memcpy(&r, &bits, sizeof(r));
+        return r;
+    }
+    return sqrtf(x);
+}
+
+double avx_sqrt_f64(double x) {
+    if (x < 0.0) {
+        uint64_t bits = 0xfff8000000000000ull;
+        double r;
+        memcpy(&r, &bits, sizeof(r));
+        return r;
+    }
+    return sqrt(x);
+}
+
 void avx_fp_binop(enum avx_fp_op op, bool is_double, unsigned vlen,
         const uint8_t *s1, const uint8_t *s2, uint8_t *d) {
     unsigned lb = is_double ? 8 : 4;
     for (unsigned i = 0; i < vlen / 8; i += lb) {
         if (is_double) {
+            uint64_t ab, bb, rb;
+            memcpy(&ab, s1 + i, 8);
+            memcpy(&bb, s2 + i, 8);
+            if (avx_fp_nan_result64(op, ab, bb, &rb)) {
+                memcpy(d + i, &rb, 8);
+                continue;
+            }
             double a, b, r;
-            memcpy(&a, s1 + i, 8);
-            memcpy(&b, s2 + i, 8);
+            memcpy(&a, &ab, 8);
+            memcpy(&b, &bb, 8);
             r = avx_fp_apply(op, a, b);
             memcpy(d + i, &r, 8);
         } else {
+            uint32_t ab, bb, rb;
+            memcpy(&ab, s1 + i, 4);
+            memcpy(&bb, s2 + i, 4);
+            if (avx_fp_nan_result32(op, ab, bb, &rb)) {
+                memcpy(d + i, &rb, 4);
+                continue;
+            }
+            // Computed in FLOAT, not promoted to double and cast back: the
+            // round-trip is what quieted signalling NaNs, and it is also the
+            // only thing that could perturb a double-rounded result.
             float a, b, r;
-            memcpy(&a, s1 + i, 4);
-            memcpy(&b, s2 + i, 4);
-            r = (float) avx_fp_apply(op, a, b);
+            memcpy(&a, &ab, 4);
+            memcpy(&b, &bb, 4);
+            switch (op) {
+            case AVX_FADD: r = a + b; break;
+            case AVX_FSUB: r = a - b; break;
+            case AVX_FMUL: r = a * b; break;
+            case AVX_FDIV: r = a / b; break;
+            case AVX_FMIN: r = a < b ? a : b; break;
+            case AVX_FMAX: r = a > b ? a : b; break;
+            default: r = 0; break;
+            }
             memcpy(d + i, &r, 4);
         }
     }
@@ -710,8 +863,9 @@ unsigned avx32_mem_bits(unsigned map, unsigned op, unsigned pp, unsigned w, unsi
     }
     if (map == 3) {
         switch (op) {
-        case 0x0f: case 0x00: case 0x46: case 0x02: case 0x0e: case 0x4c:
-        case 0x44: case 0xce: case 0x25:
+        // 0x01 is VPERMPD, sized like its VPERMQ twin at 0x00.
+        case 0x0f: case 0x00: case 0x01: case 0x46: case 0x02: case 0x0e:
+        case 0x4c: case 0x44: case 0xce: case 0x25:
             return vlen;
         case 0x38: case 0x39: return 128;  // vinserti128 / vextracti128
         case 0x14: return 8;
@@ -934,12 +1088,12 @@ void vec_avx32(struct cpu_state *cpu, const void *src, void *dst, uint32_t desc)
                 if (is_double) {
                     double v;
                     memcpy(&v, b + i, 8);
-                    v = sqrt(v);
+                    v = avx_sqrt_f64(v);
                     memcpy(out + i, &v, 8);
                 } else {
                     float v;
                     memcpy(&v, b + i, 4);
-                    v = sqrtf(v);
+                    v = avx_sqrt_f32(v);
                     memcpy(out + i, &v, 4);
                 }
             }
@@ -980,7 +1134,14 @@ void vec_avx32(struct cpu_state *cpu, const void *src, void *dst, uint32_t desc)
         }
         if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6c ||
             op == 0x68 || op == 0x69 || op == 0x6a || op == 0x6d) {
-            bool high = op >= 0x68;
+            // 0x6c is punpckLqdq and 0x6d is punpckHqdq, so a bare
+            // `op >= 0x68` calls the LOW form high. The opcode space is not
+            // ordered the way the test assumes: 60-62 are the low bw/wd/dq,
+            // 68-6a the high ones, and then the qdq pair follows as 6c/6d.
+            // Measured against real x86_64 hardware: vpunpcklqdq returned the
+            // HIGH qword of each 128-bit lane in both widths. 0x6d happened to
+            // be right by luck.
+            bool high = (op >= 0x68 && op <= 0x6a) || op == 0x6d;
             unsigned lb = (op == 0x60 || op == 0x68) ? 1
                         : (op == 0x61 || op == 0x69) ? 2
                         : (op == 0x62 || op == 0x6a) ? 4 : 8;
@@ -1150,7 +1311,9 @@ void vec_avx32(struct cpu_state *cpu, const void *src, void *dst, uint32_t desc)
     }
 
     if (map == 3) {
-        if (op == 0x00) { // vpermq -- crosses lanes
+        // 0x01 is VPERMPD: identical qword gather to VPERMQ, different operand
+        // type in the manual and no difference at all in the bits moved.
+        if (op == 0x00 || op == 0x01) { // vpermq / vpermpd -- cross lanes
             for (unsigned i = 0; i < 4; i++)
                 avx_lane_put(out + i * 8, 8, avx_lane_get(b + ((imm >> (2 * i)) & 3) * 8, 8));
             avx_reg_write(cpu, reg, 256, out);

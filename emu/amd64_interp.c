@@ -5312,12 +5312,12 @@ static int amd64_vex_map_0f(struct amd64_vex_ctx *c, byte_t op) {
             if (is_double) {
                 double v;
                 memcpy(&v, a + i, 8);
-                v = sqrt(v);
+                v = avx_sqrt_f64(v);
                 memcpy(out + i, &v, 8);
             } else {
                 float v;
                 memcpy(&v, a + i, 4);
-                v = sqrtf(v);
+                v = avx_sqrt_f32(v);
                 memcpy(out + i, &v, 4);
             }
         }
@@ -5411,7 +5411,9 @@ static int amd64_vex_map_0f(struct amd64_vex_ctx *c, byte_t op) {
     case 0x68: case 0x69: case 0x6a: case 0x6d: { // punpckh bw/wd/dq/qdq
         if (c->vex.pp != 1)
             return INT_UNDEFINED;
-        bool high = op >= 0x68;
+        // See the note in emu/avx.c's copy: 0x6c is punpckLqdq, so `op >= 0x68`
+        // classifies the LOW form as high. Measured wrong against hardware.
+        bool high = (op >= 0x68 && op <= 0x6a) || op == 0x6d;
         unsigned lb = (op == 0x60 || op == 0x68) ? 1
                     : (op == 0x61 || op == 0x69) ? 2
                     : (op == 0x62 || op == 0x6a) ? 4 : 8;
@@ -6958,7 +6960,14 @@ static int amd64_vex_map_0f3a(struct amd64_vex_ctx *c, byte_t op) {
         amd64_vec_reg_write(cpu, modrm.reg, vlen, out);
         return INT_NONE;
     }
-    case 0x00: { // vpermq (W=1): qword gather across the whole register
+    // VPERMPD (0F 3A 01, W=1) is bit-for-bit the same data movement as VPERMQ:
+    // four 2-bit selectors in imm8 gather four qwords from anywhere in the
+    // 256-bit source. Only the operand TYPE differs in the manual, and this
+    // engine moves bits, so they share an arm. It was simply absent, and an
+    // absent instruction is a SIGILL -- measured, 20 probe cases, on a form
+    // that auto-vectorisers emit for double shuffles.
+    case 0x01:
+    case 0x00: { // vpermq / vpermpd (W=1): qword gather across the register
         if (!c->vex.w || vlen < 256)
             return INT_UNDEFINED;
         if (!amd64_vex_decode_modrm(c, &modrm))

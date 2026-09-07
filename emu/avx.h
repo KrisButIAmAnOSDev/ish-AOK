@@ -84,6 +84,10 @@ void avx_pmuludq(unsigned vlen, const uint8_t *s1, const uint8_t *s2, uint8_t *d
 void avx_psadbw(unsigned vlen, const uint8_t *s1, const uint8_t *s2, uint8_t *d);
 void avx_abs(unsigned lb, unsigned vlen, const uint8_t *s, uint8_t *d);
 double avx_fp_apply(enum avx_fp_op op, double a, double b);
+// x86-exact SQRT: a negative operand gives the real indefinite (sign set),
+// which arm64's sqrt does not produce.
+float avx_sqrt_f32(float x);
+double avx_sqrt_f64(double x);
 void avx_fp_binop(enum avx_fp_op op, bool is_double, unsigned vlen, const uint8_t *s1, const uint8_t *s2, uint8_t *d);
 bool avx_fp_compare(unsigned pred, double a, double b);
 void avx_fp_cmp(unsigned pred, bool is_double, unsigned vlen, const uint8_t *s1, const uint8_t *s2, uint8_t *d);
