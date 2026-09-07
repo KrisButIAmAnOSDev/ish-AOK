@@ -13287,6 +13287,7 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FABS() h(fpu_abs)
 #define FLDC(what) hh(fpu_ldc, fconst_##what)
 #define FPREM() h(fpu_prem)
+#define FPREM1() h(fpu_prem1)
 #define FRNDINT() h(fpu_rndint)
 #define FSCALE() h(fpu_scale)
 #define FSQRT() h(fpu_sqrt)

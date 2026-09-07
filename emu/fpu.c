@@ -164,6 +164,15 @@ void fpu_prem(struct cpu_state *cpu) {
     cpu->c2 = 0; // say we finished the entire remainder
 }
 
+// FPREM1 (D9 F5): the IEEE-754 remainder, which rounds the implied quotient to
+// nearest-even where FPREM truncates it. It was missing entirely -- f80_rem had
+// been declared for it and never written -- so every FPREM1 raised SIGILL.
+// glibc's remainder()/remquo() and drem() are the callers that matter.
+void fpu_prem1(struct cpu_state *cpu) {
+    ST(0) = f80_rem(ST(0), ST(1));
+    cpu->c2 = 0; // complete reduction, as fpu_prem also reports
+}
+
 void fpu_scale(struct cpu_state *cpu) {
     enum f80_rounding_mode old_mode = f80_rounding_mode;
     f80_rounding_mode = round_chop;

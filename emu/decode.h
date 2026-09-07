@@ -1483,6 +1483,7 @@ restart:
                     case 0xd963: TRACE("fpatan"); FPATAN(); break;
                     case 0xd964: TRACE("fxtract"); FXTRACT(); break;
                     case 0xd967: TRACE("fincstp"); FINCSTP(); break;
+                    case 0xd965: TRACE("fprem1"); FPREM1(); break;
                     case 0xd970: TRACE("fprem"); FPREM(); break;
                     case 0xd972: TRACE("fsqrt"); FSQRT(); break;
                     case 0xd974: TRACE("frndint"); FRNDINT(); break;

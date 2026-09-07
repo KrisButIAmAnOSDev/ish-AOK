@@ -475,18 +475,22 @@ float80 f80_div(float80 a, float80 b) {
     if (f80_isinf(a)) {
         // dividing into infinity gives infinity
         f = F80_INF;
-        // except infinity / infinity is nan
+        // except infinity / infinity, which is an invalid operation and so
+        // gives the real indefinite (sign set), not the positive quiet NaN
         if (f80_isinf(b))
-            return F80_NAN;
+            return F80_INDEFINITE;
     } else if (f80_isinf(b)) {
         // dividing by infinity gives zero
         f = (float80) {0};
     } else if (f80_iszero(b)) {
         // division by zero gives infinity
         f = F80_INF;
-        // except 0 / 0 is nan
+        // except 0 / 0, likewise an invalid operation. Returned directly:
+        // the `f.sign = a.sign ^ b.sign` below would otherwise clear the
+        // indefinite's sign bit, which is the whole thing that distinguishes
+        // it from an ordinary quiet NaN.
         if (f80_iszero(a))
-            f = F80_NAN;
+            return F80_INDEFINITE;
     } else {
         int b_trailing = __builtin_ctzl(b.signif);
         b.signif >>= b_trailing;
@@ -507,13 +511,82 @@ float80 f80_div(float80 a, float80 b) {
     return f;
 }
 
+// FPREM / FPREM1 share one EXACT remainder.
+//
+// The old f80_mod computed x - trunc(x/y)*y, which is the right formula and the
+// wrong arithmetic: f80_div rounds, and the product of a rounded quotient with
+// y is not x's remainder. x87's FPREM is exact by construction, and the error
+// grew with the quotient -- measured, 78 differing cases against real x86_64
+// hardware over ordinary long-double inputs.
+//
+// The exact algorithm is repeated scaled subtraction. At each step the divisor
+// is scaled to just below the running remainder, so r lies in [t, 2t) whenever
+// a subtraction happens -- and by Sterbenz's lemma r - t is then exactly
+// representable, so no step loses a bit. What comes out is the true remainder
+// with the quotient truncated toward zero, plus the quotient's low bit, which
+// is all FPREM1 needs to break its tie.
+//
+// Both return a COMPLETE reduction. Real hardware may reduce partially and set
+// C2 to ask the caller to loop; software that loops on C2 simply exits at once,
+// which is what fpu_prem already assumed.
+static float80 f80_remainder_common(float80 x, float80 y, bool ieee) {
+    // Invalid operations -- a zero divisor, or an infinite dividend -- give the
+    // x87 real indefinite, which is the NEGATIVE quiet NaN. A propagated NaN
+    // operand is returned as-is rather than replaced.
+    if (f80_isnan(x))
+        return x;
+    if (f80_isnan(y))
+        return y;
+    if (!f80_is_supported(x) || !f80_is_supported(y) ||
+            f80_isinf(x) || f80_iszero(y))
+        return F80_INDEFINITE;
+    if (f80_iszero(x) || f80_isinf(y))
+        return x;
+
+    float80 r = f80_abs(x);
+    float80 d = f80_abs(y);
+    int quotient_odd = 0;
+
+    if (!f80_lt(r, d)) {
+        int rexp = 0, dexp = 0;
+        float80 ignored;
+        f80_xtract(r, &rexp, &ignored);
+        f80_xtract(d, &dexp, &ignored);
+        for (int i = rexp - dexp; i >= 0; i--) {
+            float80 t = f80_scale(d, i);
+            if (f80_lt(r, t))
+                continue;
+            r = f80_sub(r, t);
+            if (i == 0)
+                quotient_odd = 1;
+        }
+    }
+
+    // FPREM1 rounds the quotient to nearest-even instead of truncating, so it
+    // takes one more subtraction when the remainder is past halfway -- or
+    // exactly at halfway with an odd quotient. |d - r| is exact there for the
+    // same Sterbenz reason, since the branch implies r >= d/2.
+    bool flip = false;
+    if (ieee) {
+        float80 twice_r = f80_add(r, r);
+        if (f80_lt(d, twice_r) || (f80_eq(twice_r, d) && quotient_odd)) {
+            r = f80_sub(d, r);
+            flip = true;
+        }
+    }
+
+    r.sign = flip ? !x.sign : x.sign;
+    return r;
+}
+
 float80 f80_mod(float80 x, float80 y) {
-    float80 quotient = f80_div(x, y);
-    enum f80_rounding_mode old_mode = f80_rounding_mode;
-    f80_rounding_mode = round_chop;
-    quotient = f80_round(quotient);
-    f80_rounding_mode = old_mode;
-    return f80_sub(x, f80_mul(quotient, y));
+    return f80_remainder_common(x, y, false);
+}
+
+// FPREM1 (D9 F5): the IEEE-754 remainder. Declared in float80.h since the x87
+// work began and never written, which is why FPREM1 raised SIGILL.
+float80 f80_rem(float80 x, float80 y) {
+    return f80_remainder_common(x, y, true);
 }
 
 bool f80_uncomparable(float80 a, float80 b) {
@@ -588,8 +661,13 @@ float80 f80_log2(float80 x) {
 float80 f80_sqrt(float80 x) {
     if (f80_iszero(x))
         return x;
-    if (f80_isnan(x) || x.sign)
-        return F80_NAN;
+    if (f80_isnan(x))
+        return x;
+    // Invalid operation: x87 answers with the real indefinite, whose sign bit
+    // is SET. Returning the positive quiet NaN differed from hardware by
+    // exactly that bit.
+    if (x.sign)
+        return F80_INDEFINITE;
     // for a rough guess, just cut the exponent by 2
     float80 guess = x;
     guess.exp = bias(unbias(guess.exp) / 2);
@@ -613,5 +691,10 @@ float80 f80_scale(float80 x, int scale) {
 void f80_xtract(float80 f, int *exp, float80 *signif) {
     *exp = unbias(f.exp);
     *signif = f;
+    // FXTRACT of zero yields zero, not 1.0. Forcing the exponent field
+    // unconditionally turned a zero significand into 1.0 -- measured against
+    // hardware, which returns zero with the original sign.
+    if (f80_iszero(f))
+        return;
     signif->exp = bias(0);
 }

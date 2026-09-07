@@ -72,6 +72,12 @@ extern __thread int f80_inexact;
 extern __thread int f80_rounded_up;
 
 #define F80_NAN ((float80) {.signif = 0xc000000000000000, .exp = 0x7fff, .sign = 0})
+// The x87 "real indefinite": the QNaN an invalid operation produces, and its
+// SIGN BIT IS SET. F80_NAN above is the positive quiet NaN, which is what a
+// widened host NaN looks like -- not what FPREM of a zero divisor, or any other
+// invalid x87 operation, returns. Measured against real x86_64 hardware: the
+// two differ by exactly that bit.
+#define F80_INDEFINITE ((float80) {.signif = 0xc000000000000000, .exp = 0x7fff, .sign = 1})
 #define F80_INF ((float80) {.signif = 0x8000000000000000, .exp = 0x7fff, .sign = 0})
 
 #endif

@@ -8082,6 +8082,9 @@ static inline int amd64_handle_x87(struct cpu_state *cpu, struct tlb *tlb,
     case 0xd967:
         fpu_incstp(cpu);
         return INT_NONE;
+    case 0xd965:
+        fpu_prem1(cpu);
+        return INT_NONE;
     case 0xd970:
         fpu_prem(cpu);
         return INT_NONE;
