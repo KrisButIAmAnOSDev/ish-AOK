@@ -478,7 +478,13 @@ static void amd64_jit_note_compile_fallback(const struct gen_state *state, guest
 
     // Periodic sorted dump (powers of two >= 256) so a single run prints the
     // frequency ranking as it converges, without needing an exit hook.
-    if (amd64_jit_stats_enabled() && total >= 8 && (total & (total - 1)) == 0)
+    // The FIRST fallback is dumped as well as the powers of two from eight up.
+    // The whole point of this counter is to answer "is it zero", and a
+    // threshold of eight cannot distinguish one fallback from none -- which
+    // mattered exactly when the count reached one and there was no way to learn
+    // which opcode it was without rebuilding.
+    if (amd64_jit_stats_enabled() &&
+            (total == 1 || (total >= 8 && (total & (total - 1)) == 0)))
         amd64_jit_dump_fallback_histogram(total);
 }
 

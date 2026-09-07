@@ -66,6 +66,13 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long op2, unsigned long next_ip);
 int amd64_jit_grp3_test(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long opcode, unsigned long next_ip);
+int amd64_jit_loop_addr32(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long target_ip, unsigned long next_ip);
+int amd64_jit_sse3_haddsub(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip);
+int amd64_jit_0f38(struct cpu_state *cpu, struct tlb *tlb, unsigned long start_ip);
+int amd64_jit_popcnt(struct cpu_state *cpu, struct tlb *tlb, unsigned long next_ip);
+int amd64_jit_ud2(struct cpu_state *cpu, struct tlb *tlb, unsigned long start_ip);
 int amd64_jit_vex(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long lead, unsigned long start_ip);
 int amd64_jit_x87(struct cpu_state *cpu, struct tlb *tlb,

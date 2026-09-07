@@ -7295,6 +7295,66 @@ static inline int amd64_fxsave_op(struct cpu_state *cpu, struct tlb *tlb,
     return INT_NONE;
 }
 
+// Hoisted: the shared per-instruction helpers below take a rep_mode, and they
+// have to sit above their interpreter callers.
+enum amd64_rep_mode {
+    AMD64_REP_NONE,
+    AMD64_REPZ,
+    AMD64_REPNZ,
+};
+
+// SSE3 horizontal add/sub and alternating add-sub (0F 7C / 7D / D0), shared by
+// the interpreter's arm and the JIT bridge. F2 selects the *ps forms, 66 the
+// *pd forms, and any other prefix combination is #UD.
+static int amd64_sse3_haddsub(struct cpu_state *cpu, struct tlb *tlb,
+        const struct amd64_modrm *modrm, bool fs_prefix,
+        bool operand_size_prefix, enum amd64_rep_mode rep_mode, byte_t op2) {
+    union xmm_reg src_xmm;
+    bool is_ps = (rep_mode == AMD64_REPNZ && !operand_size_prefix);
+    bool is_pd = (rep_mode == AMD64_REP_NONE && operand_size_prefix);
+    if (!is_ps && !is_pd)
+        return INT_UNDEFINED;
+    if (!amd64_read_xmm_rm(cpu, tlb, modrm, fs_prefix, &src_xmm))
+        return INT_PF;
+    union xmm_reg *d = &cpu->xmm[modrm->reg];
+    if (op2 == 0x7c)
+        is_ps ? vec_haddps128(NULL, &src_xmm, d) : vec_haddpd128(NULL, &src_xmm, d);
+    else if (op2 == 0x7d)
+        is_ps ? vec_hsubps128(NULL, &src_xmm, d) : vec_hsubpd128(NULL, &src_xmm, d);
+    else
+        is_ps ? vec_addsubps128(NULL, &src_xmm, d) : vec_addsubpd128(NULL, &src_xmm, d);
+    return INT_NONE;
+}
+
+// POPCNT (F3 0F B8), shared by the interpreter's arm and the JIT bridge.
+// Counts set bits in the source; ZF is set iff the source is zero and every
+// other arithmetic flag is cleared. The F3 prefix is mandatory -- bare 0F B8 is
+// not POPCNT -- and the caller has already checked it.
+//
+// The caller has decoded the ModRM. Returns INT_NONE with rip untouched, or
+// INT_PF.
+static int amd64_popcnt_op(struct cpu_state *cpu, struct tlb *tlb,
+        const struct amd64_modrm *modrm, bool fs_prefix, unsigned op_size) {
+    qword_t src, src_masked, count;
+    if (!amd64_read_rm(cpu, tlb, modrm, fs_prefix, op_size, &src))
+        return INT_PF;
+    src_masked = amd64_trunc(src, op_size);
+    count = (op_size == 64)
+            ? (qword_t) __builtin_popcountll(src_masked)
+            : (qword_t) __builtin_popcount((uint32_t) src_masked);
+    cpu->cf = 0;
+    cpu->of = 0;
+    cpu->af = 0;
+    cpu->af_ops = 0;
+    cpu->zf = src_masked == 0;
+    cpu->sf = 0;
+    cpu->pf = 0;
+    cpu->zf_res = cpu->sf_res = cpu->pf_res = 0;
+    collapse_flags(cpu);
+    amd64_reg_set(cpu, modrm->reg, op_size, count);
+    return INT_NONE;
+}
+
 // CMPXCHG8B / CMPXCHG16B (0F C7 /1), shared by the interpreter's own arm and by
 // the JIT bridge amd64_jit_cmpxchg8b, so the two engines cannot drift apart. A
 // second copy of a per-instruction body is a mistake this tree has paid for
@@ -8091,12 +8151,6 @@ static inline bool amd64_cond_eval(struct cpu_state *cpu, unsigned cc) {
     }
 }
 
-enum amd64_rep_mode {
-    AMD64_REP_NONE,
-    AMD64_REPZ,
-    AMD64_REPNZ,
-};
-
 static inline void amd64_bump_string_reg(struct cpu_state *cpu, unsigned reg, unsigned size) {
     qword_t delta = size / 8;
     if (cpu->amd64_address_size_prefix) {
@@ -8320,6 +8374,297 @@ amd64_string_pf:
     return INT_PF;
 }
 
+// The three-byte 0F 38 escape (SSSE3 / SSE4.1 / CRC32), factored out of
+// amd64_step_to_interrupt so the JIT can bridge to it and so there stays
+// exactly one copy. Returns INT_NONE on success with rip past the
+// instruction, or an interrupt with rip and segfault_addr already set.
+static int amd64_0f38_op(struct cpu_state *cpu, struct tlb *tlb,
+        qword_t saved_rip, struct amd64_rex_prefix rex, bool fs_prefix,
+        bool operand_size_prefix, enum amd64_rep_mode rep_mode) {
+        // Three-byte 0F 38 escape (SSSE3 / SSE4.1). Implemented: pshufb
+        // (66 0F 38 00), pblendvb (10), blendvps/blendvpd (14/15), ptest (17),
+        // pcmpeqq (29), pmulld (40), and pmovsx/pmovzx packed sign/zero-extend
+        // moves (20-25 sign, 30-35 zero) — emitted by auto-vectorizers and by
+        // optimized string/format code. They require the 66 operand-size
+        // prefix and no F2/F3 prefix.
+        byte_t op3;
+        if (!amd64_fetch_u8(cpu, tlb, &op3)) {
+            cpu->amd64_rip = saved_rip;
+            cpu->segfault_addr = saved_rip;
+            return INT_GPF;
+        }
+        // crc32 (F2 0F 38 F0/F1): accumulate CRC32C of the r/m source into the
+        // GP reg dest. A GP op (not xmm), so handle it before the xmm prefix
+        // guard. F0 = r/m8; F1 = r/m16 (66) / r/m32 / r/m64 (REX.W).
+        if ((op3 == 0xf0 || op3 == 0xf1) && rep_mode == AMD64_REPNZ) {
+            struct amd64_modrm cmodrm;
+            if (!amd64_decode_modrm(cpu, tlb, rex, &cmodrm)) {
+                cpu->amd64_rip = saved_rip;
+                cpu->segfault_addr = saved_rip;
+                return INT_GPF;
+            }
+            unsigned src_size = (op3 == 0xf0) ? 8 : (rex.w ? 64 : (operand_size_prefix ? 16 : 32));
+            qword_t srcv;
+            if (!amd64_read_rm(cpu, tlb, &cmodrm, fs_prefix, src_size, &srcv)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            if (op3 == 0xf1 && rex.w) {
+                uint64_t acc = (uint32_t) amd64_reg_get(cpu, cmodrm.reg, 32);
+                vec_crc32_64(NULL, &srcv, &acc);
+                amd64_reg_set(cpu, cmodrm.reg, 64, acc);
+            } else {
+                uint32_t acc = (uint32_t) amd64_reg_get(cpu, cmodrm.reg, 32);
+                if (op3 == 0xf0) { uint8_t b = (uint8_t) srcv; vec_crc32_8(NULL, &b, &acc); }
+                else if (operand_size_prefix) { uint16_t w = (uint16_t) srcv; vec_crc32_16(NULL, &w, &acc); }
+                else { uint32_t d = (uint32_t) srcv; vec_crc32_32(NULL, &d, &acc); }
+                amd64_reg_set(cpu, cmodrm.reg, 32, acc); // zero-extends to 64
+            }
+            return INT_NONE;
+        }
+        bool is_pshufb = op3 == 0x00;
+        bool is_pblendvb = op3 == 0x10;
+        bool is_blendvps = op3 == 0x14;
+        bool is_blendvpd = op3 == 0x15;
+        bool is_ptest = op3 == 0x17;
+        bool is_pcmpeqq = op3 == 0x29;
+        bool is_pmulld = op3 == 0x40;
+        bool is_pmovx = (op3 >= 0x20 && op3 <= 0x25) ||
+                        (op3 >= 0x30 && op3 <= 0x35);
+        // Additional xmm<-xmm/m128 ops handled via the shared vec.c helpers
+        // (validated bit-exact vs real Intel by tests/remote/corpus):
+        // SSSE3 phaddw/d/sw, pmaddubsw, phsubw/d/sw, psignb/w/d, pmulhrsw
+        // (01-0b); pabsb/w/d (1c-1e); pmuldq (28), packusdw (2b),
+        // pcmpgtq (37), pmin/pmax sb/sd/uw/ud (38-3f).
+        // movntdqa (2a) is a plain aligned 128-bit load (copy); phminposuw
+        // (41) reduces src to its min unsigned word + index. Both read r/m
+        // into the local src and write the reg, so they share this path.
+        bool is_vec38 = (op3 >= 0x01 && op3 <= 0x0b) ||
+                        (op3 >= 0x1c && op3 <= 0x1e) || op3 == 0x28 ||
+                        op3 == 0x2a || op3 == 0x2b || op3 == 0x37 ||
+                        op3 == 0x41 || (op3 >= 0x38 && op3 <= 0x3f);
+        if ((!is_pshufb && !is_pblendvb && !is_blendvps && !is_blendvpd &&
+                !is_ptest && !is_pcmpeqq && !is_pmulld && !is_pmovx && !is_vec38) ||
+                !operand_size_prefix || rep_mode != AMD64_REP_NONE)
+            return INT_UNDEFINED;
+        struct amd64_modrm modrm;
+        if (!amd64_decode_modrm(cpu, tlb, rex, &modrm)) {
+            cpu->amd64_rip = saved_rip;
+            cpu->segfault_addr = saved_rip;
+            return INT_GPF;
+        }
+        if (modrm.reg >= AMD64_XMM_COUNT ||
+                (modrm.is_reg && modrm.rm >= AMD64_XMM_COUNT))
+            return INT_UNDEFINED;
+        if (is_ptest) {
+            // PTEST xmm1, xmm2/m128 (66 0F 38 17). ZF = ((DEST & SRC) == 0),
+            // CF = ((SRC & ~DEST) == 0); OF/AF/PF/SF cleared. Commonly emitted
+            // for "is this vector all-zero / a subset" tests (e.g. memcmp).
+            union xmm_reg src;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            unsigned __int128 d = cpu->xmm[modrm.reg].u128;
+            unsigned __int128 s = src.u128;
+            cpu->cf = (s & ~d) == 0;
+            cpu->of = 0;
+            cpu->af = 0;
+            cpu->af_ops = 0;
+            cpu->zf = (d & s) == 0;
+            cpu->sf = 0;
+            cpu->pf = 0;
+            cpu->zf_res = cpu->sf_res = cpu->pf_res = 0;
+            collapse_flags(cpu);
+            return INT_NONE;
+        }
+        if (is_pshufb) {
+            // PSHUFB xmm1, xmm2/m128 (66 0F 38 00). dest=reg=xmm1 is BOTH the
+            // byte source and the destination; control=r/m. For each byte i:
+            // result[i] = (control[i] & 0x80) ? 0 : dest_orig[control[i] & 0xF].
+            // Snapshot dest first so the in-place store never corrupts a later
+            // index lookup.
+            union xmm_reg control;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &control)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            union xmm_reg dst = cpu->xmm[modrm.reg];
+            union xmm_reg result;
+            for (unsigned i = 0; i < 16; i++)
+                result.u8[i] = (control.u8[i] & 0x80)
+                        ? 0 : dst.u8[control.u8[i] & 0x0F];
+            cpu->xmm[modrm.reg] = result;
+            return INT_NONE;
+        }
+        if (is_pblendvb) {
+            // PBLENDVB xmm1, xmm2/m128 (66 0F 38 10). Per-byte variable blend
+            // controlled by the high bit of each byte in the IMPLICIT XMM0
+            // mask: result[i] = mask[i]&0x80 ? src[i] : dst[i]. dst=reg,
+            // src=r/m, mask=xmm0. Snapshot all three before writing so an
+            // operand that aliases xmm0 (or the destination) stays correct.
+            union xmm_reg src;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            union xmm_reg dst = cpu->xmm[modrm.reg];
+            union xmm_reg mask = cpu->xmm[0];
+            union xmm_reg result;
+            for (unsigned i = 0; i < 16; i++)
+                result.u8[i] = (mask.u8[i] & 0x80) ? src.u8[i] : dst.u8[i];
+            cpu->xmm[modrm.reg] = result;
+            return INT_NONE;
+        }
+        if (is_blendvps || is_blendvpd) {
+            // BLENDVPS (66 0F 38 14) / BLENDVPD (15) xmm1, xmm2/m128, <XMM0>.
+            // Same implicit-XMM0 variable blend as pblendvb, but per 32-bit
+            // (blendvps) or 64-bit (blendvpd) lane, selected by that lane's
+            // high (sign) bit in XMM0. dst=reg, src=r/m, mask=xmm0; snapshot
+            // all three before the store so an operand aliasing xmm0 (or the
+            // destination) stays correct.
+            union xmm_reg src;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            union xmm_reg dst = cpu->xmm[modrm.reg];
+            union xmm_reg mask = cpu->xmm[0];
+            union xmm_reg result;
+            if (is_blendvps) {
+                for (unsigned i = 0; i < 4; i++)
+                    result.u32[i] = (mask.u32[i] & 0x80000000u)
+                            ? src.u32[i] : dst.u32[i];
+            } else {
+                for (unsigned i = 0; i < 2; i++)
+                    result.qw[i] = (mask.qw[i] & 0x8000000000000000ull)
+                            ? src.qw[i] : dst.qw[i];
+            }
+            cpu->xmm[modrm.reg] = result;
+            return INT_NONE;
+        }
+        if (is_pmulld || is_pcmpeqq) {
+            // PMULLD (66 0F 38 40): 4x packed 32-bit multiply, low 32 bits of
+            // each product (the low half is identical for signed/unsigned).
+            // PCMPEQQ (66 0F 38 29): 2x packed 64-bit equality, all-ones where
+            // the lanes are equal else 0. dst=reg, src=r/m; read both operands
+            // before the store in case src aliases the destination.
+            union xmm_reg src;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            union xmm_reg dst = cpu->xmm[modrm.reg];
+            union xmm_reg result;
+            if (is_pmulld) {
+                for (unsigned i = 0; i < 4; i++)
+                    result.u32[i] = dst.u32[i] * src.u32[i];
+            } else {
+                for (unsigned i = 0; i < 2; i++)
+                    result.qw[i] = (dst.qw[i] == src.qw[i])
+                            ? 0xFFFFFFFFFFFFFFFFull : 0;
+            }
+            cpu->xmm[modrm.reg] = result;
+            return INT_NONE;
+        }
+        if (is_vec38) {
+            // Read the source into a local copy (no aliasing with the
+            // destination) and dispatch to the shared vec.c helper, which
+            // modifies cpu->xmm[modrm.reg] in place.
+            union xmm_reg src;
+            if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+            union xmm_reg *dst = &cpu->xmm[modrm.reg];
+            switch (op3) {
+                case 0x01: vec_phaddw128(cpu, &src, dst); break;
+                case 0x02: vec_phaddd128(cpu, &src, dst); break;
+                case 0x03: vec_phaddsw128(cpu, &src, dst); break;
+                case 0x04: vec_pmaddubsw128(cpu, &src, dst); break;
+                case 0x05: vec_phsubw128(cpu, &src, dst); break;
+                case 0x06: vec_phsubd128(cpu, &src, dst); break;
+                case 0x07: vec_phsubsw128(cpu, &src, dst); break;
+                case 0x08: vec_psignb128(cpu, &src, dst); break;
+                case 0x09: vec_psignw128(cpu, &src, dst); break;
+                case 0x0a: vec_psignd128(cpu, &src, dst); break;
+                case 0x0b: vec_pmulhrsw128(cpu, &src, dst); break;
+                case 0x1c: vec_pabsb128(cpu, &src, dst); break;
+                case 0x1d: vec_pabsw128(cpu, &src, dst); break;
+                case 0x1e: vec_pabsd128(cpu, &src, dst); break;
+                case 0x28: vec_pmuldq128(cpu, &src, dst); break;
+                case 0x2b: vec_packusdw128(cpu, &src, dst); break;
+                case 0x37: vec_pcmpgtq128(cpu, &src, dst); break;
+                case 0x38: vec_pminsb128(cpu, &src, dst); break;
+                case 0x39: vec_pminsd128(cpu, &src, dst); break;
+                case 0x3a: vec_pminuw128(cpu, &src, dst); break;
+                case 0x3b: vec_pminud128(cpu, &src, dst); break;
+                case 0x3c: vec_pmaxsb128(cpu, &src, dst); break;
+                case 0x3d: vec_pmaxsd128(cpu, &src, dst); break;
+                case 0x3e: vec_pmaxuw128(cpu, &src, dst); break;
+                case 0x3f: vec_pmaxud128(cpu, &src, dst); break;
+                case 0x2a: *dst = src; break; // movntdqa (aligned 128-bit load)
+                case 0x41: vec_phminposuw128(cpu, &src, dst); break;
+                default: return INT_UNDEFINED;
+            }
+            return INT_NONE;
+        }
+        bool zero_extend = (op3 & 0xf0) == 0x30;
+        unsigned src_elem_bytes, dst_elem_bytes;
+        switch (op3 & 0x0f) {
+            case 0x0: src_elem_bytes = 1; dst_elem_bytes = 2; break; // b->w
+            case 0x1: src_elem_bytes = 1; dst_elem_bytes = 4; break; // b->d
+            case 0x2: src_elem_bytes = 1; dst_elem_bytes = 8; break; // b->q
+            case 0x3: src_elem_bytes = 2; dst_elem_bytes = 4; break; // w->d
+            case 0x4: src_elem_bytes = 2; dst_elem_bytes = 8; break; // w->q
+            default:  src_elem_bytes = 4; dst_elem_bytes = 8; break; // d->q (0x5)
+        }
+        unsigned count = 16 / dst_elem_bytes;          // result lanes
+        unsigned src_bytes = count * src_elem_bytes;   // bytes consumed
+        // Source is the low src_bytes of an xmm register or a src_bytes-sized
+        // memory operand. Read only those bytes for the memory form so a
+        // qword/dword/word operand at a page boundary cannot over-read.
+        union xmm_reg src = {0};
+        if (modrm.is_reg) {
+            src = cpu->xmm[modrm.rm];
+        } else {
+            qword_t addr = amd64_effective_addr(cpu, &modrm, fs_prefix);
+            if (!amd64_mem_read(cpu, tlb, addr, &src, src_bytes)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_PF;
+            }
+        }
+        union xmm_reg result = {0};
+        for (unsigned i = 0; i < count; i++) {
+            int64_t elem;
+            if (src_elem_bytes == 1)
+                elem = zero_extend ? (int64_t) src.u8[i]
+                                   : (int64_t) (int8_t) src.u8[i];
+            else if (src_elem_bytes == 2)
+                elem = zero_extend ? (int64_t) src.u16[i]
+                                   : (int64_t) (int16_t) src.u16[i];
+            else
+                elem = zero_extend ? (int64_t) src.u32[i]
+                                   : (int64_t) (int32_t) src.u32[i];
+            if (dst_elem_bytes == 2)
+                result.u16[i] = (uint16_t) elem;
+            else if (dst_elem_bytes == 4)
+                result.u32[i] = (uint32_t) elem;
+            else
+                result.qw[i] = (uint64_t) elem;
+        }
+        cpu->xmm[modrm.reg] = result;
+        return INT_NONE;
+}
+
 static inline int amd64_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     qword_t saved_rip = cpu->amd64_rip;
     cpu->amd64_current_insn_rip = saved_rip;
@@ -8522,287 +8867,10 @@ restart_prefix:
             return INT_UNDEFINED;
         }
         if (op2 == 0x38) {
-            // Three-byte 0F 38 escape (SSSE3 / SSE4.1). Implemented: pshufb
-            // (66 0F 38 00), pblendvb (10), blendvps/blendvpd (14/15), ptest (17),
-            // pcmpeqq (29), pmulld (40), and pmovsx/pmovzx packed sign/zero-extend
-            // moves (20-25 sign, 30-35 zero) — emitted by auto-vectorizers and by
-            // optimized string/format code. They require the 66 operand-size
-            // prefix and no F2/F3 prefix.
-            byte_t op3;
-            if (!amd64_fetch_u8(cpu, tlb, &op3)) {
-                cpu->amd64_rip = saved_rip;
-                cpu->segfault_addr = saved_rip;
-                return INT_GPF;
-            }
-            // crc32 (F2 0F 38 F0/F1): accumulate CRC32C of the r/m source into the
-            // GP reg dest. A GP op (not xmm), so handle it before the xmm prefix
-            // guard. F0 = r/m8; F1 = r/m16 (66) / r/m32 / r/m64 (REX.W).
-            if ((op3 == 0xf0 || op3 == 0xf1) && rep_mode == AMD64_REPNZ) {
-                struct amd64_modrm cmodrm;
-                if (!amd64_decode_modrm(cpu, tlb, rex, &cmodrm)) {
-                    cpu->amd64_rip = saved_rip;
-                    cpu->segfault_addr = saved_rip;
-                    return INT_GPF;
-                }
-                unsigned src_size = (op3 == 0xf0) ? 8 : (rex.w ? 64 : (operand_size_prefix ? 16 : 32));
-                qword_t srcv;
-                if (!amd64_read_rm(cpu, tlb, &cmodrm, fs_prefix, src_size, &srcv)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                if (op3 == 0xf1 && rex.w) {
-                    uint64_t acc = (uint32_t) amd64_reg_get(cpu, cmodrm.reg, 32);
-                    vec_crc32_64(NULL, &srcv, &acc);
-                    amd64_reg_set(cpu, cmodrm.reg, 64, acc);
-                } else {
-                    uint32_t acc = (uint32_t) amd64_reg_get(cpu, cmodrm.reg, 32);
-                    if (op3 == 0xf0) { uint8_t b = (uint8_t) srcv; vec_crc32_8(NULL, &b, &acc); }
-                    else if (operand_size_prefix) { uint16_t w = (uint16_t) srcv; vec_crc32_16(NULL, &w, &acc); }
-                    else { uint32_t d = (uint32_t) srcv; vec_crc32_32(NULL, &d, &acc); }
-                    amd64_reg_set(cpu, cmodrm.reg, 32, acc); // zero-extends to 64
-                }
-                break;
-            }
-            bool is_pshufb = op3 == 0x00;
-            bool is_pblendvb = op3 == 0x10;
-            bool is_blendvps = op3 == 0x14;
-            bool is_blendvpd = op3 == 0x15;
-            bool is_ptest = op3 == 0x17;
-            bool is_pcmpeqq = op3 == 0x29;
-            bool is_pmulld = op3 == 0x40;
-            bool is_pmovx = (op3 >= 0x20 && op3 <= 0x25) ||
-                            (op3 >= 0x30 && op3 <= 0x35);
-            // Additional xmm<-xmm/m128 ops handled via the shared vec.c helpers
-            // (validated bit-exact vs real Intel by tests/remote/corpus):
-            // SSSE3 phaddw/d/sw, pmaddubsw, phsubw/d/sw, psignb/w/d, pmulhrsw
-            // (01-0b); pabsb/w/d (1c-1e); pmuldq (28), packusdw (2b),
-            // pcmpgtq (37), pmin/pmax sb/sd/uw/ud (38-3f).
-            // movntdqa (2a) is a plain aligned 128-bit load (copy); phminposuw
-            // (41) reduces src to its min unsigned word + index. Both read r/m
-            // into the local src and write the reg, so they share this path.
-            bool is_vec38 = (op3 >= 0x01 && op3 <= 0x0b) ||
-                            (op3 >= 0x1c && op3 <= 0x1e) || op3 == 0x28 ||
-                            op3 == 0x2a || op3 == 0x2b || op3 == 0x37 ||
-                            op3 == 0x41 || (op3 >= 0x38 && op3 <= 0x3f);
-            if ((!is_pshufb && !is_pblendvb && !is_blendvps && !is_blendvpd &&
-                    !is_ptest && !is_pcmpeqq && !is_pmulld && !is_pmovx && !is_vec38) ||
-                    !operand_size_prefix || rep_mode != AMD64_REP_NONE)
-                return INT_UNDEFINED;
-            struct amd64_modrm modrm;
-            if (!amd64_decode_modrm(cpu, tlb, rex, &modrm)) {
-                cpu->amd64_rip = saved_rip;
-                cpu->segfault_addr = saved_rip;
-                return INT_GPF;
-            }
-            if (modrm.reg >= AMD64_XMM_COUNT ||
-                    (modrm.is_reg && modrm.rm >= AMD64_XMM_COUNT))
-                return INT_UNDEFINED;
-            if (is_ptest) {
-                // PTEST xmm1, xmm2/m128 (66 0F 38 17). ZF = ((DEST & SRC) == 0),
-                // CF = ((SRC & ~DEST) == 0); OF/AF/PF/SF cleared. Commonly emitted
-                // for "is this vector all-zero / a subset" tests (e.g. memcmp).
-                union xmm_reg src;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                unsigned __int128 d = cpu->xmm[modrm.reg].u128;
-                unsigned __int128 s = src.u128;
-                cpu->cf = (s & ~d) == 0;
-                cpu->of = 0;
-                cpu->af = 0;
-                cpu->af_ops = 0;
-                cpu->zf = (d & s) == 0;
-                cpu->sf = 0;
-                cpu->pf = 0;
-                cpu->zf_res = cpu->sf_res = cpu->pf_res = 0;
-                collapse_flags(cpu);
-                break;
-            }
-            if (is_pshufb) {
-                // PSHUFB xmm1, xmm2/m128 (66 0F 38 00). dest=reg=xmm1 is BOTH the
-                // byte source and the destination; control=r/m. For each byte i:
-                // result[i] = (control[i] & 0x80) ? 0 : dest_orig[control[i] & 0xF].
-                // Snapshot dest first so the in-place store never corrupts a later
-                // index lookup.
-                union xmm_reg control;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &control)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                union xmm_reg dst = cpu->xmm[modrm.reg];
-                union xmm_reg result;
-                for (unsigned i = 0; i < 16; i++)
-                    result.u8[i] = (control.u8[i] & 0x80)
-                            ? 0 : dst.u8[control.u8[i] & 0x0F];
-                cpu->xmm[modrm.reg] = result;
-                break;
-            }
-            if (is_pblendvb) {
-                // PBLENDVB xmm1, xmm2/m128 (66 0F 38 10). Per-byte variable blend
-                // controlled by the high bit of each byte in the IMPLICIT XMM0
-                // mask: result[i] = mask[i]&0x80 ? src[i] : dst[i]. dst=reg,
-                // src=r/m, mask=xmm0. Snapshot all three before writing so an
-                // operand that aliases xmm0 (or the destination) stays correct.
-                union xmm_reg src;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                union xmm_reg dst = cpu->xmm[modrm.reg];
-                union xmm_reg mask = cpu->xmm[0];
-                union xmm_reg result;
-                for (unsigned i = 0; i < 16; i++)
-                    result.u8[i] = (mask.u8[i] & 0x80) ? src.u8[i] : dst.u8[i];
-                cpu->xmm[modrm.reg] = result;
-                break;
-            }
-            if (is_blendvps || is_blendvpd) {
-                // BLENDVPS (66 0F 38 14) / BLENDVPD (15) xmm1, xmm2/m128, <XMM0>.
-                // Same implicit-XMM0 variable blend as pblendvb, but per 32-bit
-                // (blendvps) or 64-bit (blendvpd) lane, selected by that lane's
-                // high (sign) bit in XMM0. dst=reg, src=r/m, mask=xmm0; snapshot
-                // all three before the store so an operand aliasing xmm0 (or the
-                // destination) stays correct.
-                union xmm_reg src;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                union xmm_reg dst = cpu->xmm[modrm.reg];
-                union xmm_reg mask = cpu->xmm[0];
-                union xmm_reg result;
-                if (is_blendvps) {
-                    for (unsigned i = 0; i < 4; i++)
-                        result.u32[i] = (mask.u32[i] & 0x80000000u)
-                                ? src.u32[i] : dst.u32[i];
-                } else {
-                    for (unsigned i = 0; i < 2; i++)
-                        result.qw[i] = (mask.qw[i] & 0x8000000000000000ull)
-                                ? src.qw[i] : dst.qw[i];
-                }
-                cpu->xmm[modrm.reg] = result;
-                break;
-            }
-            if (is_pmulld || is_pcmpeqq) {
-                // PMULLD (66 0F 38 40): 4x packed 32-bit multiply, low 32 bits of
-                // each product (the low half is identical for signed/unsigned).
-                // PCMPEQQ (66 0F 38 29): 2x packed 64-bit equality, all-ones where
-                // the lanes are equal else 0. dst=reg, src=r/m; read both operands
-                // before the store in case src aliases the destination.
-                union xmm_reg src;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                union xmm_reg dst = cpu->xmm[modrm.reg];
-                union xmm_reg result;
-                if (is_pmulld) {
-                    for (unsigned i = 0; i < 4; i++)
-                        result.u32[i] = dst.u32[i] * src.u32[i];
-                } else {
-                    for (unsigned i = 0; i < 2; i++)
-                        result.qw[i] = (dst.qw[i] == src.qw[i])
-                                ? 0xFFFFFFFFFFFFFFFFull : 0;
-                }
-                cpu->xmm[modrm.reg] = result;
-                break;
-            }
-            if (is_vec38) {
-                // Read the source into a local copy (no aliasing with the
-                // destination) and dispatch to the shared vec.c helper, which
-                // modifies cpu->xmm[modrm.reg] in place.
-                union xmm_reg src;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-                union xmm_reg *dst = &cpu->xmm[modrm.reg];
-                switch (op3) {
-                    case 0x01: vec_phaddw128(cpu, &src, dst); break;
-                    case 0x02: vec_phaddd128(cpu, &src, dst); break;
-                    case 0x03: vec_phaddsw128(cpu, &src, dst); break;
-                    case 0x04: vec_pmaddubsw128(cpu, &src, dst); break;
-                    case 0x05: vec_phsubw128(cpu, &src, dst); break;
-                    case 0x06: vec_phsubd128(cpu, &src, dst); break;
-                    case 0x07: vec_phsubsw128(cpu, &src, dst); break;
-                    case 0x08: vec_psignb128(cpu, &src, dst); break;
-                    case 0x09: vec_psignw128(cpu, &src, dst); break;
-                    case 0x0a: vec_psignd128(cpu, &src, dst); break;
-                    case 0x0b: vec_pmulhrsw128(cpu, &src, dst); break;
-                    case 0x1c: vec_pabsb128(cpu, &src, dst); break;
-                    case 0x1d: vec_pabsw128(cpu, &src, dst); break;
-                    case 0x1e: vec_pabsd128(cpu, &src, dst); break;
-                    case 0x28: vec_pmuldq128(cpu, &src, dst); break;
-                    case 0x2b: vec_packusdw128(cpu, &src, dst); break;
-                    case 0x37: vec_pcmpgtq128(cpu, &src, dst); break;
-                    case 0x38: vec_pminsb128(cpu, &src, dst); break;
-                    case 0x39: vec_pminsd128(cpu, &src, dst); break;
-                    case 0x3a: vec_pminuw128(cpu, &src, dst); break;
-                    case 0x3b: vec_pminud128(cpu, &src, dst); break;
-                    case 0x3c: vec_pmaxsb128(cpu, &src, dst); break;
-                    case 0x3d: vec_pmaxsd128(cpu, &src, dst); break;
-                    case 0x3e: vec_pmaxuw128(cpu, &src, dst); break;
-                    case 0x3f: vec_pmaxud128(cpu, &src, dst); break;
-                    case 0x2a: *dst = src; break; // movntdqa (aligned 128-bit load)
-                    case 0x41: vec_phminposuw128(cpu, &src, dst); break;
-                    default: return INT_UNDEFINED;
-                }
-                break;
-            }
-            bool zero_extend = (op3 & 0xf0) == 0x30;
-            unsigned src_elem_bytes, dst_elem_bytes;
-            switch (op3 & 0x0f) {
-                case 0x0: src_elem_bytes = 1; dst_elem_bytes = 2; break; // b->w
-                case 0x1: src_elem_bytes = 1; dst_elem_bytes = 4; break; // b->d
-                case 0x2: src_elem_bytes = 1; dst_elem_bytes = 8; break; // b->q
-                case 0x3: src_elem_bytes = 2; dst_elem_bytes = 4; break; // w->d
-                case 0x4: src_elem_bytes = 2; dst_elem_bytes = 8; break; // w->q
-                default:  src_elem_bytes = 4; dst_elem_bytes = 8; break; // d->q (0x5)
-            }
-            unsigned count = 16 / dst_elem_bytes;          // result lanes
-            unsigned src_bytes = count * src_elem_bytes;   // bytes consumed
-            // Source is the low src_bytes of an xmm register or a src_bytes-sized
-            // memory operand. Read only those bytes for the memory form so a
-            // qword/dword/word operand at a page boundary cannot over-read.
-            union xmm_reg src = {0};
-            if (modrm.is_reg) {
-                src = cpu->xmm[modrm.rm];
-            } else {
-                qword_t addr = amd64_effective_addr(cpu, &modrm, fs_prefix);
-                if (!amd64_mem_read(cpu, tlb, addr, &src, src_bytes)) {
-                    cpu->amd64_rip = saved_rip;
-                    amd64_sync_legacy_regs(cpu);
-                    return INT_PF;
-                }
-            }
-            union xmm_reg result = {0};
-            for (unsigned i = 0; i < count; i++) {
-                int64_t elem;
-                if (src_elem_bytes == 1)
-                    elem = zero_extend ? (int64_t) src.u8[i]
-                                       : (int64_t) (int8_t) src.u8[i];
-                else if (src_elem_bytes == 2)
-                    elem = zero_extend ? (int64_t) src.u16[i]
-                                       : (int64_t) (int16_t) src.u16[i];
-                else
-                    elem = zero_extend ? (int64_t) src.u32[i]
-                                       : (int64_t) (int32_t) src.u32[i];
-                if (dst_elem_bytes == 2)
-                    result.u16[i] = (uint16_t) elem;
-                else if (dst_elem_bytes == 4)
-                    result.u32[i] = (uint32_t) elem;
-                else
-                    result.qw[i] = (uint64_t) elem;
-            }
-            cpu->xmm[modrm.reg] = result;
+            int r38 = amd64_0f38_op(cpu, tlb, saved_rip, rex, fs_prefix,
+                    operand_size_prefix, rep_mode);
+            if (r38 != INT_NONE)
+                return r38;
             break;
         }
         if (op2 == 0x3a) {
@@ -9090,9 +9158,6 @@ restart_prefix:
             // 0F B8 is not POPCNT. Counts set bits in the source operand; ZF is
             // set iff the source is zero, and CF/OF/SF/AF/PF are cleared.
             struct amd64_modrm modrm;
-            qword_t src;
-            qword_t src_masked;
-            qword_t count;
             if (rep_mode != AMD64_REPZ)
                 return INT_UNDEFINED;
             if (!amd64_decode_modrm(cpu, tlb, rex, &modrm)) {
@@ -9100,22 +9165,8 @@ restart_prefix:
                 cpu->segfault_addr = saved_rip;
                 return INT_GPF;
             }
-            if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, op_size, &src))
+            if (amd64_popcnt_op(cpu, tlb, &modrm, fs_prefix, op_size) != INT_NONE)
                 goto amd64_gpf_restore;
-            src_masked = amd64_trunc(src, op_size);
-            count = (op_size == 64)
-                    ? (qword_t) __builtin_popcountll(src_masked)
-                    : (qword_t) __builtin_popcount((uint32_t) src_masked);
-            cpu->cf = 0;
-            cpu->of = 0;
-            cpu->af = 0;
-            cpu->af_ops = 0;
-            cpu->zf = src_masked == 0;
-            cpu->sf = 0;
-            cpu->pf = 0;
-            cpu->zf_res = cpu->sf_res = cpu->pf_res = 0;
-            collapse_flags(cpu);
-            amd64_reg_set(cpu, modrm.reg, op_size, count);
             break;
         }
         if (op2 == 0xbc || op2 == 0xbd) {
@@ -9841,20 +9892,12 @@ restart_prefix:
                 if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[1]))
                     goto amd64_gpf_restore;
             } else if (op2 == 0x7c || op2 == 0x7d || op2 == 0xd0) {
-                // SSE3 alternating/horizontal add-sub: F2 -> *ps, 66 -> *pd.
-                bool is_ps = (rep_mode == AMD64_REPNZ && !operand_size_prefix);
-                bool is_pd = (rep_mode == AMD64_REP_NONE && operand_size_prefix);
-                if (!is_ps && !is_pd)
+                int rh = amd64_sse3_haddsub(cpu, tlb, &modrm, fs_prefix,
+                        operand_size_prefix, rep_mode, (byte_t) op2);
+                if (rh == INT_UNDEFINED)
                     return INT_UNDEFINED;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src_xmm))
+                if (rh != INT_NONE)
                     goto amd64_gpf_restore;
-                union xmm_reg *d = &cpu->xmm[modrm.reg];
-                if (op2 == 0x7c)
-                    is_ps ? vec_haddps128(NULL, &src_xmm, d) : vec_haddpd128(NULL, &src_xmm, d);
-                else if (op2 == 0x7d)
-                    is_ps ? vec_hsubps128(NULL, &src_xmm, d) : vec_hsubpd128(NULL, &src_xmm, d);
-                else
-                    is_ps ? vec_addsubps128(NULL, &src_xmm, d) : vec_addsubpd128(NULL, &src_xmm, d);
             } else if (op2 == 0xf0) {
                 // lddqu (F2 0F F0): unaligned 128-bit load (behaves like movdqu).
                 if (rep_mode != AMD64_REPNZ || operand_size_prefix)
@@ -16243,6 +16286,245 @@ amd64_grp3_op_pf:
 // wherever rip lands. That is safe because for amd64 cpu->amd64_rip is
 // authoritative and cpu->eip is derived from it after every block
 // (jit/jit.c), so the exit gadget's own eip write cannot win.
+// POPCNT (F3 0F B8) as a bridge. Its semantics lived only inside the
+// interpreter's mega-switch, so no arm could route to it and every POPCNT
+// de-JITted its block; amd64_popcnt_op is that body, factored out so both
+// engines share one copy.
+// The three-byte 0F 38 escape as a bridge, for the opcodes in that map that
+// have no native arm (ptest, blendv, pmovsx/zx, crc32 and friends). pshufb and
+// the other natively-handled members never reach here -- this arm sits after
+// them -- so this is the tail of the map, not the whole of it.
+//
+// Like the VEX bridge and unlike x87, it takes the instruction's FIRST byte and
+// advances rip itself: the length of a three-byte-escape instruction is not
+// worth recomputing in gen.c when the decoder being called already does it.
+// LOOP / LOOPE / LOOPNE / JRCXZ with a 0x67 address-size prefix (67 E0-E3),
+// which selects the 32-bit counter ECX instead of RCX.
+//
+// The unprefixed forms have native gadgets; the prefixed ones had nothing. The
+// JRCXZ arm's own comment said the 0x67/ECX form was "left to the bridge", but
+// no such bridge existed, so it de-JITted its block -- the single last
+// interpreter fallback in a full regression-suite run.
+//
+// Written out here rather than factored from the interpreter because the
+// operation is five lines of fully-specified arithmetic, not a body worth
+// sharing: decrement the 32-bit counter (which zero-extends into RCX, as every
+// 32-bit write does), then branch on it and, for LOOPE/LOOPNE, on ZF.
+int amd64_jit_loop_addr32(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long target_ip, unsigned long next_ip) {
+    (void) tlb;
+    uint32_t count;
+    bool take;
+
+    if (opcode < 0xe0 || opcode > 0xe3)
+        return INT_UNDEFINED;
+
+    if (opcode == 0xe3) {
+        // JECXZ: tests the counter, never modifies it.
+        take = (uint32_t) amd64_reg_get(cpu, amd64_rcx, 32) == 0;
+    } else {
+        count = (uint32_t) amd64_reg_get(cpu, amd64_rcx, 32) - 1;
+        amd64_reg_set(cpu, amd64_rcx, 32, count);
+        take = count != 0;
+        if (opcode == 0xe1)                 // LOOPE  / LOOPZ
+            take = take && amd64_cond_eval(cpu, 4);
+        else if (opcode == 0xe0)            // LOOPNE / LOOPNZ
+            take = take && !amd64_cond_eval(cpu, 4);
+    }
+
+    cpu->amd64_rip = (qword_t) (take ? target_ip : next_ip);
+    amd64_sync_legacy_regs(cpu);
+    return INT_NONE;
+}
+
+// SSE3 horizontal add/sub (0F 7C / 7D / D0) as a bridge. Its semantics lived
+// only inside the interpreter's mega-switch, so no arm could route to them and
+// every haddpd/hsubps/addsubpd de-JITted its block.
+int amd64_jit_sse3_haddsub(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip) {
+    qword_t saved_rip = cpu->amd64_rip;
+    guest_addr_t checked_next_ip;
+    struct amd64_rex_prefix rex = {0};
+    struct amd64_modrm modrm;
+    bool fs_prefix = false;
+    bool operand_size_prefix = false;
+    enum amd64_rep_mode rep_mode = AMD64_REP_NONE;
+    byte_t byte;
+    int interrupt;
+
+    if (op2 != 0x7c && op2 != 0x7d && op2 != 0xd0)
+        return INT_UNDEFINED;
+    if (!amd64_guest_addr_ok((qword_t) next_ip, 1, &checked_next_ip))
+        return INT_GPF;
+
+    cpu->amd64_address_size_prefix = false;
+    for (;;) {
+        if (!amd64_fetch_u8(cpu, tlb, &byte))
+            goto amd64_jit_sse3_pf;
+        if (amd64_ignored_segment_prefix(byte))
+            continue;
+        if (byte == 0x64) { fs_prefix = true; continue; }
+        if (byte == 0x66) { operand_size_prefix = true; continue; }
+        if (byte == 0xf3) { rep_mode = AMD64_REPZ; continue; }
+        if (byte == 0xf2) { rep_mode = AMD64_REPNZ; continue; }
+        if (byte >= 0x40 && byte <= 0x4f) {
+            rex.present = true;
+            rex.w = (byte & 8) != 0;
+            rex.r = (byte & 4) != 0;
+            rex.x = (byte & 2) != 0;
+            rex.b = (byte & 1) != 0;
+            continue;
+        }
+        break;
+    }
+    if (byte != 0x0f)
+        return INT_UNDEFINED;
+    if (!amd64_fetch_u8(cpu, tlb, &byte))
+        goto amd64_jit_sse3_pf;
+    if (byte != (byte_t) op2)
+        return INT_UNDEFINED;
+    if (!amd64_decode_modrm(cpu, tlb, rex, &modrm))
+        goto amd64_jit_sse3_pf;
+
+    interrupt = amd64_sse3_haddsub(cpu, tlb, &modrm, fs_prefix,
+            operand_size_prefix, rep_mode, (byte_t) op2);
+    if (interrupt == INT_UNDEFINED)
+        return INT_UNDEFINED;
+    if (interrupt != INT_NONE)
+        goto amd64_jit_sse3_pf;
+    cpu->amd64_rip = (qword_t) next_ip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_NONE;
+
+amd64_jit_sse3_pf:
+    cpu->amd64_rip = saved_rip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_PF;
+}
+
+int amd64_jit_0f38(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long start_ip) {
+    qword_t saved_rip = (qword_t) start_ip;
+    struct amd64_rex_prefix rex = {0};
+    bool fs_prefix = false;
+    bool operand_size_prefix = false;
+    enum amd64_rep_mode rep_mode = AMD64_REP_NONE;
+    byte_t byte;
+    int interrupt;
+
+    cpu->amd64_rip = saved_rip;
+    cpu->amd64_address_size_prefix = false;
+    for (;;) {
+        if (!amd64_fetch_u8(cpu, tlb, &byte))
+            goto amd64_jit_0f38_pf;
+        if (amd64_ignored_segment_prefix(byte))
+            continue;
+        if (byte == 0x64) { fs_prefix = true; continue; }
+        if (byte == 0x66) { operand_size_prefix = true; continue; }
+        if (byte == 0xf3) { rep_mode = AMD64_REPZ; continue; }
+        if (byte == 0xf2) { rep_mode = AMD64_REPNZ; continue; }
+        if (byte >= 0x40 && byte <= 0x4f) {
+            rex.present = true;
+            rex.w = (byte & 8) != 0;
+            rex.r = (byte & 4) != 0;
+            rex.x = (byte & 2) != 0;
+            rex.b = (byte & 1) != 0;
+            continue;
+        }
+        break;
+    }
+    if (byte != 0x0f)
+        return INT_UNDEFINED;
+    if (!amd64_fetch_u8(cpu, tlb, &byte))
+        goto amd64_jit_0f38_pf;
+    if (byte != 0x38)
+        return INT_UNDEFINED;
+
+    interrupt = amd64_0f38_op(cpu, tlb, saved_rip, rex, fs_prefix,
+            operand_size_prefix, rep_mode);
+    // crc32 writes a general-purpose register, and ptest writes flags.
+    amd64_sync_legacy_regs(cpu);
+    return interrupt;
+
+amd64_jit_0f38_pf:
+    cpu->amd64_rip = saved_rip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_PF;
+}
+
+int amd64_jit_popcnt(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip) {
+    qword_t saved_rip = cpu->amd64_rip;
+    guest_addr_t checked_next_ip;
+    struct amd64_rex_prefix rex = {0};
+    struct amd64_modrm modrm;
+    bool fs_prefix = false;
+    bool operand_size_prefix = false;
+    bool repz = false;
+    byte_t byte;
+    unsigned op_size;
+    int interrupt;
+
+    if (!amd64_guest_addr_ok((qword_t) next_ip, 1, &checked_next_ip))
+        return INT_GPF;
+
+    cpu->amd64_address_size_prefix = false;
+    for (;;) {
+        if (!amd64_fetch_u8(cpu, tlb, &byte))
+            goto amd64_jit_popcnt_pf;
+        if (amd64_ignored_segment_prefix(byte))
+            continue;
+        if (byte == 0x64) { fs_prefix = true; continue; }
+        if (byte == 0x66) { operand_size_prefix = true; continue; }
+        if (byte == 0xf3) { repz = true; continue; }
+        if (byte >= 0x40 && byte <= 0x4f) {
+            rex.present = true;
+            rex.w = (byte & 8) != 0;
+            rex.r = (byte & 4) != 0;
+            rex.x = (byte & 2) != 0;
+            rex.b = (byte & 1) != 0;
+            continue;
+        }
+        break;
+    }
+    if (byte != 0x0f)
+        return INT_UNDEFINED;
+    if (!amd64_fetch_u8(cpu, tlb, &byte))
+        goto amd64_jit_popcnt_pf;
+    if (byte != 0xb8)
+        return INT_UNDEFINED;
+    // The F3 prefix is what makes this POPCNT at all.
+    if (!repz)
+        return INT_UNDEFINED;
+    if (!amd64_decode_modrm(cpu, tlb, rex, &modrm))
+        goto amd64_jit_popcnt_pf;
+
+    op_size = rex.w ? 64 : (operand_size_prefix ? 16 : 32);
+    interrupt = amd64_popcnt_op(cpu, tlb, &modrm, fs_prefix, op_size);
+    if (interrupt != INT_NONE)
+        goto amd64_jit_popcnt_pf;
+    cpu->amd64_rip = (qword_t) next_ip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_NONE;
+
+amd64_jit_popcnt_pf:
+    cpu->amd64_rip = saved_rip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_PF;
+}
+
+// UD2 (0F 0B). Its entire architectural job is to raise #UD, and it is emitted
+// deliberately -- glibc, the kernel's BUG(), and __builtin_trap() all use it.
+// It had no arm, so a compiler-inserted trap threw away the whole block it
+// terminated. Raising the interrupt from a bridge keeps that block compiled.
+int amd64_jit_ud2(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long start_ip) {
+    (void) tlb;
+    cpu->amd64_rip = (qword_t) start_ip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_UNDEFINED;
+}
+
 int amd64_jit_vex(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long lead, unsigned long start_ip) {
     qword_t saved_rip = (qword_t) start_ip;

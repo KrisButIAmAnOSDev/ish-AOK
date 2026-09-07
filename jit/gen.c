@@ -158,6 +158,16 @@ static bool amd64_opcode_needs_modrm(const struct amd64_jit_insn *insn) {
         case 0xb1:
         case 0xb3:
         case 0xba:
+        // 0xb8 is POPCNT (F3 0F B8) and takes a ModRM byte. Missing, so
+        // has_modrm was false and no arm could claim it -- the same omission as
+        // 0F AE, 0F C7 and the x87 escapes. (0F 0B, UD2, is correctly absent:
+        // it has no ModRM byte.)
+        // SSE3 horizontal add/sub (0F 7C/7D) and alternating add-sub (0F D0) all
+        // take a ModRM byte and were all missing, so no arm could claim them.
+        case 0x7c:
+        case 0x7d:
+        case 0xd0:
+        case 0xb8:
         case 0xb6:
         case 0xb7:
         case 0xbe:
@@ -6211,6 +6221,44 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         (insn.fs_prefix ? 0x20 : 0) |
         (insn.rep_mode != amd64_jit_rep_none ? 0x40 : 0);
 
+    // POPCNT (F3 0F B8). Bridged; the semantics were factored out of the
+    // interpreter's mega-switch into amd64_popcnt_op so both engines share one
+    // copy. Continues the block: the ModRM extent is the exact length.
+    if (insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_repz && insn.has_modrm &&
+            insn.op2 == 0xb8) {
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("popcnt-helper ip=%llx next=%llx",
+                (unsigned long long) insn.start_ip, (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_1_retint(state, amd64_jit_popcnt,
+                (unsigned long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
+    // UD2 (0F 0B): raise #UD from a bridge instead of discarding the block.
+    // Compilers emit it deliberately -- __builtin_trap, glibc's assert paths --
+    // so it terminates real basic blocks, and de-JITting on it threw away
+    // everything compiled before the trap.
+    if (insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.op2 == 0x0b) {
+        state->amd64_ip = state->amd64_orig_ip;
+        amd64_jit_debug("ud2 ip=%llx", (unsigned long long) state->amd64_orig_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_1_retint(state, amd64_jit_ud2,
+                (unsigned long) state->amd64_orig_ip);
+        gen_exit(state);
+        return false;
+    }
+
     // VEX / EVEX (C4, C5, 62): the whole of AVX, AVX2 and AVX-512.
     //
     // There was no arm here at all, so every AVX instruction de-JITted its
@@ -6465,6 +6513,38 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 (unsigned long long) insn.start_ip,
                 (unsigned long long) target_ip, (unsigned long long) next_ip);
         gen_amd64_jrcxz(state, target_ip, next_ip);
+        return false;
+    }
+
+    // The 0x67 forms of LOOP/LOOPE/LOOPNE/JRCXZ (67 E0-E3), which count in ECX
+    // rather than RCX. The JRCXZ arm above says the ECX form is "left to the
+    // bridge" -- there was no bridge, so it de-JITted its block, and it was the
+    // single last interpreter fallback in a full regression-suite run.
+    //
+    // The address-size prefix is safe to honour here precisely because these
+    // instructions dereference nothing: it selects a counter width, and the
+    // blanket 0x67 refusal in gen_amd64_decode_mem_meta exists for consumers
+    // that compute an address.
+    if (insn.address_size_prefix && !insn.two_byte_opcode && !insn.lock_prefix &&
+            !insn.fs_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.opcode >= 0xe0 && insn.opcode <= 0xe3) {
+        if (!tlb_read(tlb, state->amd64_ip, &rel8, sizeof(rel8))) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        next_ip = state->amd64_ip + sizeof(rel8);
+        target_ip = next_ip + rel8;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("loop-addr32 ip=%llx op=%02x target=%llx next=%llx",
+                (unsigned long long) insn.start_ip, insn.opcode,
+                (unsigned long long) target_ip, (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_3_retint(state, amd64_jit_loop_addr32,
+                (unsigned long) insn.opcode, (unsigned long) target_ip,
+                (unsigned long) next_ip);
+        gen_exit(state);
         return false;
     }
 
@@ -12046,6 +12126,51 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         gen_amd64_helper_tlb_2_retint(state, amd64_jit_modrm_imm,
                 (unsigned long) insn.opcode, (unsigned long) next_ip);
         return true;
+    }
+
+    // SSE3 horizontal add/sub (0F 7C / 7D / D0). Bridged to amd64_sse3_haddsub,
+    // factored out of the interpreter's mega-switch so both engines share one
+    // copy. Continues the block: the ModRM extent is the exact length.
+    if (insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.has_modrm &&
+            (insn.op2 == 0x7c || insn.op2 == 0x7d || insn.op2 == 0xd0)) {
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("sse3-haddsub-helper ip=%llx op2=%02x next=%llx",
+                (unsigned long long) insn.start_ip, insn.op2,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_2_retint(state, amd64_jit_sse3_haddsub,
+                (unsigned long) insn.op2, (unsigned long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
+    // Three-byte 0F 38 escape, LAST of the arms so every natively-handled member
+    // of that map (pshufb and friends, above) keeps its gadget and only the tail
+    // -- ptest, blendv, pmovsx/zx, crc32 -- reaches the bridge. Those were
+    // de-JITting their blocks because the map's semantics lived inside
+    // amd64_step_to_interrupt with no way to call them; they are now
+    // amd64_0f38_op, shared by both engines.
+    //
+    // Block-terminating, like the VEX bridge and for the same reason: the
+    // instruction's length is not worth recomputing here when the decoder being
+    // called already walks it.
+    if (insn.two_byte_opcode && insn.op2 == 0x38 && !insn.address_size_prefix &&
+            !insn.lock_prefix) {
+        state->amd64_ip = state->amd64_orig_ip;
+        amd64_jit_debug("0f38-helper ip=%llx", (unsigned long long) state->amd64_orig_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_1_retint(state, amd64_jit_0f38,
+                (unsigned long) state->amd64_orig_ip);
+        gen_exit(state);
+        return false;
     }
 
 amd64_bridge_step:
