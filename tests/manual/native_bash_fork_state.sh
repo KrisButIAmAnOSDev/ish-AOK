@@ -218,6 +218,30 @@ ck_oracle T-return-subshell     'set -T; trap "echo R" RETURN; f(){ :; }; ( f );
 ck_oracle E-err-subshell-ok     'set -E; trap "echo E" ERR; ( : ); trap - ERR; echo .'
 ck_oracle E-err-subshell-fails  'set -E; trap "echo E" ERR; ( false ); trap - ERR; echo .'
 ck_oracle E-err-comsub-fails    'set -E; trap "echo E" ERR; n=$( false ); trap - ERR; echo .'
+# $? NONZERO at the boundary, under -T. This is the group the status restore
+# used to add a fire to: the state armed the traps and then ran `(exit N) && :'
+# to put $? back, so the restore tripped the trap it had just armed. Measured
+# before the fix: the first of these was `T T T T .' against a fork's `T T T .'.
+# It cannot be fixed in shell -- the status has to be set by a command, and the
+# traps have to be armed before it or they do not survive -- so the status now
+# crosses in the environment and is applied by an assignment in C. See
+# AOK_STATUS_VAR in deps/bash/aok_fork.c.
+ck_oracle T-debug-after-failure 'set -T; trap "echo T" DEBUG; false; ( : ); trap - DEBUG; echo .'
+ck_oracle T-debug-status-7      'set -T; trap "echo T" DEBUG; (exit 7) && :; ( echo rc=$? ); trap - DEBUG; echo .'
+# The command substitution has to CAPTURE the output to see it at all: the extra
+# fire happened inside the child, so it went into $n rather than to the
+# terminal, and `trap - DEBUG; echo .' on its own agreed with a fork while the
+# variable held `T T' against a fork's `T'.
+ck_oracle T-debug-comsub-fail   'set -T; trap "echo T" DEBUG; false; n=$( : ); trap - DEBUG; echo "[$n]"'
+# TWO special traps crossing at once is its own case, and it found its own bug.
+# `trap' is a command, so the second trap line in the state fires the first one
+# if the first one was DEBUG -- and the traps were emitted by signal number,
+# which puts DEBUG first. Measured before the fix: `T T T E T T T .' against a
+# fork's `T T T E T T .'. They are emitted DEBUG-last now; see aok_emit_traps.
+ck_oracle TE-both-after-failure 'set -TE; trap "echo T" DEBUG; trap "echo E" ERR; false; ( : ); trap - DEBUG; trap - ERR; echo .'
+ck_oracle TE-both-clean         'set -TE; trap "echo T" DEBUG; trap "echo E" ERR; ( : ); trap - DEBUG; trap - ERR; echo .'
+ck_oracle T-debug-and-return    'set -T; trap "echo T" DEBUG; trap "echo R" RETURN; f(){ :; }; ( f ); trap - DEBUG; trap - RETURN; echo .'
+ck_oracle TE-all-three          'set -TE; trap "echo T" DEBUG; trap "echo E" ERR; trap "echo R" RETURN; f(){ false; }; ( f ); trap - DEBUG; trap - ERR; trap - RETURN; echo .'
 
 # KNOWN DIVERGENCE, deliberately not asserted: under `set -T', a re-launch from
 # execute_simple_command -- a pipeline element, an async simple command -- fires
@@ -257,6 +281,14 @@ ck_oracle status-crosses        'false; ( echo rc=$? )'
 ck_oracle status-crosses-7      '(exit 7) && :; ( echo rc=$? )'
 ck_oracle status-crosses-comsub 'false; n=$( echo rc=$? ); echo "$n"'
 ck_oracle status-under-errexit  'set -e; (exit 7) && :; ( echo rc=$? ); echo done'
+# A ZERO status crosses too, and it is no longer the case that nothing has to
+# happen for it to. The restore used to be emitted only when $? was nonzero,
+# which left a zero one riding on "the last line of the state happened to
+# succeed"; the assignment in C is unconditional, so a state line the child
+# disliked can no longer become the command`s $?.
+ck_oracle status-crosses-zero   'true; ( echo rc=$? )'
+ck_oracle status-crosses-nested 'false; ( ( echo rc=$? ) )'
+ck_oracle status-crosses-pipe   'false; ( echo rc=$? ) | cat'
 else
     ck_skip traps-and-errexit "no /bin/bash in this root to compare against"
 fi
@@ -281,8 +313,75 @@ ck cmdline-bounded   ok    'p=xxxxxxxxxxxxxxxxxxxx; p=$p$p$p$p$p; p=$p$p$p$p$p; 
 # The carrier must be invisible to the code it carries, in both namespaces.
 ck state-var-hidden  0     '( echo ${#AOK_BASH_STATE} )'
 ck state-env-hidden  0     '( env | grep -c AOK_BASH_STATE )'
+# ...and so must the one that carries $?, which is also the gate that says the
+# state was handed to this shell by its own parent. A child that could see it
+# could also hand a stale one down.
+ck status-var-hidden 0     '( echo ${#AOK_BASH_STATUS} )'
+ck status-env-hidden 0     '( env | grep -c AOK_BASH_STATUS )'
+# argv[2] is the COMMAND now, not the fixed bootstrap: our own bash is handed
+# the state in the environment and executes it in C, so the -c string is an
+# ordinary one. That is a deliberate widening of what `ps` shows -- the printed
+# command text, before expansion, which is what a shell running a command shows
+# anyway -- and it is asserted so that a change back is a visible decision.
+ck cmdline-is-command ok   '( sleep 3; : ) & c=$!; sleep 1; r=no; tr "\0" " " < /proc/$c/cmdline | grep -q "sleep 3" && r=ok; kill $c 2>/dev/null; echo $r'
 # ...while a real exported variable still reaches a child process untouched.
 ck env-still-exported 1    'export SEKRIT=SEKRITVALUE; ( env | grep -c "^SEKRIT=SEKRITVALUE$" )'
+
+echo "== the state must be parsed one command at a time =="
+# `shopt -s extglob' is emitted BEFORE the function definitions that need it,
+# and that only works because the state is parsed and executed command by
+# command: a brace group, or any single parse of the whole string, would read
+# every function body before the shopt had run. A function whose body contains
+# `?(...)' -- bash-completion is built out of them, and so is the AOK profile --
+# can only be re-read by a shell that has extglob on, and the shell that DEFINED
+# it very often turns extglob off again afterwards.
+#
+# The symptom of losing this is every child dying on `syntax error near
+# unexpected token (' partway through the state, which leaves command
+# substitutions empty and a login shell unusable. It is the single most
+# load-bearing property of the state script and it had no assertion until the
+# machinery that provides it changed hands -- from `eval' to the
+# parse_and_execute the C path calls directly.
+#
+# These are written one command PER LINE on purpose. `shopt -s extglob; f(){
+# ... ?(a)b ... }' on a single line does not work in ANY bash -- a `;'-separated
+# list is one parse, so the shopt has not run when the body is read -- and the
+# first draft of these cases failed against the shell they were meant to test.
+# That is the property under test, seen from the other side.
+#
+# Asserted as agreement with the guest's own bash rather than against a written
+# answer, for the reason the trap cases are: `shopt -u extglob' makes `?(a)b' a
+# LITERAL pattern at match time too, so the second pair below is `no' in a real
+# bash and the first draft's expected `yes' was simply wrong. What a broken
+# state produces is neither -- it is `syntax error near unexpected token (' and
+# no output at all, which no oracle run ever matches.
+if [ -x /bin/bash ]; then
+# extglob ON in the parent: the child has to parse the body AND match with it.
+ck_oracle extglob-on-subshell 'shopt -s extglob
+f(){ case $1 in ?(a)b) echo yes;; *) echo no;; esac; }
+( f ab )'
+ck_oracle extglob-on-comsub   'shopt -s extglob
+f(){ case $1 in ?(a)b) echo yes;; *) echo no;; esac; }
+echo $(f ab)'
+# extglob OFF in the parent, which is the shape that broke a login shell:
+# bash-completion defines hundreds of such functions and then turns extglob off,
+# so the state has to turn it back on to READ them and put it back afterwards.
+ck_oracle extglob-off-subshell 'shopt -s extglob
+f(){ case $1 in ?(a)b) echo yes;; *) echo no;; esac; }
+shopt -u extglob
+( f ab )'
+ck_oracle extglob-off-comsub   'shopt -s extglob
+f(){ case $1 in ?(a)b) echo yes;; *) echo no;; esac; }
+shopt -u extglob
+echo $(f ab)'
+else
+    ck_skip extglob-parse "no /bin/bash in this root to compare against"
+fi
+# ...and the child ends up with the PARENT's extglob setting, not the one the
+# state turned on to read the functions with. No oracle needed: this is about
+# what the state restores, not about what bash does with it.
+ck extglob-off-in-child  ok  'shopt -u extglob; ( shopt -q extglob && echo leaked || echo ok )'
+ck extglob-on-in-child   ok  'shopt -s extglob; ( shopt -q extglob && echo ok || echo lost )'
 
 echo "== state crossing =="
 ck var               outer  'v=outer; ( v=inner ); echo $v'

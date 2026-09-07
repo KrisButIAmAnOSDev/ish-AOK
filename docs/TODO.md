@@ -19,48 +19,27 @@ Started 2026-08-19, after the 549 release run. Closed entries from the 549 and
 
 ## Diagnosed, not fixed
 
-### Two things a re-launched bash subshell still gets wrong about `$?` and DEBUG
+### Under `set -T`, some bash re-launches announce a command twice
 
-Left open by the 2026-09-07 trap-ordering fix (`deps/bash/aok_fork.c`), which
-closed the large case: the special traps are now emitted last and only under the
-option that arms them in a real child, so a default shell agrees with a forked
-one exactly. `tests/manual/native_bash_fork_state.sh` asserts that against the
-guest's own bash. What is left is smaller and both halves come from the same
-place -- the `(exit N) && :` the state script uses to restore `$?`.
+The last trap divergence between a re-launched subshell and a forked one, and
+the only one left after the 2026-09-07 work on `deps/bash/aok_fork.c` (the
+special traps emitted last, emitted DEBUG-last among themselves, and `$?` moved
+out of the state script into `AOK_BASH_STATUS`).
 
-**A nonzero `$?` at a subshell boundary costs a second re-launch.** `(exit N)`
-is a subshell, so restoring the status spawns a whole extra native bash.
-Measured on `build/devuan-arm64-test`, 20 iterations, warm and idle (two runs
-each, and take the RATIO rather than the absolutes -- a cold root clone doubles
-both):
+A re-launch from `execute_simple_command` -- a pipeline element, an async simple
+command -- fires the DEBUG trap in the parent (that site runs the trap and *then*
+calls `make_child`) and again in the child, which re-parses the text it was
+handed. `set -T; trap 'echo T' DEBUG; : | cat` fires 5 times against a fork's 3.
+`( )` and `$( )` are exact, because the parent does not announce those, and
+`tests/manual/native_bash_fork_state.sh` asserts that agreement.
 
-| `$?` before `( : )` | wall | per subshell |
-|---|---|---|
-| 0 (`true; ( : )`) | 39-42ms | ~2.0ms |
-| 1 (`false; ( : )`) | 72ms | ~3.6ms |
-
-So a failing command before a subshell nearly doubles what the subshell costs.
-
-Nothing in shell sets `$?` to an arbitrary value without a subshell, and it
-cannot move earlier in the script because every later line would overwrite it.
-The fix is to pass the status to our own bash the way `$$` already travels
-(`AOK_DOLLAR_VAR`, and `aok_relaunch_env` builds the envp) and apply it in C
-between the state and the command -- which means the command can no longer be
-appended to the state string, so it is a change to the bootstrap, not a one-
-liner. The `/bin/bash` fallback still needs the shell form.
-
-**Under `set -T`, some re-launches announce a command twice.** A re-launch from
-`execute_simple_command` -- a pipeline element, an async simple command -- fires
-the DEBUG trap in the parent (that site runs the trap and *then* calls
-`make_child`) and again in the child, which re-parses the text it was handed.
-`set -T; trap 'echo T' DEBUG; : | cat` fires 5 times against a fork's 3. `( )`
-and `$( )` are exact, because the parent does not announce those. The `(exit N)`
-restore adds one more when `$?` was nonzero. Only reachable under `-T`, which is
-what a DEBUG-trap debugger sets, so it is worth closing -- but the obvious
-mechanism (the child skipping a counted number of fires on a signal from the
-parent) can *swallow* a real fire if the count is ever wrong, which is worse for
-a debugger than an extra one. Fixing the `$?` path above removes one of the two
-sources for free.
+Only reachable under `-T`, which is what a DEBUG-trap debugger sets. The obvious
+mechanism -- the child skipping a counted number of fires on a signal from the
+parent -- can *swallow* a real fire if the count is ever wrong, which is worse
+for a debugger than an extra one, so it has not been built. Anything that closes
+it has to work the other way round: the child would have to be told that the
+command it is about to parse has already been announced, which is a property of
+that one re-launch site rather than a count.
 
 ### atop's accounting daemon wedges boot, and nothing after it starts
 
