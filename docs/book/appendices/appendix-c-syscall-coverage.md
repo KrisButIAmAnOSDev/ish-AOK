@@ -15,7 +15,7 @@ so a NULL check passes — editing it changes nothing.
 |---|--:|--:|--:|--:|
 | i386 | 354 | 317 | 0 | 37 |
 | amd64 | 327 | 292 | 1 | 34 |
-| arm64 / riscv64 | 312 | 225 | 2 | 85 |
+| arm64 / riscv64 | 312 | 227 | 2 | 83 |
 
 riscv64 shares arm64's table: both are asm-generic ABIs with identical
 numbering (Chapter 7).
@@ -778,9 +778,9 @@ numbering (Chapter 7).
 | 72 | `sys_pselect_amd64` | implemented |  |
 | 73 | `sys_ppoll_amd64` | implemented |  |
 | 74 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
-| 75 | `syscall_stub` | stub | returns ENOSYS, logged |
+| 75 | `sys_vmsplice` | implemented |  |
 | 76 | `sys_splice` | implemented |  |
-| 77 | `syscall_stub` | stub | returns ENOSYS, logged |
+| 77 | `sys_tee` | implemented |  |
 | 78 | `sys_readlinkat` | implemented |  |
 | 79 | `sys_newfstatat_amd64` | implemented |  |
 | 80 | `sys_fstat_amd64` | implemented |  |

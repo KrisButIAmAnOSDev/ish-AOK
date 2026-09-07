@@ -150,11 +150,14 @@ a convenience, and the configuration surface between them is where features go
 missing (Chapter 34). Nothing else is as expensive to learn late.
 
 **Where the truth lives.** `docs/TODO.md` is a lab notebook, not a task list —
-it holds diagnosed-but-unfixed entries with measurements, closed entries with
-their full investigation, and rejected designs with reasons. The release notes
-are a design record (Chapter 37). And the comments are unusually load-bearing,
-with the caveat of Chapter 40: they make checkable claims, and some of them are
-false.
+it holds diagnosed-but-unfixed entries with measurements and rejected designs
+with reasons, and says nothing about whether anyone intends to do them.
+`docs/roadmap.md`, added during the 554 run, is the other half: it is the one
+document that says what happens next and in what order, and it names what is
+*not* being done as carefully as what is. `docs/build_<N>_musts.md` is the
+single-release commitment between them. The release notes are a design record
+(Chapter 37). And the comments are unusually load-bearing, with the caveat of
+Chapter 40: they make checkable claims, and some of them are false.
 
 **The oracles, before writing any code.** Chapter 9's discipline is what
 separates a fix from a plausible change, and the most common expensive mistake
@@ -200,4 +203,4 @@ the only one that transfers to any system at all: **check the thing itself.**
 [docs/wasm_browser_architecture.md](../../docs/wasm_browser_architecture.md),
 [opt/AOK/tools/start-wayland.sh](../../opt/AOK/tools/start-wayland.sh),
 [opt/AOK/tools/setup-wayland.sh](../../opt/AOK/tools/setup-wayland.sh),
-[docs/TODO.md](../../docs/TODO.md).
+[docs/TODO.md](../../docs/TODO.md), [docs/roadmap.md](../../docs/roadmap.md).

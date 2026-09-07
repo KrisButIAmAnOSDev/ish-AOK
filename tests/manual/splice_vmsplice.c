@@ -45,6 +45,51 @@ static void ck(const char *label, long got, long want) {
 
 static long rc_of(long r) { return r < 0 ? -errno : r; }
 
+// /dev/kmsg is where a guest can read the emulator's own log. Open it and
+// throw away everything already buffered, so a later read sees only what the
+// calls below produced. Returns -1 if the log is not readable, which is not a
+// failure -- on real Linux this needs CAP_SYSLOG, and the checks that use it
+// are skipped rather than guessed at.
+static int kmsg_open_drained(void) {
+    int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+    char junk[8192];
+    while (read(fd, junk, sizeof junk) > 0)
+        continue;
+    return fd;
+}
+
+// Collect every record logged since the drain into one buffer. This reads the
+// stream to EAGAIN, which is why it must happen ONCE and be searched many
+// times rather than the other way round: a per-needle reader consumes the
+// records the first needle did not match, so every check after the first one
+// silently examines an empty stream and passes. (Measured -- with a per-needle
+// reader, three of the four checks below could not fail even against a build
+// that was logging the line they look for.) /dev/kmsg hands back one whole
+// record per read.
+static void kmsg_slurp(int fd, char *out, size_t outsize) {
+    size_t used = 0;
+    char rec[8192];
+    ssize_t n;
+    out[0] = '\0';
+    while ((n = read(fd, rec, sizeof rec - 1)) > 0) {
+        if (used + (size_t) n + 1 >= outsize)
+            break;
+        memcpy(out + used, rec, (size_t) n);
+        used += (size_t) n;
+        out[used] = '\0';
+    }
+}
+
+static int log_has(const char *log, const char *kind, long nr) {
+    char needle[64];
+    // The trailing space matters: without it "syscall 75" also matches a
+    // syscall 750.
+    snprintf(needle, sizeof needle, "%s syscall %ld ", kind, nr);
+    return strstr(log, needle) != NULL;
+}
+
 static long do_splice(int in, long long *in_off, int out, long long *out_off,
                       size_t len, unsigned flags) {
     errno = 0;
@@ -210,6 +255,70 @@ int main(int argc, char **argv) {
         close(pa[1]);
         close(pb[0]);
         close(pb[1]);
+    }
+
+    // ---- a working call must not announce itself as unimplemented ---------
+    //
+    // The arm64/riscv64 table named vmsplice and tee twice: once with their
+    // real implementations near the top, and again as syscall_stub in a later
+    // parity sweep -- and a later designated initializer wins. Neither call
+    // actually broke, because handle_asm_generic_native_syscall answers 75/76/77
+    // before the table is ever called, so nothing above this line could see it:
+    // every transfer check still passed.
+    //
+    // But the table IS read for one thing first -- "is this entry a stub?" --
+    // and that writes the kernel log. So each successful vmsplice printed
+    // "arm64 stub syscall 75" at ERROR level, and on arm64/riscv64 the log
+    // budget does not apply (it only covers abi < 2), so it printed on every
+    // call, forever. A guest reading its own log was told a syscall that had
+    // just moved its bytes did not exist.
+    //
+    // The needle carries THIS arch's syscall number, which is what the log
+    // prints, so the check follows the test to i386, amd64, arm64 and riscv64
+    // without knowing their numbering. The trailing space matters: without it
+    // "syscall 75 " would also match a syscall 750.
+    {
+        int klog = kmsg_open_drained();
+        if (klog < 0) {
+            test_logf("  %-56s (skipped: /dev/kmsg not readable)\n",
+                      "the kernel log does not call these stubs");
+        } else {
+            int pf[2];
+            ck("pipe", pipe(pf), 0);
+            struct iovec iov = { (void *) "logcheck", 8 };
+            errno = 0;
+            ck("vmsplice moves bytes", rc_of(syscall(SYS_vmsplice, pf[1], &iov, (unsigned long) 1, 0)), 8);
+            char buf[16] = { 0 };
+            ck("  which read back", (long) read(pf[0], buf, 8), 8);
+            ck("  and are the right ones", strncmp(buf, "logcheck", 8) == 0, 1);
+
+            int pb[2];
+            ck("pipe", pipe(pb), 0);
+            errno = 0;
+            long t = rc_of(syscall(SYS_tee, pf[0], pb[1], (size_t) 4, 0));
+            ck("tee either works or is ENOSYS", t == 4 || t == -ENOSYS, 1);
+
+            static char klog_text[64 * 1024];
+            kmsg_slurp(klog, klog_text, sizeof klog_text);
+            ck("vmsplice is not logged as a stub",
+               log_has(klog_text, "stub", (long) SYS_vmsplice), 0);
+            ck("  nor as missing",
+               log_has(klog_text, "missing", (long) SYS_vmsplice), 0);
+            // tee's ENOSYS is sys_tee's own documented decision -- AOK pipes are
+            // host pipes, which cannot be read without consuming -- and the
+            // i386 and amd64 tables name sys_tee for exactly that reason. An
+            // implemented refusal is not an absent table entry.
+            ck("tee is not logged as a stub either",
+               log_has(klog_text, "stub", (long) SYS_tee), 0);
+            ck("  nor as missing",
+               log_has(klog_text, "missing", (long) SYS_tee), 0);
+
+            close(pf[0]);
+            close(pf[1]);
+            close(pb[0]);
+            close(pb[1]);
+            close(klog);
+        }
     }
 
     unlink(src_path);
