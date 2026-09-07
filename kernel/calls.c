@@ -1551,7 +1551,7 @@ static syscall_t amd64_syscall_table[470] = {
     [188 ... 199] = (syscall_t) sys_xattr_stub,
     [200] = (syscall_t) sys_tkill,
     [201] = (syscall_t) sys_time_amd64,
-    [202] = (syscall_t) sys_futex,
+    [202] = (syscall_t) sys_futex_amd64_guest,
     [203] = (syscall_t) sys_sched_setaffinity,
     [204] = (syscall_t) sys_sched_getaffinity,
     // The io_* family, which had NO amd64 entries at all -- so an amd64 guest
@@ -1833,7 +1833,7 @@ static syscall_t arm64_syscall_table[470] = {
     [95]  = (syscall_t) sys_waitid,
     [96]  = (syscall_t) sys_set_tid_address,
     [97]  = (syscall_t) sys_unshare,
-    [98]  = (syscall_t) sys_futex,
+    [98]  = (syscall_t) sys_futex_amd64_guest,
     [99]  = (syscall_t) sys_set_robust_list_amd64,
     [100] = (syscall_t) sys_get_robust_list_amd64,
     [101] = (syscall_t) sys_nanosleep_amd64,
@@ -2659,7 +2659,9 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 80: result = sys_fstat_arm64_guest((fd_t) raw_args[0], raw_args[1]); break;
     case 88: result = sys_utimensat_amd64_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]); break;
     case 96: result = (dword_t) sys_set_tid_address_guest(raw_args[0]); break;
-    case 98: result = sys_futex_guest(raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break;
+    // 64-bit guest: its struct timespec is 16 bytes, so the timeout must be
+    // read with the time64 layout. See sys_futex_amd64_guest (kernel/futex.c).
+    case 98: result = sys_futex_amd64_guest(raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break;
     case 99: result = (dword_t) sys_set_robust_list_amd64_guest(raw_args[0], (dword_t) raw_args[1]); break;
     case 100: result = (dword_t) sys_get_robust_list_amd64_guest((pid_t_) raw_args[0], raw_args[1], raw_args[2]); break;
     case 113: result = sys_clock_gettime_amd64_guest((dword_t) raw_args[0], raw_args[1]); break;
@@ -3310,7 +3312,8 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         return true;
     case 202:
     {
-        dword_t result = sys_futex_guest(
+        // 64-bit timespec; see sys_futex_amd64_guest (kernel/futex.c).
+        dword_t result = sys_futex_amd64_guest(
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3],
                 raw_args[4], (dword_t) raw_args[5]);
         if (syscall_result_should_restart(result)) {

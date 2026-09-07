@@ -1124,13 +1124,41 @@ dword_t sys_madvise_guest(guest_addr_t addr, qword_t len, dword_t advice) {
         saw_hole = true;       // part of the range is outside the address space
         end = mem->page_limit; // clamp the loop bound / guard overflow
     }
+    // The FORK pair records itself in per-page flags, so any lazy reservation
+    // in range has to become real entries before the loop can mark them --
+    // pt_set_flags does the same for mprotect. No other advice materialises,
+    // and that is the point: MADV_DONTDUMP over a 128 MB buffer pool must not
+    // fault in 128 MB to answer a hint.
+    if (advice == MADV_WIPEONFORK_ || advice == MADV_KEEPONFORK_)
+        mem_lazy_materialize_range(mem, start, end);
     for (page_t page = start; page < end; ) {
         struct pt_entry *pt = mem_pt(mem, page);
         if (pt == NULL) {
-            // A gap anywhere in the range makes the whole call ENOMEM on Linux,
-            // after the advice is still applied to the mapped portion.
-            saw_hole = true;
-            page++;
+            // A lazy anonymous reservation has no page-table entry yet, but it
+            // IS mapped as far as the guest is concerned -- the same reading
+            // mincore takes below. Only a genuine hole is ENOMEM. InnoDB
+            // MADV_DONTDUMPs its whole buffer pool immediately after mapping
+            // it, so every MariaDB start logged "Failed to set memory to
+            // MADV_DONTDUMP: Cannot allocate memory" for a range that was
+            // mapped the whole time.
+            struct mem_lazy_map *lazy = mem_lazy_find(mem, page);
+            if (lazy == NULL) {
+                // A gap anywhere in the range makes the whole call ENOMEM on
+                // Linux, after the advice is still applied to the mapped
+                // portion.
+                saw_hole = true;
+                page++;
+                continue;
+            }
+            // Nothing to do for the reservation itself: its pages have never
+            // been written, so they already read back as zero, which is all
+            // DONTNEED and FREE promise -- and REMOVE has no shared backing to
+            // punch, so it keeps the EINVAL a private mapping gets below.
+            if (advice == MADV_REMOVE_ && !(lazy->flags & P_SHARED)) {
+                err = _EINVAL;
+                break;
+            }
+            page = lazy->end < end ? lazy->end : end;
             continue;
         }
         // MADV_WIPEONFORK marks the range so a child of fork() gets fresh zero
@@ -1541,11 +1569,20 @@ int_t sys_msync_guest(guest_addr_t addr, qword_t len, int_t flags) {
     if (end < start || end > mem->page_limit) {
         err = _ENOMEM;     // range extends outside the address space
     } else {
-        for (page_t page = start; page < end; page++) {
+        for (page_t page = start; page < end; ) {
             if (mem_pt(mem, page) == NULL) {
-                err = _ENOMEM;   // a gap in the range -> ENOMEM
-                break;
+                // Mapped, just not materialised yet -- mincore and madvise read
+                // a lazy reservation the same way. There is nothing to write
+                // back for one either: it has never been written to.
+                struct mem_lazy_map *lazy = mem_lazy_find(mem, page);
+                if (lazy == NULL) {
+                    err = _ENOMEM;   // a gap in the range -> ENOMEM
+                    break;
+                }
+                page = lazy->end < end ? lazy->end : end;
+                continue;
             }
+            page++;
         }
     }
     struct msync_fds seen = {0};

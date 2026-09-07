@@ -1145,6 +1145,28 @@ dword_t sys_futex_time64_guest(guest_addr_t uaddr, dword_t op, dword_t val, gues
     return sys_futex_common(uaddr, op, val, timeout_or_val2, uaddr2, val3, true);
 }
 
+// futex(2) for a 64-bit guest. Its struct timespec is two 64-bit fields, the
+// same shape futex_time64 carries on a 32-bit guest -- so the plain call has to
+// be read that way too, and it was not: every 64-bit ABI went through
+// sys_futex_guest, which parses the 32-bit struct. That took tv_sec from the
+// low half of the real tv_sec and tv_nsec from its HIGH half, which is zero for
+// any timestamp that fits in 32 bits. So the nanoseconds were dropped whole:
+//
+//   FUTEX_WAIT, relative {0s, 500000000ns}  ->  read as {0s, 0ns}, no wait
+//   FUTEX_WAIT, relative {2s, 0ns}          ->  read as {2s, 0ns}, correct by luck
+//   FUTEX_WAIT_BITSET, absolute deadline    ->  truncated to a whole second,
+//                                               i.e. in the past ~always
+//
+// Nothing waits after that, and every caller that treats a timed wait as a
+// sleep spins instead. glibc builds pthread_cond_timedwait, sem_timedwait and
+// pthread_mutex_timedlock on FUTEX_WAIT_BITSET, so all three returned ETIMEDOUT
+// immediately and their callers busy-looped: MariaDB's statement_timer thread
+// held ~80% of a core on an idle server, at ~3400 futex calls a second.
+dword_t sys_futex_amd64_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2,
+        guest_addr_t uaddr2, dword_t val3) {
+    return sys_futex_common(uaddr, op, val, timeout_or_val2, uaddr2, val3, true);
+}
+
 int_t sys_set_robust_list(addr_t robust_list, dword_t len) {
     return sys_set_robust_list_common(robust_list, len, GUEST_ABI_I386);
 }

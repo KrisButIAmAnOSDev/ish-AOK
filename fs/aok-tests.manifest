@@ -148,6 +148,7 @@ tty_line_discipline.c
 tty_ctty_ioctls.c
 tty_job_control.c
 mmap_validation.c
+madvise_lazy_reservation.c
 mmap_shared_integrity.c
 fs_permission_rules.c
 fs_remove_enoent_order.c
@@ -178,6 +179,7 @@ proc_files.c
 signal_conventions.c
 dir_tmpfs.c
 futex_validation.c
+futex_timeout_duration.c
 orphan_pgrp_wait.c
 reparent_zombie_notify.c
 subreaper_not_inherited.c

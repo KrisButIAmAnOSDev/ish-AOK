@@ -591,6 +591,7 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
 dword_t sys_futex_time64(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2, addr_t uaddr2, dword_t val3);
 dword_t sys_futex_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
 dword_t sys_futex_time64_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
+dword_t sys_futex_amd64_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
 int_t sys_set_robust_list(addr_t robust_list, dword_t len);
 int_t sys_set_robust_list_guest(guest_addr_t robust_list, dword_t len);
 int_t sys_set_robust_list_amd64(addr_t robust_list, dword_t len);
