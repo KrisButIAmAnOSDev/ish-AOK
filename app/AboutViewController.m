@@ -131,6 +131,7 @@ UIViewController *ISHCreateDiagnosticsViewController(void) {
     return [DiagnosticsViewController new];
 }
 
+
 UIViewController *ISHCreateLLMClientViewController(void) {
     return [LLMClientViewController new];
 }
@@ -182,13 +183,35 @@ BOOL ISHLLMClientEnabled(void) {
 
 @end
 
+// How long a burst of store updates is allowed to accumulate before the report
+// is rebuilt. The store posts its notification for EVERY breadcrumb, and a
+// breadcrumb is recorded per guest process exit and per keystroke, so without
+// this the pane rebuilds a multi-kilobyte report from five JSON files, on the
+// main thread, dozens of times a second. Half a second still reads as live.
+static const NSTimeInterval kDiagnosticsCoalesceInterval = 0.5;
+
+// How close to the end counts as "at the end", for deciding whether to follow
+// the tail. One line of the monospaced 12pt font, near enough.
+static const CGFloat kDiagnosticsBottomSlack = 16;
+
+@interface DiagnosticsViewController () <UITextViewDelegate>
+// Set when the workspace embeds this in its own window, which already draws a
+// title bar saying "Diagnostics". Without it the pane shows that word twice,
+// stacked.
+@property (nonatomic) BOOL embeddedInWorkspaceWindow;
+@end
+
 @implementation DiagnosticsViewController {
     UITextView *_textView;
+    BOOL _rebuildScheduled;   // a coalescing rebuild is already pending
+    BOOL _rebuildDeferred;    // an update arrived while the reader was scrolling
+    BOOL _everLoaded;         // the first load starts at the top; later ones do not
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Diagnostics";
+    if (!self.embeddedInWorkspaceWindow)
+        self.title = @"Diagnostics";
     if (@available(iOS 13.0, *)) {
         self.view.backgroundColor = UIColor.systemBackgroundColor;
     } else {
@@ -199,6 +222,9 @@ BOOL ISHLLMClientEnabled(void) {
     _textView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _textView.editable = NO;
     _textView.alwaysBounceVertical = YES;
+    // For the scroll callbacks below: an update that lands mid-drag is held
+    // until the finger lifts rather than cancelling the gesture.
+    _textView.delegate = self;
     if (@available(iOS 13.0, *)) {
         _textView.backgroundColor = UIColor.systemBackgroundColor;
         _textView.textColor = UIColor.labelColor;
@@ -220,7 +246,7 @@ BOOL ISHLLMClientEnabled(void) {
     ];
 
     [NSNotificationCenter.defaultCenter addObserver:self
-                                           selector:@selector(refreshDiagnostics:)
+                                           selector:@selector(diagnosticsStoreDidUpdate:)
                                                name:ISHDiagnosticsStoreDidUpdateNotification
                                              object:nil];
     [self refreshDiagnostics:nil];
@@ -242,9 +268,122 @@ BOOL ISHLLMClientEnabled(void) {
     }
 }
 
+// A store update arrived. Coalesce it; do not touch the view yet.
+- (void)diagnosticsStoreDidUpdate:(__unused NSNotification *)notification {
+    if (_rebuildScheduled)
+        return;
+    _rebuildScheduled = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t) (kDiagnosticsCoalesceInterval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        DiagnosticsViewController *strongSelf = weakSelf;
+        if (strongSelf == nil)
+            return;
+        strongSelf->_rebuildScheduled = NO;
+        [strongSelf rebuildReport];
+    });
+}
+
+// The Refresh button, and every appearance. Explicit, so it is not deferred --
+// but it still keeps the reader where they are, because a manual refresh means
+// "show me the latest", not "take me back to the top".
 - (void)refreshDiagnostics:(id)sender {
-    _textView.text = [ISHDiagnosticsStore diagnosticsReport];
-    [_textView setContentOffset:CGPointZero animated:NO];
+    [self rebuildReport];
+}
+
+// Whether the reader is looking at the end of the report, which is where the
+// interesting part is: the sections are ordered summary-first and Recent
+// Breadcrumbs last.
+- (BOOL)textViewIsAtBottom {
+    CGFloat insetBottom = 0;
+    if (@available(iOS 11.0, *))
+        insetBottom = _textView.adjustedContentInset.bottom;
+    else
+        insetBottom = _textView.contentInset.bottom;
+    CGFloat maxOffset = _textView.contentSize.height - _textView.bounds.size.height + insetBottom;
+    if (maxOffset <= 0)
+        return YES;   // it all fits; there is nowhere else to be
+    return _textView.contentOffset.y >= maxOffset - kDiagnosticsBottomSlack;
+}
+
+// Rebuild the text without moving the reader.
+//
+// The old version assigned `.text` and then setContentOffset:CGPointZero, which
+// snapped the view to the top on EVERY store update -- and the store posts one
+// per breadcrumb, i.e. per guest process exit and per keystroke. With a guest
+// doing anything at all the pane could not be scrolled down; reported from
+// Discord as exactly that, with the note that the interesting lines are at the
+// bottom. Nothing about the report wants the offset reset: it is the same
+// document with more appended.
+- (void)rebuildReport {
+    // Never reassign the text under a finger: it cancels the drag, which is the
+    // same complaint by another route. Hold the update until the scrolling
+    // stops -- scrollViewDidEndDragging/Decelerating below pick it back up.
+    if (_textView.isTracking || _textView.isDragging || _textView.isDecelerating) {
+        _rebuildDeferred = YES;
+        return;
+    }
+    _rebuildDeferred = NO;
+
+    NSString *report = [ISHDiagnosticsStore diagnosticsReport] ?: @"";
+    if (_everLoaded && [report isEqualToString:_textView.text]) {
+        // Identical: re-laying it out would cost a relayout and, on a text view
+        // being read, a visible flicker, for no new information.
+        return;
+    }
+
+    BOOL follow = _everLoaded && [self textViewIsAtBottom];
+    CGPoint offset = _textView.contentOffset;
+
+    _textView.text = report;
+    [_textView layoutIfNeeded];   // so contentSize below describes the NEW text
+
+    CGFloat insetBottom = 0;
+    if (@available(iOS 11.0, *))
+        insetBottom = _textView.adjustedContentInset.bottom;
+    else
+        insetBottom = _textView.contentInset.bottom;
+    CGFloat maxOffset = _textView.contentSize.height - _textView.bounds.size.height + insetBottom;
+    if (maxOffset < 0)
+        maxOffset = 0;
+
+    if (!_everLoaded) {
+        // The first look starts at the summary, which names the app, the device
+        // and the OS -- the part someone reporting a problem is asked for.
+        offset = CGPointZero;
+        if (@available(iOS 11.0, *))
+            offset.y = -_textView.adjustedContentInset.top;
+    } else if (follow) {
+        // Already reading the end: stay on the end as it grows. This is what
+        // makes the pane usable as a live log -- scroll to the bottom once and
+        // it keeps showing the newest lines.
+        offset.y = maxOffset;
+    } else if (offset.y > maxOffset) {
+        // The report shrank under them (the breadcrumb ring wraps at 200, the
+        // exits ring at 32), so the old offset is past the end now.
+        offset.y = maxOffset;
+    }
+    [_textView setContentOffset:offset animated:NO];
+    _everLoaded = YES;
+}
+
+- (void)applyDeferredRebuildIfNeeded {
+    if (_rebuildDeferred)
+        [self rebuildReport];
+}
+
+- (void)scrollViewDidEndDragging:(__unused UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (!decelerate)
+        [self applyDeferredRebuildIfNeeded];
+}
+
+- (void)scrollViewDidEndDecelerating:(__unused UIScrollView *)scrollView {
+    [self applyDeferredRebuildIfNeeded];
+}
+
+- (void)scrollViewDidEndScrollingAnimation:(__unused UIScrollView *)scrollView {
+    [self applyDeferredRebuildIfNeeded];
 }
 
 - (void)exportDiagnostics:(id)sender {
@@ -265,6 +404,27 @@ BOOL ISHLLMClientEnabled(void) {
 }
 
 @end
+
+// The same screen for a workspace tool window, wrapped in its own navigation
+// controller.
+//
+// A workspace tool gets a navigation bar only if the factory hands one back --
+// the window chrome draws a title bar with a close button and (in Modern) the
+// root menu, and nothing else. Diagnostics was returned bare, so its
+// navigationItem.rightBarButtonItems -- Share and Refresh -- had nowhere to
+// render, and in Workspace mode the screen had no way to export at all.
+// Reported from Discord alongside the scrolling: the Share sheet is how people
+// get the log off the device to read it.
+//
+// Filesystems and Settings already solved this the same way, for the same
+// reason; see their comments in ISHWorkspaceViewControllerForToolIdentifier.
+// The bar's title is suppressed (see embeddedInWorkspaceWindow) because the
+// window's own title bar already says "Diagnostics".
+UIViewController *ISHCreateDiagnosticsNavigationController(void) {
+    DiagnosticsViewController *diagnostics = [DiagnosticsViewController new];
+    diagnostics.embeddedInWorkspaceWindow = YES;
+    return [[UINavigationController alloc] initWithRootViewController:diagnostics];
+}
 
 static NSURL *ISHLLMPersistDirectoryURL(void) {
     NSURL *containerURL = ContainerURL();
