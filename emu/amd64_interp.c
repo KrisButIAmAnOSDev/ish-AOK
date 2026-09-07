@@ -16209,6 +16209,74 @@ amd64_grp3_op_pf:
 // atomic primitive. CMPXCHG16B (REX.W) requires 16-byte alignment and raises
 // #GP otherwise, which is what makes a single host 128-bit compare-exchange
 // legitimate.
+// x87 (D8-DF), as a bridge the gadget chain can call.
+//
+// A thin shell around amd64_handle_x87, which is a complete D8-DF
+// implementation over the same emu/fpu.c and emu/float80.c helpers the i386
+// engine uses. It deliberately does NOT pre-decode the ModRM byte: the handler
+// decodes its own, and pre-decoding here would advance rip twice.
+//
+// amd64_sync_legacy_regs on the way out is mandatory, not decorative -- FNSTSW
+// AX writes RAX, so an x87 instruction can change a general-purpose register.
+int amd64_jit_x87(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip) {
+    qword_t saved_rip = cpu->amd64_rip;
+    guest_addr_t checked_next_ip;
+    struct amd64_rex_prefix rex = {0};
+    bool fs_prefix = false;
+    byte_t byte;
+    int interrupt;
+
+    if (opcode < 0xd8 || opcode > 0xdf)
+        return INT_UNDEFINED;
+    if (!amd64_guest_addr_ok((qword_t) next_ip, 1, &checked_next_ip))
+        return INT_GPF;
+
+    cpu->amd64_address_size_prefix = false;
+    for (;;) {
+        if (!amd64_fetch_u8(cpu, tlb, &byte))
+            goto amd64_jit_x87_pf;
+        if (amd64_ignored_segment_prefix(byte))
+            continue;
+        if (byte == 0x64) {
+            fs_prefix = true;
+            continue;
+        }
+        // 0x66 has no meaning for an x87 escape; consumed so it cannot desync
+        // the fetch. A LOCK prefix is deliberately NOT consumed -- it is #UD on
+        // x87, and leaving it to fail the opcode check below is how that gets
+        // reported.
+        if (byte == 0x66)
+            continue;
+        if (byte >= 0x40 && byte <= 0x4f) {
+            rex.present = true;
+            rex.w = (byte & 8) != 0;
+            rex.r = (byte & 4) != 0;
+            rex.x = (byte & 2) != 0;
+            rex.b = (byte & 1) != 0;
+            continue;
+        }
+        break;
+    }
+    if (byte != (byte_t) opcode)
+        return INT_UNDEFINED;
+
+    // rip now points AT the ModRM byte, which is where amd64_handle_x87 wants
+    // it. It restores rip itself on a fault, using the saved_rip we hand it.
+    interrupt = amd64_handle_x87(cpu, tlb, saved_rip, rex, fs_prefix,
+            (byte_t) opcode);
+    if (interrupt != INT_NONE)
+        return interrupt;
+    cpu->amd64_rip = (qword_t) next_ip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_NONE;
+
+amd64_jit_x87_pf:
+    cpu->amd64_rip = saved_rip;
+    amd64_sync_legacy_regs(cpu);
+    return INT_PF;
+}
+
 int amd64_jit_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip) {
     qword_t saved_rip = cpu->amd64_rip;

@@ -286,6 +286,20 @@ static bool amd64_opcode_needs_modrm(const struct amd64_jit_insn *insn) {
     case 0xd1:
     case 0xd2:
     case 0xd3:
+    // D8-DF are the x87 escape opcodes and every one of them takes a ModRM
+    // byte -- the reg field is part of the opcode. Their absence here meant
+    // insn.has_modrm was false for all of x87, so no arm could be written for
+    // them at all and every one de-JITted its block: 506 of the 598 fallbacks
+    // left after the locked read-modify-writes were routed. Same class as the
+    // 0F AE and 0F C7 omissions already recorded above.
+    case 0xd8:
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
+    case 0xdc:
+    case 0xdd:
+    case 0xde:
+    case 0xdf:
     case 0xf6:
     case 0xf7:
     case 0xfe:
@@ -6196,6 +6210,56 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         (insn.address_size_prefix ? 0x10 : 0) |
         (insn.fs_prefix ? 0x20 : 0) |
         (insn.rep_mode != amd64_jit_rep_none ? 0x40 : 0);
+
+    // x87 (D8-DF), as a bridge into the interpreter's own amd64_handle_x87.
+    //
+    // This is the established design for x87 in this tree, not a compromise:
+    // the i386 engine has no x87 gadgets either -- gen_step32 emits generic
+    // helper gadgets that call the same C fpu_* functions, and the only native
+    // x87 gadget anywhere is fstsw_ax. amd64_handle_x87 lives outside
+    // amd64_step_to_interrupt, so it survives that function's deletion.
+    //
+    // return true, not gen_exit: x87 encodings carry no immediate, so the ModRM
+    // extent IS the whole instruction and the block can carry on afterwards.
+    //
+    // Placed before every other arm because adding D8-DF to the ModRM table
+    // above makes them visible to the generic has_modrm-gated arms further
+    // down, and one of those would otherwise claim them and emit the wrong
+    // thing.
+    if (!insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
+            insn.opcode >= 0xd8 && insn.opcode <= 0xdf) {
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("x87-helper ip=%llx opcode=%02x modrm=%02x next=%llx",
+                (unsigned long long) insn.start_ip, insn.opcode, insn.modrm,
+                (unsigned long long) next_ip);
+        gen_amd64_flush_reg_cache(state);
+        gen_amd64_flush_rip(state);
+        gen_amd64_helper_tlb_2_retint(state, amd64_jit_x87,
+                (unsigned long) insn.opcode, (unsigned long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
+
+    // FWAIT / WAIT (0x9b). No ModRM, no operands, and nothing to do: this
+    // emulator raises no deferred x87 exceptions for it to sync with. It had no
+    // arm, so it de-JITted its block -- and it appears in musl's long-double
+    // printf path right beside the x87 it waits on, so it cost a block break
+    // exactly where x87 code is densest.
+    if (!insn.two_byte_opcode && !insn.address_size_prefix && !insn.lock_prefix &&
+            insn.rep_mode == amd64_jit_rep_none && insn.opcode == 0x9b) {
+        next_ip = insn.start_ip + 1;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("fwait-nop ip=%llx next=%llx",
+                (unsigned long long) insn.start_ip, (unsigned long long) next_ip);
+        gen_amd64_defer_rip(state, next_ip);
+        return true;
+    }
 
     if (amd64_jit_one_byte_ret_prefixes(&insn) && insn.opcode == 0xc3) {
         amd64_jit_debug("ret ip=%llx",
