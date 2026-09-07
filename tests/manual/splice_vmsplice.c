@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "test_common.h"
@@ -158,6 +159,41 @@ int main(int argc, char **argv) {
         long got = moved == 4 ? (long) read(pf[0], buf, 4) : -1;
         ck("  the pipe has the bytes from offset 4", got, 4);
         ck("  which are \"4567\"", strncmp(buf, "4567", 4) == 0, 1);
+        close(in);
+        close(pf[0]);
+        close(pf[1]);
+    }
+
+    // ---- the offset may live anywhere the guest can address ---------------
+    //
+    // Same call as above, with the offset variable in an mmap'd page instead of
+    // on the stack. That is not a contrived place to keep one -- it is where a
+    // heap allocation lands -- and on amd64 it was the difference between
+    // working and being KILLED. amd64 routed splice through the legacy
+    // marshalled table to sys_splice, the i386 entry point, whose offsets are
+    // 32-bit addr_t; the marshaller refuses an argument that does not fit a
+    // dword and delivers SIGSYS. A stack offset (0xffffec78 on this guest) fits
+    // and passed, which is why the case above never caught it; an mmap'd one
+    // (0x7ffffdfc7000) does not. sendfile and copy_file_range were already
+    // routed natively for exactly this reason -- splice was the one left out.
+    {
+        int in = open(src_path, O_RDONLY);
+        int pf[2];
+        ck("pipe", pipe(pf), 0);
+        long long *off = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ck("an mmap'd page for the offset", off != MAP_FAILED, 1);
+        if (off != MAP_FAILED) {
+            *off = 4;
+            long moved = do_splice(in, off, pf[1], NULL, 4, 0);
+            ck("splice with the offset in mmap'd memory", moved, 4);
+            ck("  the offset argument advanced", (long) *off, 8);
+            char buf[16] = { 0 };
+            long got = moved == 4 ? (long) read(pf[0], buf, 4) : -1;
+            ck("  and the right bytes moved", got, 4);
+            ck("  which are \"4567\"", strncmp(buf, "4567", 4) == 0, 1);
+            munmap(off, 4096);
+        }
         close(in);
         close(pf[0]);
         close(pf[1]);
@@ -314,6 +350,16 @@ int main(int argc, char **argv) {
     }
 
     // ---- tee: implemented, or honestly absent ------------------------------
+    //
+    // The FOUR-argument call below is itself a regression, so do not "tidy" it
+    // into anything else. amd64's legacy marshaller classified tee as taking
+    // six arguments -- the default -- and so validated r8/r9, which a
+    // four-argument syscall() never writes. The verdict then came from whatever
+    // the caller left in those registers: glibc reliably leaves a >4 GiB
+    // address there, so this line SIGSYS-KILLED the process every time on a
+    // Devuan root, while the same source passed on Alpine's musl. That is why
+    // it read as a flake -- and why this suite has to be run on a glibc amd64
+    // root as well as a musl one to see it at all.
     {
         int pa[2], pb[2];
         ck("pipe a", pipe(pa), 0);
@@ -323,6 +369,19 @@ int main(int argc, char **argv) {
         long r = rc_of(syscall(SYS_tee, pa[0], pb[1], (size_t) 7, 0));
         test_logf("  %-56s got=%ld\n", "tee answers", r);
         ck("tee either works or is ENOSYS", r == 7 || r == -ENOSYS, 1);
+
+        // The same call with the two registers past tee's fourth argument
+        // carrying values that cannot fit a dword. A four-argument syscall()
+        // never writes them, so on a real kernel they hold caller garbage and
+        // are ignored; amd64's arity classifier defaulted to six and VALIDATED
+        // them, turning whatever happened to be in r8/r9 into the verdict. The
+        // plain four-argument call above cannot pin that -- it dies only when
+        // the leftovers happen not to fit, which is why this looked like a
+        // flake -- so state the values outright and make it deterministic.
+        errno = 0;
+        long rx = rc_of(syscall(SYS_tee, pa[0], pb[1], (size_t) 7, 0,
+                                0x7fffffffffffULL, 0x7fffffffffffULL));
+        ck("tee ignores what is past its fourth argument", rx == 7 || rx == -ENOSYS, 1);
         if (r == 7) {
             // If it worked it must not have consumed: both pipes hold it.
             char x[16] = { 0 }, y[16] = { 0 };
