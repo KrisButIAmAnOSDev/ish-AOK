@@ -171,6 +171,16 @@ static bool amd64_opcode_needs_modrm(const struct amd64_jit_insn *insn) {
         case 0xc4:
         case 0xc5:
         case 0xc6:
+        // 0xc7 was missing, and it is the 0xae bug above repeated: 0F C7 /1 is
+        // CMPXCHG8B/CMPXCHG16B, it plainly has a ModRM byte, and every arm that
+        // could claim it is gated on insn.has_modrm -- which this switch alone
+        // sets. So every CMPXCHG8B walked the whole chain to amd64_bridge_step
+        // and de-JITted its block. 0xc8-0xcf are BSWAP and correctly absent:
+        // they take no ModRM. (0xc3, MOVNTI, is also absent and also takes one,
+        // but it is left alone deliberately -- nothing here implements it, so
+        // giving it a ModRM would let the generic 0f-rm bridge claim it and
+        // raise #UD where today the interpreter executes it.)
+        case 0xc7:
         case 0xd1:
         case 0xd2:
         case 0xd3:
@@ -7197,6 +7207,37 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
 #endif
 
     // imul reg, rm (0F AF): memory / 16-bit forms bridge to the helper.
+    // 0F C7 /1 CMPXCHG8B / CMPXCHG16B, memory operand. Had no arm at all, so
+    // every one fell to amd64_bridge_step and de-JITted its block -- 167 of the
+    // 7009 interpreter fallbacks in a full regression-suite run, and the whole
+    // of the 0f c7 column. The helper is the interpreter's own semantics moved
+    // out of the mega-switch, so this is routing, not a reimplementation.
+    //
+    // /1 is the only encoding taken here: /r values 6 and 7 are RDRAND/RDSEED,
+    // which must keep bridging, and the register form is #UD. The LOCK prefix
+    // is accepted for the same reason as 0F B1 below -- it changes nothing a
+    // single thread observes and the helper takes the atomic path when it is
+    // present.
+    if (!insn.address_size_prefix && insn.two_byte_opcode && insn.has_modrm &&
+            insn.rep_mode == amd64_jit_rep_none &&
+            insn.op2 == 0xc7 && amd64_modrm_reg(insn.modrm) == 1 &&
+            amd64_modrm_mod(insn.modrm) != 3) {
+        if (!gen_amd64_decode_rm_extent(state, tlb, &insn, &next_ip)) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("cmpxchg8b-helper ip=%llx rexw=%d lock=%d next=%llx",
+                (unsigned long long) insn.start_ip,
+                (int) insn.rex.w, (int) insn.lock_prefix,
+                (unsigned long long) next_ip);
+        gen_amd64_helper_tlb_1_retint(state, amd64_jit_cmpxchg8b,
+                (unsigned long) next_ip);
+        gen_exit(state);
+        return false;
+    }
+
     // 0F B1 CMPXCHG [mem], reg, 32/64-bit, memory destination. Before the
     // 0f-rm-helper arm, which otherwise claims it. The byte form (B0) and the
     // 0x66 form keep bridging. A LOCK prefix changes nothing a single thread
@@ -9475,10 +9516,13 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return false;
     }
 
-    // The grp3 helper does not parse a LOCK prefix; route lock not/neg (legal
-    // on memory operands) to the interpreter.
+    // LOCK NOT / LOCK NEG now come here too. They used to be excluded, with a
+    // comment saying the grp3 helper does not parse a LOCK prefix -- so they
+    // fell to amd64_bridge_step and de-JITted their whole block, which was 95%
+    // of every interpreter fallback left in a full regression-suite run
+    // (6800 of 7009). amd64_jit_grp3_op parses the prefix now and takes the
+    // atomic path, so the block survives and the guest keeps its atomicity.
     if (!insn.two_byte_opcode && !insn.address_size_prefix &&
-            !insn.lock_prefix &&
             insn.rep_mode == amd64_jit_rep_none && insn.has_modrm &&
             (insn.opcode == 0xf6 || insn.opcode == 0xf7) &&
             amd64_modrm_reg(insn.modrm) >= 2) {
@@ -9489,6 +9533,11 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         }
         state->amd64_ip = next_ip;
 #if defined(__aarch64__)
+        // Every native arm below is a mod==3 (register-operand) form, and LOCK
+        // with a register destination is #UD. Skipping them wholesale when the
+        // prefix is present keeps that decision in one place and sends the
+        // instruction to the helper, which raises the #UD itself.
+        if (!insn.lock_prefix) {
         // Native byte NOT (0xf6 /2) / NEG (0xf6 /3), mod==3. Cache-aware; handles AH-BH
         // and r8-r15 byte. NOT writes ~src (no flags); NEG sets sub flags (0 - src).
         if (insn.opcode == 0xf6 && !insn.fs_prefix &&
@@ -9561,6 +9610,7 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             gen(state, packed);
             gen_amd64_defer_rip(state, next_ip);
             return true;
+        }
         }
 #endif
         amd64_jit_debug("grp3-op-helper ip=%llx opcode=%02x modrm=%02x next=%llx",

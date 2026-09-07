@@ -7295,6 +7295,96 @@ static inline int amd64_fxsave_op(struct cpu_state *cpu, struct tlb *tlb,
     return INT_NONE;
 }
 
+// CMPXCHG8B / CMPXCHG16B (0F C7 /1), shared by the interpreter's own arm and by
+// the JIT bridge amd64_jit_cmpxchg8b, so the two engines cannot drift apart. A
+// second copy of a per-instruction body is a mistake this tree has paid for
+// before, and this one has to outlive amd64_step_to_interrupt.
+//
+// The caller has already decoded the ModRM. Returns INT_NONE on success with
+// rip untouched (the caller advances it), INT_UNDEFINED for an encoding that is
+// not this instruction, or INT_GPF / INT_PF with segfault_addr already set.
+static int amd64_cmpxchg8b_16b(struct cpu_state *cpu, struct tlb *tlb,
+        struct amd64_rex_prefix rex, const struct amd64_modrm *modrm,
+        bool fs_prefix, bool lock_prefix) {
+    qword_t dst, expected, desired;
+
+    if (modrm->reg != 1 || modrm->is_reg)
+        return INT_UNDEFINED;
+
+    if (rex.w) {
+        // CMPXCHG16B: compare RDX:RAX with the 16-byte operand; on equal store
+        // RCX:RBX and set ZF, else reload RDX:RAX and clear it. The operand must
+        // be 16-byte aligned or this raises #GP -- and that alignment is also
+        // what lets it be a single host 128-bit compare-exchange.
+        qword_t addr = amd64_effective_addr(cpu, modrm, fs_prefix);
+        if (addr & 0xf) {
+            cpu->segfault_addr = addr;
+            return INT_GPF;
+        }
+        qword_t exp128[2] = {
+            amd64_reg_get(cpu, amd64_rax, 64),
+            amd64_reg_get(cpu, amd64_rdx, 64),
+        };
+        qword_t des128[2] = {
+            amd64_reg_get(cpu, amd64_rbx, 64),
+            amd64_reg_get(cpu, amd64_rcx, 64),
+        };
+        qword_t mem128[2];
+        bool eq = false;
+        guest_addr_t checked_addr;
+        if (!amd64_atomic_addr_ok(cpu, tlb, addr, 128, &checked_addr))
+            return INT_PF;
+        if (x86_atomic_cas16b(cpu, tlb, checked_addr, exp128, des128,
+                    mem128, &eq) != 0) {
+            amd64_atomic_faulted(cpu, checked_addr);
+            return INT_PF;
+        }
+        collapse_flags(cpu);
+        cpu->zf = eq;
+        cpu->zf_res = 0;
+        if (!eq) {
+            amd64_reg_set(cpu, amd64_rax, 64, mem128[0]);
+            amd64_reg_set(cpu, amd64_rdx, 64, mem128[1]);
+        }
+        return INT_NONE;
+    }
+
+    expected = ((qword_t) (dword_t) amd64_reg_get(cpu, amd64_rdx, 32) << 32) |
+            (dword_t) amd64_reg_get(cpu, amd64_rax, 32);
+    desired = ((qword_t) (dword_t) amd64_reg_get(cpu, amd64_rcx, 32) << 32) |
+            (dword_t) amd64_reg_get(cpu, amd64_rbx, 32);
+
+    if (lock_prefix) {
+        qword_t addr8 = amd64_effective_addr(cpu, modrm, fs_prefix);
+        bool swapped = false;
+        if (!amd64_locked_cmpxchg(cpu, tlb, addr8, 64, expected, desired,
+                    &dst, &swapped))
+            return INT_PF;
+        collapse_flags(cpu);
+        cpu->zf = swapped;
+        cpu->zf_res = 0;
+        if (!swapped) {
+            amd64_reg_set(cpu, amd64_rax, 32, (dword_t) dst);
+            amd64_reg_set(cpu, amd64_rdx, 32, (dword_t) (dst >> 32));
+        }
+        return INT_NONE;
+    }
+
+    if (!amd64_read_rm(cpu, tlb, modrm, fs_prefix, 64, &dst))
+        return INT_PF;
+    collapse_flags(cpu);
+    cpu->zf = expected == dst;
+    cpu->zf_res = 0;
+    if (expected == dst) {
+        if (!amd64_write_rm(cpu, tlb, modrm, fs_prefix, 64, desired))
+            return INT_PF;
+    } else {
+        amd64_reg_set(cpu, amd64_rax, 32, (dword_t) dst);
+        amd64_reg_set(cpu, amd64_rdx, 32, (dword_t) (dst >> 32));
+    }
+    return INT_NONE;
+}
+
 static inline int amd64_handle_x87(struct cpu_state *cpu, struct tlb *tlb,
         qword_t saved_rip, struct amd64_rex_prefix rex, bool fs_prefix, byte_t opcode) {
     struct amd64_modrm modrm;
@@ -10565,93 +10655,19 @@ restart_prefix:
         }
         if (op2 == 0xc7) {
             struct amd64_modrm modrm;
-            qword_t dst, expected, desired;
-            bool atomic_locked = false;
             if (!amd64_decode_modrm(cpu, tlb, rex, &modrm)) {
                 cpu->amd64_rip = saved_rip;
                 cpu->segfault_addr = saved_rip;
                 return INT_GPF;
             }
-            if (modrm.reg != 1 || modrm.is_reg)
+            // One implementation, shared with the JIT bridge; see
+            // amd64_cmpxchg8b_16b.
+            int cx_int = amd64_cmpxchg8b_16b(cpu, tlb, rex, &modrm, fs_prefix,
+                    lock_prefix);
+            if (cx_int == INT_UNDEFINED)
                 return INT_UNDEFINED;
-
-            atomic_locked = lock_prefix;
-            if (rex.w) {
-                // CMPXCHG16B: 128-bit compare-exchange. Compare RDX:RAX with the
-                // 16-byte memory operand; on equal store RCX:RBX (ZF=1), else
-                // reload RDX:RAX from memory (ZF=0). The operand must be 16-byte
-                // aligned or the instruction raises #GP. (Without REX.W this is
-                // CMPXCHG8B -- the 64-bit path below.)
-                qword_t addr = amd64_effective_addr(cpu, &modrm, fs_prefix);
-                if (addr & 0xf) {
-                    cpu->amd64_rip = saved_rip;
-                    cpu->segfault_addr = addr;
-                    return INT_GPF;
-                }
-                // The 16-byte alignment enforced just above is also what lets
-                // this be a single host 128-bit compare-exchange.
-                qword_t exp128[2] = {
-                    amd64_reg_get(cpu, amd64_rax, 64),
-                    amd64_reg_get(cpu, amd64_rdx, 64),
-                };
-                qword_t des128[2] = {
-                    amd64_reg_get(cpu, amd64_rbx, 64),
-                    amd64_reg_get(cpu, amd64_rcx, 64),
-                };
-                qword_t mem128[2];  // [0] = low qword, [1] = high qword
-                bool eq = false;
-                guest_addr_t checked_addr;
-                if (!amd64_atomic_addr_ok(cpu, tlb, addr, 128, &checked_addr))
-                    goto amd64_gpf_restore;
-                if (x86_atomic_cas16b(cpu, tlb, checked_addr, exp128, des128,
-                            mem128, &eq) != 0) {
-                    amd64_atomic_faulted(cpu, checked_addr);
-                    goto amd64_gpf_restore;
-                }
-                collapse_flags(cpu);
-                cpu->zf = eq;
-                cpu->zf_res = 0;
-                if (!eq) {
-                    amd64_reg_set(cpu, amd64_rax, 64, mem128[0]);
-                    amd64_reg_set(cpu, amd64_rdx, 64, mem128[1]);
-                }
-                break;
-            }
-            expected = ((qword_t) (dword_t) amd64_reg_get(cpu, amd64_rdx, 32) << 32) |
-                    (dword_t) amd64_reg_get(cpu, amd64_rax, 32);
-            desired = ((qword_t) (dword_t) amd64_reg_get(cpu, amd64_rcx, 32) << 32) |
-                    (dword_t) amd64_reg_get(cpu, amd64_rbx, 32);
-            if (atomic_locked) {
-                qword_t addr8 = amd64_effective_addr(cpu, &modrm, fs_prefix);
-                bool swapped = false;
-                if (!amd64_locked_cmpxchg(cpu, tlb, addr8, 64, expected, desired,
-                            &dst, &swapped))
-                    goto amd64_gpf_restore;
-                collapse_flags(cpu);
-                cpu->zf = swapped;
-                cpu->zf_res = 0;
-                if (swapped) {
-                    amd64_trace_qword_store(cpu, saved_rip, 0x0f, addr8, desired);
-                } else {
-                    amd64_reg_set(cpu, amd64_rax, 32, (dword_t) dst);
-                    amd64_reg_set(cpu, amd64_rdx, 32, (dword_t) (dst >> 32));
-                }
-                break;
-            }
-            if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, 64, &dst))
+            if (cx_int != INT_NONE)
                 goto amd64_gpf_restore;
-            collapse_flags(cpu);
-            cpu->zf = expected == dst;
-            cpu->zf_res = 0;
-            if (expected == dst) {
-                if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, desired))
-                    goto amd64_gpf_restore;
-                amd64_trace_qword_store(cpu, saved_rip, 0x0f,
-                        amd64_effective_addr(cpu, &modrm, fs_prefix), desired);
-            } else {
-                amd64_reg_set(cpu, amd64_rax, 32, (dword_t) dst);
-                amd64_reg_set(cpu, amd64_rdx, 32, (dword_t) (dst >> 32));
-            }
             break;
         }
         if (op2 >= 0xc8 && op2 <= 0xcf) {
@@ -11393,6 +11409,17 @@ restart_prefix:
                 amd64_set_sub_flags(cpu, 0, old_val, new_val, size);
             break;
         }
+        // A LOCK prefix that reached here has a register destination, or names
+        // a group member that cannot take one. Real hardware raises #UD for
+        // both -- measured, with a probe that executes a hand-assembled
+        // `f0 f7 d0` and reports the signal: `lock not %eax`, `lock neg %eax`
+        // and `lock inc %eax` all SIGILL on an x86_64 host. This engine used to
+        // ignore the prefix and execute the operation non-atomically, which is
+        // a state no real CPU produces and which now disagrees with the JIT
+        // bridge (amd64_jit_grp3_op), so the two engines would answer
+        // differently for the same bytes.
+        if (lock_prefix)
+            return INT_UNDEFINED;
         result = amd64_grp3_muldiv(cpu, tlb, &modrm, fs_prefix, size);
         if (result == INT_PF)
             goto amd64_gpf_restore;
@@ -12170,6 +12197,12 @@ restart_prefix:
                     goto amd64_gpf_restore;
                 break;
             }
+            // LOCK with a register destination is #UD on real hardware
+            // (measured: `lock inc %eax` SIGILLs on x86_64), and the JIT
+            // already raises it. Executing it non-atomically instead is a
+            // state no CPU produces.
+            if (lock_prefix)
+                return INT_UNDEFINED;
             if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, 8, &lhs))
                 goto amd64_gpf_restore;
             result = is_inc ? amd64_trunc(lhs + 1, 8) : amd64_trunc(lhs - 1, 8);
@@ -12207,6 +12240,12 @@ restart_prefix:
                     goto amd64_gpf_restore;
                 break;
             }
+            // LOCK with a register destination is #UD on real hardware
+            // (measured: `lock inc %eax` SIGILLs on x86_64), and the JIT
+            // already raises it. Executing it non-atomically instead is a
+            // state no CPU produces.
+            if (lock_prefix)
+                return INT_UNDEFINED;
             if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, op_size, &lhs))
                 goto amd64_gpf_restore;
             result = is_inc ? amd64_trunc(lhs + 1, op_size) : amd64_trunc(lhs - 1, op_size);
@@ -16065,6 +16104,7 @@ int amd64_jit_grp3_op(struct cpu_state *cpu, struct tlb *tlb,
     struct amd64_modrm modrm;
     bool fs_prefix = false;
     bool operand_size_prefix = false;
+    bool lock_prefix = false;
     byte_t byte;
     unsigned size;
     int interrupt;
@@ -16088,6 +16128,15 @@ int amd64_jit_grp3_op(struct cpu_state *cpu, struct tlb *tlb,
             operand_size_prefix = true;
             continue;
         }
+        // LOCK. Not consumed here before, which is why jit/gen.c had to send
+        // every `lock notl` / `lock negl` to a whole-block interpreter
+        // fallback -- 95% of the interpreter fallbacks left in a full
+        // regression-suite run. The semantics were never the problem; nothing
+        // routed to them.
+        if (byte == 0xf0) {
+            lock_prefix = true;
+            continue;
+        }
         if (byte >= 0x40 && byte <= 0x4f) {
             rex.present = true;
             rex.w = (byte & 8) != 0;
@@ -16106,6 +16155,31 @@ int amd64_jit_grp3_op(struct cpu_state *cpu, struct tlb *tlb,
         return INT_UNDEFINED;
 
     size = opcode == 0xf6 ? 8 : (operand_size_prefix ? 16 : (rex.w ? 64 : 32));
+
+    if (lock_prefix) {
+        // Of this group only NOT (/2) and NEG (/3) accept LOCK, and only with a
+        // memory operand: LOCK on a register destination is #UD on real
+        // hardware, as is LOCK on the TEST and MUL/DIV forms. Returning
+        // INT_UNDEFINED here is therefore the architecturally correct answer,
+        // not a bail-out.
+        if (modrm.is_reg || (modrm.reg != 2 && modrm.reg != 3))
+            return INT_UNDEFINED;
+        qword_t addr = amd64_effective_addr(cpu, &modrm, fs_prefix);
+        qword_t old_value = 0, new_value = 0;
+        if (!amd64_locked_negnot(cpu, tlb, addr, size, modrm.reg == 3,
+                    &old_value, &new_value))
+            goto amd64_grp3_op_pf;
+        // Same flag rule as the non-atomic path in amd64_grp3_muldiv: NOT
+        // touches no flags at all, NEG sets them as for `0 - src`. The
+        // pre-image is what the flags are computed from, which is why
+        // amd64_locked_negnot returns it.
+        if (modrm.reg == 3)
+            amd64_set_sub_flags(cpu, 0, old_value, new_value, size);
+        cpu->amd64_rip = (qword_t) next_ip;
+        amd64_sync_legacy_regs(cpu);
+        return INT_NONE;
+    }
+
     interrupt = amd64_grp3_muldiv(cpu, tlb, &modrm, fs_prefix, size);
     if (interrupt != INT_NONE) {
         cpu->amd64_rip = saved_rip;
@@ -16120,6 +16194,85 @@ amd64_grp3_op_pf:
     cpu->amd64_rip = saved_rip;
     amd64_sync_legacy_regs(cpu);
     return INT_PF;
+}
+
+// CMPXCHG8B / CMPXCHG16B (0F C7 /1), as a bridge the gadget chain can call.
+//
+// It existed only inside the interpreter's mega-switch, so jit/gen.c had no arm
+// for it and every one de-JITted its whole block -- the second-largest source
+// of interpreter fallbacks after LOCK NOT/NEG. The semantics below are a
+// transcription of that switch arm, verified equal to real hardware on values,
+// EAX/EDX writeback and ZF before being moved.
+//
+// The LOCK prefix does not change what a single thread observes, so both the
+// locked and unlocked encodings route here; only the locked one takes the
+// atomic primitive. CMPXCHG16B (REX.W) requires 16-byte alignment and raises
+// #GP otherwise, which is what makes a single host 128-bit compare-exchange
+// legitimate.
+int amd64_jit_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip) {
+    qword_t saved_rip = cpu->amd64_rip;
+    guest_addr_t checked_next_ip;
+    struct amd64_rex_prefix rex = {0};
+    struct amd64_modrm modrm;
+    bool fs_prefix = false;
+    bool lock_prefix = false;
+    byte_t byte;
+    int cx_int = INT_PF;
+
+    if (!amd64_guest_addr_ok((qword_t) next_ip, 1, &checked_next_ip))
+        return INT_GPF;
+
+    cpu->amd64_address_size_prefix = false;
+    for (;;) {
+        if (!amd64_fetch_u8(cpu, tlb, &byte))
+            goto amd64_cmpxchg8b_pf;
+        if (amd64_ignored_segment_prefix(byte))
+            continue;
+        if (byte == 0x64) {
+            fs_prefix = true;
+            continue;
+        }
+        if (byte == 0xf0) {
+            lock_prefix = true;
+            continue;
+        }
+        // 0x66 is meaningless for this opcode; consumed so it cannot desync
+        // the fetch, exactly as the interpreter's own prefix loop does.
+        if (byte == 0x66)
+            continue;
+        if (byte >= 0x40 && byte <= 0x4f) {
+            rex.present = true;
+            rex.w = (byte & 8) != 0;
+            rex.r = (byte & 4) != 0;
+            rex.x = (byte & 2) != 0;
+            rex.b = (byte & 1) != 0;
+            continue;
+        }
+        break;
+    }
+    if (byte != 0x0f)
+        return INT_UNDEFINED;
+    if (!amd64_fetch_u8(cpu, tlb, &byte))
+        goto amd64_cmpxchg8b_pf;
+    if (byte != 0xc7)
+        return INT_UNDEFINED;
+    if (!amd64_decode_modrm(cpu, tlb, rex, &modrm))
+        goto amd64_cmpxchg8b_pf;
+
+    cx_int = amd64_cmpxchg8b_16b(cpu, tlb, rex, &modrm, fs_prefix, lock_prefix);
+    if (cx_int == INT_NONE) {
+        cpu->amd64_rip = (qword_t) next_ip;
+        amd64_sync_legacy_regs(cpu);
+        return INT_NONE;
+    }
+    if (cx_int == INT_UNDEFINED)
+        return INT_UNDEFINED;
+
+amd64_cmpxchg8b_pf:
+    cpu->amd64_rip = saved_rip;
+    amd64_sync_legacy_regs(cpu);
+    return cx_int == INT_GPF ? INT_GPF : INT_PF;
 }
 
 int amd64_jit_modrm_imm(struct cpu_state *cpu, struct tlb *tlb,
