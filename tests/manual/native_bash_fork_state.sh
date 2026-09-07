@@ -81,6 +81,62 @@ ck recurse-legal-400  deep-ok  'f(){ [ $1 -gt 0 ] && f $(($1-1)) || echo deep-ok
 # bash's own FUNCNEST must still work where it applies.
 ck funcnest-still-works 1 'FUNCNEST=10; r(){ r; }; r 2>&1 | grep -c "exceeded (10)"'
 
+echo "== a null command must not re-launch itself for ever =="
+# `{v}>file` with no command is a SIMPLE COMMAND WITH NO WORDS, and bash forks
+# for it -- execute_null_command's forcefork -- so that the descriptor variable
+# and the redirection land somewhere the shell will not see them. A fork gives
+# the child a process that is already past the parse; it runs do_redirections
+# and exits. A re-launch does not: the child is a fresh shell handed the
+# command as TEXT.
+#
+# So the text matters. This site used to hand down the printed command, and the
+# printed command is `{v}>file` again -- and forcefork is a property of that
+# TEXT, not of the pipes the child was given, so the child took the same
+# decision and re-launched a child of its own. Measured: 6141 nested shells for
+# one `{v}>/tmp/x`, "shell level (1000) too high" six times over, a spawn
+# failure at the bottom, exit 254, and no /tmp/x at all -- not one of those
+# shells ever reached the redirection. It is the same trap the subshell site
+# documents for `( ... )`, in the one other place where a command's own text
+# routes it back through the fork.
+#
+# The child is now handed `: ` plus the redirections, which has a word to run
+# and so never enters execute_null_command. These cases assert the redirection
+# actually HAPPENED, which is the part the runaway lost, and that it happened
+# quietly -- a regression here announces itself on stderr long before it
+# announces itself in the exit status.
+ck nullcmd-varassign  ok   'f=/tmp/aok-nc-1; rm -f $f; {v}>$f; [ -f $f ] && echo ok'
+ck nullcmd-status     0    '{v}>/tmp/aok-nc-2; echo $?'
+ck nullcmd-quiet      ok   'r=$( { {v}>/tmp/aok-nc-3; } 2>&1 ); [ -z "$r" ] && echo ok || echo "noise: $r"'
+# The variable is bound in the child and discarded with it, as a fork gave.
+ck nullcmd-var-local  ok   '{v}>/tmp/aok-nc-4; [ -z "$v" ] && echo ok || echo "leaked: $v"'
+# The redirection is a real one, not a no-op that happens to exit 0.
+ck nullcmd-truncates  0    'f=/tmp/aok-nc-5; printf abcdef > $f; {v}>$f; wc -c < $f'
+ck nullcmd-fail-rc    1    '{v}>/no-such-dir/x; echo $?' 
+# A here-document is the case that decided HOW the word is added: its body is
+# printed after the whole command, so there is no position in the finished text
+# to paste a word into, and the child's command has to be printed rather than
+# spliced.
+ck nullcmd-heredoc    0    '{h}<<EOF
+hi
+EOF
+echo $?'
+# The other thing that sends a null command here: a redirection of the shell'"'"'s
+# own input descriptor.
+ck nullcmd-input      ok   'f=/tmp/aok-nc-6; echo data > $f; ${nothing} <$f && echo ok'
+ck nullcmd-closefd    ok   '${nothing} <&-; echo ok'
+# In a pipeline, in every position. These are also the shapes that would catch
+# a live pipe descriptor reaching the spawned child: the reader would never see
+# EOF and the case would HANG rather than fail.
+ck nullcmd-pipe-first ok   'f=/tmp/aok-nc-7; rm -f $f; {v}>$f | cat; [ -f $f ] && echo ok'
+ck nullcmd-pipe-last  ok   'f=/tmp/aok-nc-8; rm -f $f; echo x | {v}>$f; [ -f $f ] && echo ok'
+ck nullcmd-pipe-mid   ok   'f=/tmp/aok-nc-9; rm -f $f; echo x | {v}>$f | cat; [ -f $f ] && echo ok'
+# And the compound shapes that reach it through another spawn.
+ck nullcmd-in-func    ok   'f=/tmp/aok-nc-10; rm -f $f; g(){ {v}>$f; }; g | cat; [ -f $f ] && echo ok'
+ck nullcmd-in-group   ok   'f=/tmp/aok-nc-11; rm -f $f; { {v}>$f; } | cat; [ -f $f ] && echo ok'
+ck nullcmd-in-subsh   ok   'f=/tmp/aok-nc-12; rm -f $f; ( {v}>$f ) | cat; [ -f $f ] && echo ok'
+ck nullcmd-async      ok   'f=/tmp/aok-nc-13; rm -f $f; {v}>$f & wait; [ -f $f ] && echo ok'
+ck nullcmd-exec-pipe  ok   'f=/tmp/aok-nc-14; rm -f $f; { exec {v}>$f; } | cat; [ -f $f ] && echo ok'
+
 echo "== the locale comes from the guest, not the host =="
 # setlocale(cat, "") means "take it from the environment", and a native program
 # is a function call inside the app -- so the C library resolved it against the
