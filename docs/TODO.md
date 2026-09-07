@@ -19,43 +19,6 @@ Started 2026-08-19, after the 549 release run. Closed entries from the 549 and
 
 ## Diagnosed, not fixed
 
-### A `#!` interpreter may not itself be a script
-
-Found 2026-09-07 alongside the native-interpreter fix (`kernel/exec.c`,
-`native_dispatch_exec`), and deliberately left alone there because it changes
-what ordinary `#!` handling *accepts*, which was out of that change's scope.
-
-**Established, measured on the Linux oracle** (Devuan, 6.12, x86_64) with a
-chain of scripts each naming the previous one as its interpreter:
-
-| chain length | Linux | iSH-AOK |
-|---|---|---|
-| 1 (`#!/bin/sh`) | runs | runs |
-| 2 (interpreter is itself a `#!` script) | runs | `ENOEXEC` |
-| 3, 4 | runs | `ENOEXEC` |
-| 5 and deeper | `ELOOP` (errno 40) | `ENOEXEC` |
-
-So Linux resolves a `#!` chain up to **four** interpreters deep and answers
-`ELOOP` beyond that; AOK resolves exactly one and answers `ENOEXEC` for
-anything deeper. `shebang_exec` hands the interpreter to `format_exec`, which
-tries ELF and then `binfmt_misc` and stops -- it never re-enters
-`shebang_exec`, so the recursion Linux bounds at 4 is absent rather than
-limited.
-
-`ENOEXEC` is the errno every shell answers by silently re-running the file
-under `/bin/sh`, so the visible symptom is a script running under the wrong
-interpreter with no diagnostic -- the same silence the native-interpreter bug
-had, and the reason that one went unnoticed. One concrete case remains open
-because of it: `/AOK/native/<name>` serves a `#!/bin/sh` placeholder whose
-whole job is to say "native dispatch unavailable in this build" out loud, and
-reached as a `#!` interpreter in a build that lacks the program, that
-diagnostic is still swallowed.
-
-**Next step:** thread a depth through `shebang_exec`/`format_exec` -- Linux's
-`bprm->recursion_depth`, bounded the same way -- and return `_ELOOP` past the
-bound. `tests/manual/exec_shebang_interpreter.c` is where the cases go; the
-oracle numbers above are the expectations.
-
 ### Two things a re-launched bash subshell still gets wrong about `$?` and DEBUG
 
 Left open by the 2026-09-07 trap-ordering fix (`deps/bash/aok_fork.c`), which
