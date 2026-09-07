@@ -4,7 +4,7 @@
 
 # Appendix F. The regression suite, annotated
 
-243 C programs in `tests/manual/`, of which **226 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
+244 C programs in `tests/manual/`, of which **227 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
 
 A row with a directory prefix is a per-architecture or accelerator test, kept
 in a subdirectory of `tests/manual/` and registered under that same prefix.
@@ -62,6 +62,7 @@ does not say what it is for.
 | `exec_de_thread.c` | yes | execve from a non-leader thread (Linux's de_thread). |
 | `exec_i386_fault_addr.c` | yes | exec_i386_fault_addr.c -- an i386 image must report its own page faults with a clean high half, even when the task it was exec'd into descends... |
 | `exec_perm_rules.c` | yes | What execve accepts, and what a program keeps across one. |
+| `exec_shebang_interpreter.c` | yes | What a #! line names, and what actually runs. |
 | `fakefs_casefold.c` | yes | Regression test for fakefs case sensitivity on case-insensitive hosts. |
 | `fakefs_inode_alias.c` | yes | Regression test for fakefs inode aliasing, and for the unremovable entry it used to leave behind. |
 | `fakefs_type_race.c` | yes | Regression test for a fakefs metadata/host-filesystem entry-type race. |

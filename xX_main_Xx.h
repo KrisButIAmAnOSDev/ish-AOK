@@ -103,6 +103,11 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         fs_chdir(current->fs, pwd);
     }
 
+    // Whatever this entry point wants present in the root, before the first
+    // program is loaded out of it rather than after (kernel/init.h).
+    if (ish_boot_setup_hook != NULL)
+        ish_boot_setup_hook();
+
     char argv_copy[4096];
     int i = optind;
     size_t p = 0;

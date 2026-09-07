@@ -85,6 +85,12 @@ so a script could run an interpreter the caller was not permitted to execute.
 The permission model has to be applied at every place a program is chosen, not
 just the one the user typed.
 
+And not only the permission model. Section 15.5's question — is this a program
+compiled into iSH-AOK? — is a question about a chosen program too, and it went
+unasked here for exactly as long as it took somebody to write
+`#!/AOK/native/bash` at the top of a script. See there for what that silence
+looked like.
+
 **An ELF image.** `elf_exec` maps the segments, and if the image names an
 interpreter — which every dynamically linked program does — maps that too and
 enters at *its* entry point, leaving `ld.so` to do the rest.
@@ -182,20 +188,33 @@ that a process be able to shed its threads and keep its pid.
 
 ## 15.5 The fork in the road
 
-The last thing `__do_execve` does before any of the above is ask whether the
-resolved path is a natively-implemented program:
+The last thing done before any of the above is ask whether the resolved file is
+a natively-implemented program:
 
 ```c
 // Natively-implemented programs (/AOK/native/*, kernel/native.h) are ...
 ```
 
-If it is, the function sets `native_exec` on the task and returns before
-reaching any of the ELF machinery. No segments are mapped, no interpreter is
-loaded, no entry point is set. When the task would otherwise begin executing the
-loaded image, it calls a C function inside iSH-AOK instead. Part V is about what
-that means; here it is enough to note where the branch is, and that it is a
+If it is, `native_dispatch_exec` records the program on the task and returns
+before reaching any of the ELF machinery. No segments are mapped, no interpreter
+is loaded, no entry point is set. When the task would otherwise begin executing
+the loaded image, it calls a C function inside iSH-AOK instead. Part V is about
+what that means; here it is enough to note where the branch is, and that it is a
 branch in `execve` rather than a special case bolted on elsewhere — which is
 exactly why the caller cannot tell.
+
+For a while the branch was in `__do_execve` and nowhere else, which meant it was
+taken when a native program was named directly and not when it was reached as a
+`#!` interpreter. The result was the quietest possible failure. What the guest
+finds at `/AOK/native/<name>` is a `#!/bin/sh` placeholder — the real program is
+compiled in, and the file is only there so the path exists — so a script saying
+`#!/AOK/native/bash` was handed a shell script as its interpreter, found no
+loader that would take one, and came back `ENOEXEC`. `ENOEXEC` is precisely the
+errno every shell answers by re-running the file under `/bin/sh`. So the script
+ran, under dash, and said nothing: not the program asked for, not the
+placeholder's own diagnostic, no error anywhere. The question now lives in
+`native_dispatch_exec` and is asked wherever a program is chosen — the direct
+exec, the `#!` interpreter, and the `binfmt_misc` interpreter alike.
 
 Even so, exec's ordinary obligations do not go away, and forgetting them was a
 source of bugs. `exec_apply_native_process_state` resets the signal

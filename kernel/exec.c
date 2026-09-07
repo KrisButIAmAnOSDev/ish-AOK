@@ -1304,6 +1304,17 @@ static inline int user_memset(guest_addr_t start, byte_t val, dword_t len) {
 static struct fd *open_exec(const char *file, struct statbuf *stat);
 static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp);
 
+// Returned by native_dispatch_exec, and propagated by every loader path that
+// can reach it, when the file turned out to be a program compiled into
+// iSH-AOK. Distinct from a plain 0 because the two mean opposite things to the
+// caller: 0 says an image was loaded and the rest of execve's process-state
+// work is still to be done, while this says the exec is already COMMITTED --
+// exec_apply_native_process_state has done all of it -- and doing it a second
+// time is at best redundant and at worst a ptrace stop the direct native path
+// never takes. __do_execve turns it back into 0 for the guest.
+#define EXEC_NATIVE_DISPATCHED 1
+static int native_dispatch_exec(struct fd *fd, struct exec_args argv, struct exec_args envp);
+
 // binfmt_misc: hand the file to a registered interpreter.
 //
 // This is what makes /proc/sys/fs/binfmt_misc honest. That directory used to
@@ -1377,10 +1388,18 @@ static int binfmt_misc_exec(struct fd *fd, const char *file, struct exec_args ar
         free(new_argv_buf);
         return (int) PTR_ERR(interpreter_fd);
     }
-    int err = format_exec(interpreter_fd, interpreter, new_argv, envp);
+    // Same as the #! path: a registration may name a native program as its
+    // interpreter, and that has to be asked before any loader is handed the
+    // file.
+    int err = native_dispatch_exec(interpreter_fd, new_argv, envp);
+    if (err == _ENOEXEC)
+        err = format_exec(interpreter_fd, interpreter, new_argv, envp);
     free(new_argv_buf);
-    if (err < 0)
-        fd_close(interpreter_fd);
+    // Unconditionally, as shebang_exec does with its own: a loader that takes
+    // the file retains its own reference for mm->exefile (elf_exec), so the one
+    // open_exec handed back is still ours either way. Closing it only on
+    // failure leaked a descriptor on every successful binfmt_misc exec.
+    fd_close(interpreter_fd);
     return err;
 }
 
@@ -1555,7 +1574,12 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
         free(new_argv_buf);
         return (int)PTR_ERR(interpreter_fd);
     }
-    int err = format_exec(interpreter_fd, interpreter, new_argv, envp);
+    // ...and it faces the native-program question on the same terms, before
+    // any loader sees it. Without this a `#!/AOK/native/<name>` script never
+    // reached the program it named (native_dispatch_exec).
+    int err = native_dispatch_exec(interpreter_fd, new_argv, envp);
+    if (err == _ENOEXEC)
+        err = format_exec(interpreter_fd, interpreter, new_argv, envp);
     fd_close(interpreter_fd);
     free(new_argv_buf);
     return err;
@@ -1683,6 +1707,77 @@ static void exec_apply_native_process_state(struct mm *new_mm) {
     vfork_notify(current);
 }
 
+// Natively-implemented programs (/AOK/native/*, kernel/native.h) are dispatched
+// here: after the caller's existence and permission checks, so they behave like
+// any other executable, but before any ELF parsing, since there is no guest
+// image to load. Keyed off the resolved fd rather than a path, so a symlink
+// from anywhere in the guest lands here while argv[0] stays whatever the caller
+// passed.
+//
+// Answers _ENOEXEC for anything that is not a native program this build
+// carries, which is the same "not my format" every other loader answers, so a
+// caller can try it alongside the rest. It never closes `fd`: the caller keeps
+// the reference it opened with, exactly as it does across format_exec.
+//
+// A caller, not just __do_execve. An interpreter named on a #! line is
+// executed, and it is executed by the same rules as anything else -- so this
+// has to be asked there too. It was not, and the answer was silent: the file
+// served at /AOK/native/<name> is a `#!/bin/sh` placeholder (fs/aok.c), so a
+// script saying `#!/AOK/native/bash` reached that placeholder, found no loader
+// that would take a shell script as an interpreter, and came back ENOEXEC --
+// which every shell answers by re-running the script under /bin/sh. Writing
+// `#!/AOK/native/bash` and being given dash is the worst available outcome:
+// not the program asked for, not the placeholder's diagnostic, no error at all.
+static int native_dispatch_exec(struct fd *fd, struct exec_args argv, struct exec_args envp) {
+    const char *native_name = aokfs_native_program_name(fd);
+    if (native_name == NULL)
+        return _ENOEXEC;
+    const struct native_program *prog = native_program_lookup(native_name);
+    // No match means this build does not carry that program; the caller falls
+    // through and runs the /AOK/native stub, which says so out loud.
+    if (prog == NULL)
+        return _ENOEXEC;
+
+    char **native_argv = exec_args_to_vector(argv);
+    char **native_envp = exec_args_to_vector(envp);
+    if (native_argv == NULL || native_envp == NULL) {
+        free(native_argv);
+        free(native_envp);
+        return _ENOMEM;
+    }
+    // Built here, before anything is committed, for the same reason elf_exec
+    // builds its new_mm before exec_de_thread: past the commit point a failure
+    // has nowhere to go but a dead process.
+    struct mm *native_mm = mm_new(current->abi);
+    if (native_mm == NULL) {
+        free(native_argv);
+        free(native_envp);
+        return _ENOMEM;
+    }
+    // /proc/<pid>/exe should name what was exec'd. Inheriting the mm meant it
+    // named the PARENT's binary -- /bin/busybox for anything a shell started --
+    // which is worse than either the truth or nothing. For a #! script this is
+    // the interpreter, which is what Linux records there too.
+    native_mm->exefile = fd_retain(fd);
+    // Recorded rather than run here. Running a native program never returns, so
+    // doing it at this point would strand every buffer the execve syscall still
+    // means to free -- including the argv/envp blocks themselves. Instead take
+    // a private copy, report success, and let each entry point run it once its
+    // own frees are done (see native_exec_run_pending).
+    int perr = native_exec_set_pending(prog, (int) argv.count,
+            native_argv, native_envp);
+    free(native_argv);
+    free(native_envp);
+    if (perr < 0) {
+        mm_release(native_mm);
+        return perr;
+    }
+    // Only once the record is safely taken: everything below commits the exec,
+    // and there is no undoing a closed descriptor.
+    exec_apply_native_process_state(native_mm);
+    return EXEC_NATIVE_DISPATCHED;
+}
+
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
     // open_exec decides what the file IS and whether this caller may execute
     // it before opening it, which is Linux's do_open_execat order. This used
@@ -1694,61 +1789,13 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         return (int) PTR_ERR(fd);
     int err;
 
-    // Natively-implemented programs (/AOK/native/*, kernel/native.h) are
-    // dispatched here: after the existence and permission checks above, so
-    // they behave like any other executable, but before any ELF parsing, since
-    // there is no guest image to load. Keyed off the resolved fd rather than
-    // `file`, so a symlink from anywhere in the guest lands here while argv[0]
-    // stays whatever the caller passed.
-    const char *native_name = aokfs_native_program_name(fd);
-    if (native_name != NULL) {
-        const struct native_program *prog = native_program_lookup(native_name);
-        // No match means this build does not carry that program; fall through
-        // and run the /AOK/native stub, which says so out loud.
-        if (prog != NULL) {
-            char **native_argv = exec_args_to_vector(argv);
-            char **native_envp = exec_args_to_vector(envp);
-            if (native_argv == NULL || native_envp == NULL) {
-                free(native_argv);
-                free(native_envp);
-                fd_close(fd);
-                return _ENOMEM;
-            }
-            // Built here, before anything is committed, for the same reason
-            // elf_exec builds its new_mm before exec_de_thread: past the
-            // commit point a failure has nowhere to go but a dead process.
-            struct mm *native_mm = mm_new(current->abi);
-            if (native_mm == NULL) {
-                free(native_argv);
-                free(native_envp);
-                fd_close(fd);
-                return _ENOMEM;
-            }
-            // /proc/<pid>/exe should name what was exec'd. Inheriting the mm
-            // meant it named the PARENT's binary -- /bin/busybox for anything
-            // a shell started -- which is worse than either the truth or
-            // nothing.
-            native_mm->exefile = fd_retain(fd);
-            fd_close(fd);
-            // Recorded rather than run here. Running a native program never
-            // returns, so doing it at this point would strand every buffer the
-            // execve syscall still means to free -- including the argv/envp
-            // blocks themselves. Instead take a private copy, report success,
-            // and let each entry point run it once its own frees are done (see
-            // native_exec_run_pending).
-            int perr = native_exec_set_pending(prog, (int) argv.count,
-                    native_argv, native_envp);
-            free(native_argv);
-            free(native_envp);
-            if (perr < 0) {
-                mm_release(native_mm);
-                return perr;
-            }
-            // Only once the record is safely taken: everything below commits
-            // the exec, and there is no undoing a closed descriptor.
-            exec_apply_native_process_state(native_mm);
-            return 0;
-        }
+    // A native program replaces this image with compiled-in host code, so it
+    // is asked about before any loader gets the file. Anything else comes back
+    // _ENOEXEC and carries on below.
+    err = native_dispatch_exec(fd, argv, envp);
+    if (err != _ENOEXEC) {
+        fd_close(fd);
+        return err == EXEC_NATIVE_DISPATCHED ? 0 : err;
     }
 
     // Stage what the credentials will be once this exec commits, for the aux
@@ -1786,6 +1833,12 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         amd64_trace_exec_loader_failure("do-execve", file, current->abi, NULL, 0, NULL, err, NULL);
         return err;
     }
+    // The interpreter was a native program, so the exec is already committed
+    // and everything below has already happened once
+    // (exec_apply_native_process_state). Returning here is what the direct
+    // native path does a hundred lines up, and this is the same exec.
+    if (err == EXEC_NATIVE_DISPATCHED)
+        return 0;
 
     // setuid/setgid
     if (stat.mode & S_ISUID) {

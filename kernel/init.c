@@ -19,6 +19,10 @@
 #include "kernel/task.h"
 #include "util/sync.h"
 
+// See kernel/init.h. Left NULL for the entry points (ptraceomatic, unicornomatic)
+// that boot a bare root and have nothing to set up in it.
+void (*ish_boot_setup_hook)(void) = NULL;
+
 int mount_root(const struct fs_ops *fs, const char *source) {
     char source_realpath[MAX_PATH + 1];
     if (realpath(source, source_realpath) == NULL)

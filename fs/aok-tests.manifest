@@ -189,6 +189,7 @@ dirfd_position.c
 cross_process_state.c
 concurrent_dir_futex.c
 exec_perm_rules.c
+exec_shebang_interpreter.c
 sock_bind_refuse.c
 time_clocks_ticks.c
 futex_robust_requeue.c

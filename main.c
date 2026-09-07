@@ -444,14 +444,17 @@ int main(int argc, char *const argv[]) {
         return 1;
     }
 
+    // Runs inside xX_main_Xx, between mounting the root and exec'ing the
+    // command, rather than after both. See kernel/init.h: doing it afterwards
+    // made every /AOK path (and every /dev node this creates) unreachable to
+    // the one command the CLI was asked to run.
+    ish_boot_setup_hook = setup_host_mounts;
     int err = xX_main_Xx(argc, argv, envp);
     free(envp);
     if (err < 0) {
         fprintf(stderr, "xX_main_Xx: %s\n", strerror(-err));
         return 1;
     }
-
-    setup_host_mounts();
 
     // Dev harness for the LLM-Chat guest-shell tool primitive. With
     // ISH_TEST_GUEST_CMD set, run that command in the guest via

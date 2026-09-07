@@ -19,6 +19,17 @@ intptr_t become_new_init_child(void);
 int create_stdio(const char *file, int major, int minor);
 int create_piped_stdio(void);
 
+// Called by xX_main_Xx once the root is mounted and `current` exists, and
+// BEFORE the initial command is exec'd. NULL by default; main.c points it at
+// its /dev, /proc, /sys and /AOK setup.
+//
+// The CLI used to do that setup after xX_main_Xx returned, which meant the very
+// first exec ran against a root where none of it existed yet -- so `ish -f <root>
+// /AOK/native/bash` answered ENOENT for a program that works from any shell the
+// same run starts. Nothing in the setup needs the exec to have happened, and
+// everything the guest's first program looks for is better there before it runs.
+extern void (*ish_boot_setup_hook)(void);
+
 // Result of run_guest_command_capture(). output is malloc'd and must be freed
 // by the caller (NULL only on allocation failure).
 struct guest_command_result {
