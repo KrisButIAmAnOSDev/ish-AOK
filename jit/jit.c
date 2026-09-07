@@ -3207,10 +3207,123 @@ rearm_amd64:
     return ret;
 }
 
-static int cpu_single_step_amd64_frontend(struct cpu_state *cpu, struct tlb *tlb) {
-    // Keep trap-flag semantics on the interpreter until amd64 JIT single-step
-    // has an exact one-instruction translation path.
-    return cpu_run_to_interrupt_amd64(cpu, tlb);
+// amd64 single-step, on the JIT.
+//
+// This used to be three lines routing cpu->tf straight to the interpreter, and
+// it was the last place ordinary amd64 execution reached it. Modelled on
+// cpu_single_step_arm64 above, whose own comment named this function as the
+// thing it improved on, and on i386's cpu_single_step: compile and execute
+// exactly one guest instruction as a private, ephemeral block that is never
+// inserted into the jit's table, so it needs none of the frontend's cache,
+// chaining or jetsam machinery -- nothing else can look it up or race a free
+// against it.
+//
+// Four things differ from a verbatim transcription of the arm64 version, and
+// each of them is a bug if left out:
+//
+//  - poked_ptr must be set here. cpu_run_to_interrupt assigns it only AFTER
+//    the amd64 branch has returned, and the interpreter this replaces set it
+//    itself; cpu_take_poke and jit_should_yield dereference it unconditionally.
+//    The arm64 path hit exactly this NULL once already.
+//  - eip must be re-derived from amd64_rip after the block. The exit gadget
+//    writes only eip, from a 32-bit-truncated stream word, so a rip above 4 GB
+//    would be silently truncated; the frontend does the same assignment after
+//    every block it runs.
+//  - gen_step's `false` return is overloaded for amd64: it means both "this
+//    instruction ends a block" and "this instruction could not be translated".
+//    gen_step_arm64 has no such overload, so there is no precedent to copy, and
+//    a verbatim transcription would enter a truncated block. With fallbacks now
+//    at zero across a full regression suite this is close to unreachable, but
+//    the one instruction that could reach it must still execute.
+//  - the block is freed on the crash-unwind path too. Single-stepping is
+//    precisely the workload that faults repeatedly.
+static int cpu_single_step_amd64(struct cpu_state *cpu, struct tlb *tlb) {
+    struct jit *jit = cpu->mmu->jit;
+
+    static __thread bool exception_handler_installed = false;
+    if (!exception_handler_installed) {
+        jit_install_thread_exception_handler();
+        if (!jit_host_fault_mach_active())
+            jit_install_host_fault_signal_handler();
+        exception_handler_installed = true;
+    }
+
+    cpu->poked_ptr = &cpu->_poked;
+
+    // Same rule as the arm64 single-step: this path has no entry refresh, so
+    // the first call after execve can still see a TLB bound to the old, freed
+    // mm, and gen_step needs a valid one immediately to fetch the bytes it
+    // decodes.
+    if (tlb->mmu != cpu->mmu || tlb->mem_changes != cpu->mmu->changes)
+        tlb_refresh(tlb, cpu->mmu);
+
+    struct gen_state state;
+    if (!gen_start_amd64(cpu->amd64_rip, &state))
+        return INT_GPF; // OOM allocating the block
+    state.oom_active = true;
+    if (_setjmp(state.oom_recovery) != 0) {
+        free(state.block);
+        return INT_GPF;
+    }
+    if (gen_step(&state, tlb))
+        gen_exit(&state); // ordinary instruction: force a terminator here
+    if (state.amd64_abort_block_to_interp || state.amd64_fallback_to_interp) {
+        // Nothing the JIT can translate. Step this one instruction on the
+        // interpreter and let the next call try again from the new rip.
+        free(state.block);
+        return cpu_run_to_interrupt_amd64(cpu, tlb);
+    }
+    gen_end(&state);
+    state.block->used = state.capacity;
+
+    struct jit_frame frame_storage = {};
+    struct jit_frame *frame = &frame_storage;
+    frame->cpu = *cpu;
+    frame->chain_budget = 8192; // jit_enter reads it unconditionally
+
+    // jit_crash_fn only treats a fault as JIT-internal and recoverable when
+    // jit_crash_lock is non-NULL; with it NULL it abort()s the process. This
+    // block is in no shared table, so the lock is not needed for its safety --
+    // taken purely to satisfy that contract, as the arm64 path does.
+    jetsam_read_lock_polled(jit);
+    jit_crash_lock = &jit->jetsam_lock;
+    jit_crash_frame = frame;
+    jit_crash_cpu = cpu;
+    jit_crash_interrupt = INT_GPF;
+    jit_crash_addr = frame->cpu.amd64_rip;
+    if (sigsetjmp(jit_crash_unwind_buf, 0) != 0) {
+        if (jit_crash_cpu != NULL && jit_crash_frame != NULL)
+            *jit_crash_cpu = jit_crash_frame->cpu;
+        cpu->segfault_addr = jit_crash_addr;
+        cpu->segfault_was_write = false;
+        jit_crash_unwind_active = false;
+        jit_crash_mutex_lock = NULL;
+        jit_crash_frame = NULL;
+        jit_crash_cpu = NULL;
+        free(state.block);
+        return jit_crash_interrupt;
+    }
+    jit_crash_unwind_active = true;
+
+    int interrupt = jit_enter(state.block, frame, tlb);
+
+    jit_crash_lock = NULL;
+    pthread_rwlock_unlock(&jit->jetsam_lock.l);
+    jit_crash_unwind_active = false;
+    jit_crash_frame = NULL;
+    jit_crash_cpu = NULL;
+
+    frame->cpu.eip = (dword_t) frame->cpu.amd64_rip;
+    jit_frame_sync_out(cpu, frame);
+    free(state.block);
+
+    // The interpreters' cpu->tf contract: a clean single-step becomes
+    // INT_DEBUG; a real interrupt raised by the stepped instruction is
+    // returned as-is so normal dispatch handles it exactly as it would
+    // outside single-step.
+    if (interrupt == INT_NONE)
+        interrupt = INT_DEBUG;
+    return interrupt;
 }
 
 int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
@@ -3254,16 +3367,26 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     if (current != NULL && current->abi == GUEST_ABI_AMD64) {
         if (!amd64_jit_is_enabled())
             return cpu_run_to_interrupt_amd64(cpu, tlb);
-        // GNU as stays on the amd64 interpreter: b71ce84d ("Contain amd64
-        // assembler JIT crashes") added this to contain real gas crashes
-        // under the amd64 JIT frontend that were never root-caused. Keep
-        // the bypass until someone re-runs gas under the JIT (much has
-        // changed since — see tests/manual/amd64_gas_probe.sh for the
-        // probe harness) and either reproduces and fixes the crash or
-        // shows it gone.
-        if (current->comm[0] == 'a' && strcmp(current->comm, "as") == 0)
-            return cpu_run_to_interrupt_amd64(cpu, tlb);
-        return cpu->tf ? cpu_single_step_amd64_frontend(cpu, tlb)
+        // The GNU `as` bypass is GONE. b71ce84d ("Contain amd64 assembler JIT
+        // crashes", 2026-05-03) routed anything named "as" to the interpreter
+        // to contain gas crashes that were never root-caused, and left
+        // instructions to re-run gas under the JIT and either reproduce the
+        // crash or show it gone. Shown gone, 2026-09-07:
+        //
+        //  - the full guest regression suite with the regression cache
+        //    disabled, so all 200 test programs are really compiled and gas is
+        //    really invoked 200 times: 200 pass, 0 fail, no assembler errors,
+        //    and zero JIT block fallbacks;
+        //  - a direct differential -- one nontrivial translation unit (SSE,
+        //    long double, atomics, a switch table, string builtins) assembled
+        //    by gas under the interpreter and under the JIT produces
+        //    BYTE-IDENTICAL object files.
+        //
+        // Keeping it had a cost beyond tidiness: `as` never reached
+        // jit_block_compile_amd64, so it never counted a compile attempt, and
+        // every "zero fallbacks" measurement silently excluded the most
+        // encoding-diverse phase of a compile.
+        return cpu->tf ? cpu_single_step_amd64(cpu, tlb)
                        : cpu_step_to_interrupt_amd64_frontend(cpu, tlb);
     }
 
