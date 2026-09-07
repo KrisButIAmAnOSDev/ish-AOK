@@ -30,12 +30,16 @@ place -- the `(exit N) && :` the state script uses to restore `$?`.
 
 **A nonzero `$?` at a subshell boundary costs a second re-launch.** `(exit N)`
 is a subshell, so restoring the status spawns a whole extra native bash.
-Measured on `build/devuan-arm64-test`, 20 iterations:
+Measured on `build/devuan-arm64-test`, 20 iterations, warm and idle (two runs
+each, and take the RATIO rather than the absolutes -- a cold root clone doubles
+both):
 
-| `$?` before `( : )` | wall |
-|---|---|
-| 0 (`true; ( : )`) | 74ms -- 3.7ms a subshell |
-| 1 (`false; ( : )`) | 131ms -- 6.5ms a subshell |
+| `$?` before `( : )` | wall | per subshell |
+|---|---|---|
+| 0 (`true; ( : )`) | 39-42ms | ~2.0ms |
+| 1 (`false; ( : )`) | 72ms | ~3.6ms |
+
+So a failing command before a subshell nearly doubles what the subshell costs.
 
 Nothing in shell sets `$?` to an arbitrary value without a subshell, and it
 cannot move earlier in the script because every later line would overwrite it.

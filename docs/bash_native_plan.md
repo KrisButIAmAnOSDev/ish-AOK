@@ -488,9 +488,13 @@ the first thing to reach for when one misbehaves.
   DEBUG fires on a signal from the parent, and a mechanism that can *swallow* a
   fire is worse for a debugger than one that adds one.
 - **A nonzero `$?` at a subshell boundary costs a second re-launch**, because
-  `(exit N)` in the state script is itself a subshell. Measured: 20 iterations
-  of `true; ( : )` 74ms against `false; ( : )` 131ms — 3.7ms a subshell against
-  6.5ms. Nothing in shell sets `$?` to an arbitrary value without a subshell,
+  `(exit N)` in the state script is itself a subshell. Measured warm and idle,
+  20 iterations of `true; ( : )` ~40ms against `false; ( : )` 72ms — ~2.0ms a
+  subshell against ~3.6ms, so a failing command before a subshell nearly
+  doubles what the subshell costs. (Take the ratio, not the absolutes: the same
+  measurement on a freshly `cp -Rc`'d root, with a cold page cache, reads 74ms
+  against 131ms.) Nothing in shell sets `$?` to an arbitrary value without a
+  subshell,
   so closing this means passing the status to our own bash the way `$$` is
   passed, and applying it in C between the state and the command.
 
