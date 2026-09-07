@@ -1144,10 +1144,11 @@ static int proc_ish_show_mem_guard(struct proc_entry *UNUSED(entry), struct proc
             proc_printf(buf, "  headroom       unmeasured\n");
     }
     proc_printf(buf, "\nsystem memory pressure  %s\n",
-                pressure >= 2 ? "CRITICAL  (growth refused)" :
+                pressure >= 2 ? "CRITICAL  (a large growth is refused while the machine is short)" :
                 pressure >= 1 ? "WARN      (throttle engaged, growth still allowed)" :
                                 "normal");
-    proc_printf(buf, "\ngrowth refused now      %s\n",
+    proc_printf(buf, "\ngrowth refused now      %s  (a LARGE growth; small ones are always allowed,\n"
+                     "                             see mem_growth_refused in kernel/mmap.c)\n",
                 host_mem_headroom_low() ? "YES" : "no");
     proc_printf(buf, "throttle engaged now    %s\n",
                 host_mem_should_reclaim() ? "YES" : "no");

@@ -158,6 +158,7 @@ poll_rdhup_bounds.c
 poll_default_mask.c
 poll_idle_cpu.c
 wake_poke_lost.c
+mem_guard_small_growth.c
 kmsg_stream.c
 resource_limits_sched.c
 signal_routing_perms.c
