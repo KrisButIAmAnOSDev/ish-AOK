@@ -1930,8 +1930,24 @@ static syscall_t arm64_syscall_table[470] = {
     [69] = (syscall_t) sys_preadv_guest, // preadv
     [70] = (syscall_t) sys_pwritev_guest, // pwritev
     [74] = (syscall_t) syscall_stub_silent, // signalfd4
-    [75] = (syscall_t) syscall_stub, // vmsplice
-    [77] = (syscall_t) syscall_stub, // tee
+    // 75 (vmsplice), 76 (splice) and 77 (tee) are NOT listed here: they are
+    // already at the top of this table with their real implementations, and
+    // all three are dispatched by handle_asm_generic_native_syscall, which
+    // runs before the table is ever called. The parity sweep re-listed 75 and
+    // 77 as syscall_stub, and because a later designated initializer wins,
+    // the sweep's entries replaced the real ones.
+    //
+    // That did not break either call -- the dispatcher had already answered
+    // them -- but the table is read for one thing before the dispatcher runs:
+    // syscall_is_logged_stub. So every working vmsplice announced itself as
+    // "arm64 stub syscall 75" at ERROR level, on a guest where log_stub_syscall
+    // does not even rate-limit (its budget only covers abi < 2, and arm64 is 2,
+    // riscv64 3). Measured on an aarch64 guest: tests/manual/splice_vmsplice
+    // passed every transfer check -- 10 bytes gathered, "abc"/"def" scattered
+    // back out -- and logged three of those lines while doing it.
+    //
+    // tee's ENOSYS is sys_tee's own documented decision (AOK pipes are host
+    // pipes, which cannot be read without consuming), not a missing entry.
     [84] = (syscall_t) syscall_stub_silent, // sync_file_range
     [89] = (syscall_t) syscall_stub, // acct
     [104] = (syscall_t) syscall_stub, // kexec_load
