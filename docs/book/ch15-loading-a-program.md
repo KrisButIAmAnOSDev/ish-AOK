@@ -85,11 +85,30 @@ so a script could run an interpreter the caller was not permitted to execute.
 The permission model has to be applied at every place a program is chosen, not
 just the one the user typed.
 
-And not only the permission model. Section 15.5's question — is this a program
-compiled into iSH-AOK? — is a question about a chosen program too, and it went
-unasked here for exactly as long as it took somebody to write
-`#!/AOK/native/bash` at the top of a script. See there for what that silence
-looked like.
+And not only the permission model. *Every* question `execve` asks about a file
+is a question about a chosen program. Two of them were being asked only about
+the file the caller typed.
+
+Section 15.5's — is this a program compiled into iSH-AOK? — went unasked here
+for exactly as long as it took somebody to write `#!/AOK/native/bash` at the top
+of a script. See there for what that silence looked like.
+
+The other is "what if the interpreter is *itself* a `#!` script?" Linux hands
+the exec on again, and again, bounded: `exec_binprm` loops with `if (depth > 5)
+return -ELOOP`, which measures on a real kernel as five rewrites resolved and
+the sixth refused. AOK resolved exactly one and answered `ENOEXEC` past that —
+and `ENOEXEC`, as the previous section's story turns on, is the one exec errno
+no user ever sees. `exec_interpreter` is that loop, written as recursion, with
+Linux's constant and Linux's comparison. The depth is tested *after* the
+interpreter is opened, not before, because Linux opens it inside the handler
+that named it: a chain ending in an interpreter that does not exist answers
+`ENOENT` however deep it is, and a typo in a `#!` line should not be reported as
+a loop.
+
+That is not a hypothetical shape. It is exactly how the placeholder at
+`/AOK/native/<name>` — a `#!/bin/sh` script whose whole job is to say that
+native dispatch did not happen — gets to say it when a script names a copy of
+it as its interpreter.
 
 **An ELF image.** `elf_exec` maps the segments, and if the image names an
 interpreter — which every dynamically linked program does — maps that too and
