@@ -97,7 +97,22 @@ static void run_trial(int trial, unsigned *stuck) {
     int stuck_this_trial = 0;
     int status = 0;
     if (sigsetjmp(watchdog_jmp, 1) == 0) {
-        alarm(WATCHDOG_SECONDS);
+        // Scaled, like every other watchdog in the suite. It was a raw
+        // alarm(10) -- the one watchdog here that ignored
+        // ISH_TEST_WATCHDOG_SCALE, which exists for exactly this. A trial is 24
+        // backgrounded subshells that each sleep 1 and then exit, and on slow
+        // hardware a trial that is merely slow and one that is genuinely wedged
+        // look identical to a fixed alarm. The default is unchanged (scale 1 ->
+        // 10s), so this masks nothing; it gives a slow device the knob.
+        //
+        // OPEN, 2026-09-08: an A9 iPad running this suite for the first time
+        // reported 2 stuck of 25 trials, which is exactly the failure threshold
+        // -- not the ~50% an actually-broken build shows, and not the 0% an M4
+        // iPad Pro gives three runs running. Never resolved: the device went
+        // away before the deciding measurement (time a trial, then re-run with
+        // a 60s watchdog -- a wedged shell never finishes however long you
+        // wait, so 0/25 at 60s would settle it as slowness).
+        alarm(test_watchdog_secs(WATCHDOG_SECONDS));
         pid_t r = waitpid(child, &status, 0);
         alarm(0);
         if (r != child) {
