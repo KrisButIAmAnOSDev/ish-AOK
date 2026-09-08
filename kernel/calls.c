@@ -6599,11 +6599,40 @@ void handle_interrupt(int interrupt) {
             // and kill rather than leave it pending while the brk
             // re-executes forever. send_signal is the kill()-style path
             // without that semantic.
-            deliver_signal(current, SIGTRAP_, (struct siginfo_) {
-                .sig = SIGTRAP_,
-                .code = TRAP_BRKPT_,
-                .fault.addr = current_fault_ip(cpu),
-            });
+            //
+            // The siginfo is ARCHITECTURE-DEPENDENT, and getting it wrong made
+            // gdb unusable on the x86 guests (GH #503).
+            //
+            // x86: exc_int3 calls do_trap with sicode 0, and do_trap's
+            // `if (!sicode) force_sig(signr)` produces a BARE signal -- si_code
+            // SI_KERNEL, si_addr zero. gdb's linux-nat save_stop_reason only
+            // calls a SIGTRAP its own software breakpoint when si_code says so,
+            // and only then rewinds the PC by one and restores the original
+            // instruction byte. With TRAP_BRKPT instead it treats the stop as a
+            // "random signal", leaves the PC one byte past the int3, and
+            // resumes into the middle of the clobbered instruction -- which is
+            // where the SIGILL and SIGSEGV in that report came from.
+            //
+            // arm64's BRK (brk_handler -> send_user_sigtrap) and riscv64's
+            // EBREAK (do_trap_break) DO use force_sig_fault, so they keep
+            // TRAP_BRKPT and the faulting PC. Same interrupt, different answer.
+            //
+            // MEASURED on Linux 6.12/x86_64, both -m32 and -m64:
+            //     si_signo=5 si_code=128 si_addr=(nil)
+            {
+                bool x86_guest = current->abi == GUEST_ABI_I386 ||
+                                 current->abi == GUEST_ABI_AMD64;
+                deliver_signal(current, SIGTRAP_, x86_guest ?
+                    (struct siginfo_) {
+                        .sig = SIGTRAP_,
+                        .code = SI_KERNEL_,
+                    } :
+                    (struct siginfo_) {
+                        .sig = SIGTRAP_,
+                        .code = TRAP_BRKPT_,
+                        .fault.addr = current_fault_ip(cpu),
+                    });
+            }
             break;
         case INT_DEBUG:
             deliver_signal(current, SIGTRAP_, (struct siginfo_) {

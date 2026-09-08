@@ -44,6 +44,7 @@ futex_core.c
 process_lifecycle.c
 pthread_sync.c
 ptrace_group_stop.c
+ptrace_trap_siginfo.c
 ptrace_thread_follow.c
 epoll_mod_wake.c
 epoll_oneshot_rearm.c

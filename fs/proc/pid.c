@@ -1264,7 +1264,13 @@ static ssize_t proc_pid_mem_pread(struct proc_entry *entry, struct proc_data *bu
     int result = user_read_task_mem(task, &mm->mem, (guest_addr_t)offset, buf->data, buf->size);
     mm_release(mm);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    // An address the target has not mapped is an I/O error, not a permission
+    // one -- mem_rw's access_remote_vm failure returns -EIO. The bare -1 this
+    // used to return is _EPERM, which reads as "you may not do this at all"
+    // and is what gdb reported when it probed an unmapped address.
+    // MEASURED on x86_64 Linux 6.12: pread of an unmapped address through
+    // /proc/<pid>/task/<tid>/mem gives EIO, at address 0 too.
+    return result ? _EIO : (ssize_t) buf->size;
 }
 
 static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *buf, off_t offset) {
@@ -1286,7 +1292,8 @@ static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *b
     int result = user_write_task_ptrace_mem(task, &mm->mem, (guest_addr_t)offset, buf->data, buf->size);
     mm_release(mm);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    // See the read side: EIO, not the bare -1 that means EPERM.
+    return result ? _EIO : (ssize_t) buf->size;
 }
 
 
