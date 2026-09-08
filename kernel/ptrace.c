@@ -45,6 +45,21 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         child->ptrace.tracer = NULL;
         child->ptrace.options = 0;
         child->ptrace.sysgood = false;
+        // Not previously cleared. A later PTRACE_ATTACH of the same task would
+        // otherwise inherit it and have its group-stops reported as seize-style
+        // event-stops to a tracer that never seized anything.
+        child->ptrace.seized = false;
+        // Any interrupt trap this tracer queued and the tracee never consumed
+        // is ours to take back -- once untraced it is a plain SIGTRAP, and
+        // SIGTRAP's default action kills the program.
+        //
+        // This runs BEFORE the notify below, and under ptrace.lock, because the
+        // tracee is parked in ptrace_stop_common's loop holding that same lock:
+        // the moment it is released the tracee is free to return to
+        // receive_signals and take the trap, and by then it is untraced.
+        // ptrace.lock -> sighand->lock is the order ptrace_stop_common already
+        // uses, so taking sighand's lock from here is safe.
+        ptrace_discard_interrupt_traps(child);
     }
     notify(&child->ptrace.cond);
     unlock(&child->ptrace.lock);
@@ -613,6 +628,14 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
     if (syscall_stop && current->ptrace.sysgood)
         current->ptrace.signal |= 0x80;
     current->ptrace.info = *info;
+    // SI_PTRACE_INTERRUPT_ is a marker for the detach path, not a value any
+    // tracer should ever read back through PTRACE_GETSIGINFO. Report what Linux
+    // reports for the stop this actually is -- an event-stop's si_code is
+    // (event << 8) | SIGTRAP, the same expression ptrace_event_stop uses. That
+    // also corrects the value: this stop previously carried si_code 0, because
+    // the interrupt was sent with SIGINFO_NIL.
+    if (current->ptrace.info.code == SI_PTRACE_INTERRUPT_)
+        current->ptrace.info.code = (current->ptrace.trap_event << 8) | SIGTRAP_;
     unlock(&current->ptrace.lock);
 
     tracer = ptrace_tracer(current);
@@ -987,7 +1010,14 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
                 child->ptrace.trap_event = PTRACE_EVENT_STOP_;
                 child->ptrace.eventmsg = 0;
                 unlock(&child->ptrace.lock);
-                send_signal(child, SIGTRAP_, SIGINFO_NIL);
+                // Tagged so a detach before the tracee consumes it can take it
+                // back rather than leave a fatal signal behind -- an untraced
+                // process treats SIGTRAP as terminate. See task.h's note above
+                // struct siginfo_ info, and ptrace_discard_interrupt_traps.
+                struct siginfo_ trap_info = SIGINFO_NIL;
+                trap_info.sig = SIGTRAP_;
+                trap_info.code = SI_PTRACE_INTERRUPT_;
+                send_signal(child, SIGTRAP_, trap_info);
             } else {
                 unlock(&child->ptrace.lock);
             }

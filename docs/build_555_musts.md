@@ -14,6 +14,10 @@ a diagnosis that does not reproduce at all. That is a 40% staleness rate on a
 six-day-old document, and it is the reason every entry below was re-measured
 before being carried rather than copied forward.
 
+That re-measurement paid for itself the same day: §1 was carried for two
+releases as an unbounded "the debugging tools do not work", and once measured
+it was one line in `PTRACE_INTERRUPT` and is now fixed.
+
 The release's **theme** is in [docs/roadmap.md](roadmap.md) and it is
 persistence. This document is the other half: the work that has to happen
 around it.
@@ -29,8 +33,10 @@ is precisely the work a functioning `strace` and `gdb` make cheap and an absent
 one makes archaeology. So:
 
 1. **The debugging tools** (§1 below). It is a prerequisite for the headline,
-   not a parallel track, and the re-measurement below has already made it a much
-   smaller job than the carried entry suggested.
+   not a parallel track. **Done 2026-09-08** -- the re-measurement found the
+   carried diagnosis wrong, and the real cause turned out to be one line in
+   `PTRACE_INTERRUPT`. `strace -p` no longer kills what it attaches to. What is
+   left of it is listed there and is smaller than what closed.
 2. **OS snapshot** — roadmap. The cheaper and more certain of the two
    persistence items, and it lands #575 on the way past.
 3. **Suspend to disk phase 0** — roadmap, and *a gate*. Publish the fd
@@ -45,91 +51,126 @@ right things to pick up when a headline item is blocked on a device run.
 
 ---
 
-## 1. A clean ptrace detach kills the tracee
+## 1. A clean ptrace detach killed the tracee — FIXED 2026-09-08
 
-**This replaces the carried entry "strace and gdb kill the process they attach
-to", whose diagnosis does not reproduce.** That entry said the cause was
-"a wait after attaching to a non-leader thread resolves to the wrong task". It
-is not, and the symptom is not about non-leader threads either.
+**Closed the day this document was written**, and kept here in full rather than
+moved out, because what it took to find is the reusable part: two of the three
+diagnoses on the way to it were wrong, and each was wrong in a way that looked
+like an answer.
 
-**Established, measured 2026-09-08** on `build/alpine-arm64-test`, with the same
-script run against the Devuan 6 / Linux 6.12 oracle:
+**The carried entry was wrong.** `docs/historical/build_554_musts.md` said
+`strace` and `gdb` "kill the thread they attach to", because threads here are
+children of their creator so a wait after attaching to a non-leader resolves to
+the wrong task. A probe doing `PTRACE_ATTACH(tid)` then `waitpid(-1, __WALL)`
+returns the thread's own tid with status `0x137f`, byte-identical to the oracle.
+That mechanism was fixed by the `__WALL` work in `do_wait` that shipped for
+`strace -f`, and nobody noticed it had closed this entry's stated cause.
 
-| case | AOK | Linux |
+**The symptom was real.** Measured on `build/alpine-arm64-test` against Devuan 6
+/ Linux 6.12, running `strace` against a two-thread process:
+
+| case | AOK before | Linux |
 |---|---|---|
-| `strace -p <non-leader tid>`, SIGINT to make it detach | target **DEAD** | alive |
-| `strace -p <leader>` of a multithreaded process, SIGINT | target **DEAD** | alive |
-| `strace -f -p <leader>`, SIGINT | target **DEAD** | alive |
-| `strace -p <non-leader tid>`, tracer **SIGKILLed** | target ALIVE | alive |
+| `strace -p <non-leader tid>`, SIGINT to detach | target **DEAD** | alive |
+| `strace -p <leader>`, SIGINT to detach | target **DEAD** | alive |
+| `strace -f -p <leader>`, SIGINT to detach | target **DEAD** | alive |
+| `strace -p <non-leader tid>`, tracer SIGKILLed | target alive | alive |
 
-Four things follow, and each narrows the search:
+**The second wrong diagnosis was "the explicit detach path".** It is the obvious
+read of that table — the surviving case is the one that never detaches — and
+`PTRACE_DETACH` does have a real defect beside it (it never unlinks
+`ptrace_siblings`; only kernel/exit.c does). But a test covering all eight
+attach/detach shapes passed every one. **Not reproducing is data**: it meant the
+difference was something `strace` does that a minimal detach does not.
 
-- **It is not about non-leader threads.** Tracing the group leader kills it too.
-- **It is not the attach, and it is not the tracing.** The target was checked
-  alive mid-trace in every case, and `strace -c` produced a correct profile —
-  260 `nanosleep` calls counted, "Process N attached" and "Process N detached"
-  both printed. The trace works.
-- **It is the detach.** The one case that survives is the one where the tracer
-  is SIGKILLed and never detaches. AOK's *implicit* detach-on-tracer-death path
-  (`ptrace_detach_from_tracer`, kernel/exit.c:194) is correct; the *explicit*
-  `PTRACE_DETACH` path is not.
-- **And it is not plain `PTRACE_ATTACH` + `PTRACE_DETACH`**, which a C probe
-  runs cleanly against both a thread and a leader with the target surviving. So
-  the fault is in what `strace` does that the probe does not: `PTRACE_SEIZE`,
-  `PTRACE_INTERRUPT`, `PTRACE_SETOPTIONS`, or the detach of an
-  interrupt-stopped tracee.
+**What it actually was.** The shell can say how a process died, and it said
+**133 — that is 128 + 5, SIGTRAP.** `PTRACE_INTERRUPT` was implemented by
+sending a real SIGTRAP to the tracee (kernel/ptrace.c). While the task is traced
+that signal never reaches the program: `signal_delivery_stop` intercepts it and
+reports the stop, which is why it worked at all. The moment the tracer detaches
+it is an ordinary SIGTRAP again, and SIGTRAP's default action is to terminate.
 
-**One structural difference is already visible and is the first thing to look
-at.** `PTRACE_DETACH_` (kernel/ptrace.c:1139) calls
-`ptrace_resume_child_locked(child, sig, false, false, true)`, which clears
-`traced`/`tracer`/`options` — and **never removes the tracee from the tracer's
-`ptracees` list**. `list_add(&tracer->ptracees, ...)` happens at
-kernel/ptrace.c:111 and 780; there is no matching `list_remove` anywhere in
-`kernel/ptrace.c`. Only the exit-time path removes it
-(`list_remove_safe(&tracee->ptrace_siblings)`, kernel/exit.c:218) — which is
-exactly the path that does **not** kill the target. So after a clean detach the
-tracer still lists a task it no longer traces, and `do_wait`'s ptracees loop
-(kernel/exit.c) and `do_exit`'s ptracees sweep (kernel/exit.c:615) both still
-walk it.
+`strace`'s detach interrupts a *running* tracee and then waits — and a program
+making a syscall every few milliseconds reaches a syscall-stop of its own first.
+So strace saw the stop it wanted, detached, and left the interrupt's SIGTRAP
+sitting in the queue with nothing left to intercept it. Linux has no such
+window: its interrupt is `JOBCTL_TRAP_STOP`, a flag rather than a signal, and
+`__ptrace_unlink` clears it on detach.
 
-**A second, separate bug found on the way, and it is the gdb one.**
-`waitpid(<tid>, ..., __WALL)` on a traced non-leader thread does not return —
-`waitpid(-1, ..., __WALL)` on the same stop returns the right tid immediately
-(status `0x137f`, byte-identical to the oracle). `do_wait`'s `P_PID_` branch
-admits the thread (`id_is_thread && traced_by_us`) and then does
-`task = task->group->leader;` before testing for a stop, so it inspects the
-leader's state and the thread's ptrace-stop is never seen. gdb's
-`linux_nat_post_attach_wait` waits on the specific pid it attached to, which is
-this path.
+**The fix.** Three parts, in `kernel/ptrace.c`, `kernel/signal.c` and
+`kernel/exit.c`:
 
-**Next step.** Three, in order, and the first two are cheap:
+- `PTRACE_INTERRUPT` stamps its SIGTRAP with `SI_PTRACE_INTERRUPT_`, a si_code
+  outside anything a guest can produce.
+- `ptrace_discard_interrupt_traps` drops exactly those traps, and runs on both
+  detach paths — the explicit one and the tracer-death sweep — under
+  `ptrace.lock` and *before* the notify, because the tracee is parked holding
+  that same lock and is free to take the trap the instant it is released.
+- Identified by tag rather than by a count kept alongside the send. A count was
+  written first and was wrong: `send_signal` drops the signal instead of
+  queueing it when SIGTRAP is `SIG_IGN` or the task is exiting, so the count
+  would over-run and eat the next SIGTRAP the guest raised for itself.
+- The tag is normalised away in `ptrace_stop_common` before the stop is
+  published, so no tracer can read it back through `PTRACE_GETSIGINFO`. That
+  also *corrects* the value: an interrupt-stop's si_code was 0, because the
+  interrupt was sent with `SIGINFO_NIL`, where Linux reports
+  `(event << 8) | SIGTRAP`.
 
-1. Bisect the strace detach sequence with a C probe — `SEIZE` alone, then
-   `SEIZE`+`INTERRUPT`, then each with `SETOPTIONS` — until one of them turns
-   `ALIVE` into `DEAD`. (`tests/manual/` has `ptrace_attach.c`,
-   `ptrace_group_stop.c` and `ptrace_thread_follow.c` to build from.) Use
-   `sigaction` without `SA_RESTART` for the probe's alarm, or a hung case blocks
-   the whole probe instead of reporting.
-2. Fix the `P_PID_` thread resolution in `do_wait`: a traced non-leader must be
-   tested for a ptrace-stop as itself, not through `task->group->leader`.
-3. Make `PTRACE_DETACH` unlink `ptrace_siblings` the way the exit path does,
-   and re-measure. This may be the whole bug or merely a real defect beside it;
-   both are worth closing.
+Two things were repaired in passing: `ptrace.seized` was never cleared on
+detach, so a later `PTRACE_ATTACH` of the same task inherited it and had its
+group-stops reported as seize-style event-stops to a tracer that never seized;
+and `do_wait`'s `P_PID_` branch resolved a traced non-leader to
+`task->group->leader` before testing for a stop, so `waitpid(<tid>, __WALL)`
+**hung** where `waitpid(-1, __WALL)` returned correctly. That second one is the
+gdb half: `linux_nat_post_attach_wait` waits on the pid it just attached to.
 
-**Prove it.** A `tests/manual` test — the natural name is
-`ptrace_detach_survives` — that attaches to a thread and to a leader, by
-`ATTACH` and by `SEIZE`+`INTERRUPT`, detaches cleanly each time, and requires
-the target alive afterwards; plus `waitpid(<tid>, __WALL)` returning that tid.
-Then the tools themselves: `strace -p <tid>` for ten seconds followed by a clean
-detach leaves the target running, and `gdb -p <tid>` on a live multithreaded
-guest process prints a backtrace and detaches with the process still running.
+**Proved.** `tests/manual/ptrace_detach_survives.c`, registered in all three
+places, covers eight attach/detach shapes, the interrupt-unconsumed shape that
+actually reproduced it, and the tracer-death shape that always worked and must
+keep working. 10/10 on the Linux oracle first — where the first draft's expected
+stop status was refused for all four SEIZE cases, because a seized tracee's
+interrupt-stop is `PTRACE_EVENT_STOP`, not a SIGSTOP delivery-stop — then 10/10
+in the guest. The four real `strace` scenarios all leave the target alive, and
+`ptrace_attach`, `ptrace_group_stop`, `ptrace_thread_follow`, `ptrace_exit_kill`,
+`ptrace_trap_siginfo`, `native_ptrace_group_stop`, `ptrace_singlestep`,
+`signal_core`, `signal_stop_cont`, `signal_forced_trap`, `process_lifecycle` and
+`orphan_pgrp_wait` all still pass. Beyond the ptrace set: the **full arm64 guest
+suite, 201 PASS / 0 FAIL**, and the ptrace group again on `devuan-amd64-test`
+(x86_64 glibc, 9/9) because the change is in shared kernel code and only the
+emulator underneath it differs.
 
-**Why this is first.** [#503](https://github.com/emkey1/ish-AOK/issues/503) is
-closed and riscv64 single-step is fixed, so the debugger works right up until
-you let go of it. Every diagnosis in this cycle — the fd inventory above all —
-is done with the tools or without them.
+**What is left, and it is smaller than what closed.**
 
----
+- **`PTRACE_INTERRUPT` should not use a signal at all.** The tag makes the
+  detach safe; it does not make the mechanism right. A tracee with SIGTRAP set
+  to `SIG_IGN` is never interrupted, because `send_signal` drops the signal and
+  nothing stops — a silent no-op where Linux stops the task. The real shape is
+  a per-task flag the interruptible-wait path notices, like Linux's jobctl bit.
+  Contained, and now the only thing standing between this and correct.
+- **`PTRACE_DETACH` still does not unlink `ptrace_siblings`.** Found while
+  chasing this and left alone deliberately: it is not what killed anything, and
+  changing list membership under the detach path deserved its own change rather
+  than riding along with a fix that was already three files wide.
+- ~~`gdb -p` end to end has not been re-run.~~ **Done, and it works.** `gdb -q
+  -p <non-leader tid> -batch -ex bt -ex 'info threads' -ex detach` on a live
+  guest process prints a full symbolic backtrace -- through musl's
+  `__syscall_cp_asm`, `__clock_nanosleep` and `usleep` into the program's own
+  function -- detaches with rc 0, and leaves the process running. Attaching to
+  the leader instead reports `[New LWP <tid>]`, so it finds the second thread
+  too. No `linux_nat_post_attach_wait` assertion. (`gdb` is not in the stock
+  test root; `apk add gdb` first.)
+
+**So the tools work.** `strace -p`, `strace -f -p` and `gdb -p` all attach,
+report, detach, and leave the target running -- which was the whole point of
+putting this first, and the roadmap's claim that it was worth more than its
+place in the list held up.
+
+**Two lessons worth keeping.** *A test that does not reproduce the bug is
+telling you which shapes are innocent* — eight passing cases is what turned
+"the detach path" into "something strace does that this does not". And *ask the
+corpse how it died*: one `wait $!` reporting 133 replaced a whole afternoon of
+reading ptrace code, and it was available from the first hour.
+
 
 ## 2. `lock not` and `lock neg` are SIGILL on an i386 guest
 

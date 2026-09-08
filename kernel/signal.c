@@ -900,6 +900,39 @@ static bool signal_still_pending_locked(struct task *task, int sig) {
     return signal_list_still_has_locked(&task->queue, sig);
 }
 
+// Take back the SIGTRAPs PTRACE_INTERRUPT queued and the tracee never consumed.
+//
+// Called from the detach paths only -- explicit PTRACE_DETACH, and the
+// tracer-death sweep in kernel/exit.c. A ptrace-interrupt trap is a stop
+// request, not a signal the program is entitled to see, so it must not outlive
+// the tracing relationship that created it: unconsumed, it is delivered to a
+// now-untraced process, and SIGTRAP's default action is to terminate. Linux
+// never has one to discard (its interrupt is JOBCTL_TRAP_STOP, a flag), so this
+// is the AOK-specific half of __ptrace_unlink's task_clear_jobctl_pending.
+//
+// Identified by si_code rather than counted. A count kept alongside the send
+// would over-count whenever send_signal drops the signal instead of queueing it
+// -- SIGTRAP set to SIG_IGN, a task already exiting -- and an over-count eats
+// the next SIGTRAP the guest raises for itself. The tag cannot be wrong in
+// either direction: it is on exactly the traps this mechanism queued.
+void ptrace_discard_interrupt_traps(struct task *task) {
+    struct sighand *sighand = task->sighand;
+    if (sighand == NULL)
+        return;
+    lock(&sighand->lock, 0);
+    struct sigqueue *sigqueue, *tmp;
+    list_for_each_entry_safe(&task->queue, sigqueue, tmp, queue) {
+        if (sigqueue->info.sig != SIGTRAP_ ||
+                sigqueue->info.code != SI_PTRACE_INTERRUPT_)
+            continue;
+        list_remove(&sigqueue->queue);
+        free(sigqueue);
+    }
+    if (!signal_still_pending_locked(task, SIGTRAP_))
+        sigset_del(&task->pending, SIGTRAP_);
+    unlock(&sighand->lock);
+}
+
 // Scans both `task`'s own (thread-directed) queue and, if present, its
 // sighand's shared (process-directed) queue -- a signalfd/sigwaitinfo/
 // receive_signals caller must see process-directed signals (e.g. SIGCHLD to a

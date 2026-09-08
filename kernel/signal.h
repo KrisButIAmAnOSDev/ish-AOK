@@ -75,6 +75,15 @@ struct sigaction_ {
 #define SI_TKILL_ -6
 #define SI_KERNEL_ 128
 
+// Internal, never reported to a guest: the si_code AOK stamps on the SIGTRAP
+// that PTRACE_INTERRUPT queues, so the detach path can tell that trap apart
+// from one the program raised for itself and discard only its own. Chosen
+// outside the range any guest-reachable path produces -- kill/tkill give
+// SI_USER/SI_TKILL, sigqueue gives SI_QUEUE, and a real trap gives TRAP_BRKPT
+// or TRAP_TRACE -- so no guest signal can ever be mistaken for one of these.
+// See kernel/ptrace.c's PTRACE_INTERRUPT and ptrace_discard_interrupt_traps.
+#define SI_PTRACE_INTERRUPT_ 0x1507
+
 // SIGCHLD si_code values (CLD_*). Linux reports these to a SA_SIGINFO SIGCHLD
 // handler and to waitid(2), with si_status carrying the *bare* exit code or
 // signal number (not the wait(2)-encoded status word).
@@ -204,6 +213,10 @@ struct sigevent_ {
 void send_signal(struct task *task, int sig, struct siginfo_ info);
 // send a signal without regard for whether the signal is blocked or ignored
 void deliver_signal(struct task *task, int sig, struct siginfo_ info);
+// Discard the unconsumed SIGTRAPs that PTRACE_INTERRUPT queued to this task,
+// identified by SI_PTRACE_INTERRUPT_. Called on detach: see the definition in
+// signal.c for why an interrupt trap must not outlive the tracing relationship.
+void ptrace_discard_interrupt_traps(struct task *task);
 // true when the next unblocked pending signal would run a handler with SA_RESTART
 bool signal_should_restart_syscall(void);
 bool signal_should_restart_syscall_nohand(void);

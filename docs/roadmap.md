@@ -274,23 +274,27 @@ Work that fills the space between the items above. None of it is scheduled to a
 release; all of it is ready to pick up, and the conformance items in particular
 are what the release-run regression sweeps keep landing on.
 
-**The debugging tools do not work on this kernel, and that taxes everything
-else.** This entry said `strace` and `gdb` kill *the thread they attach to*,
-because threads here are children of their creator rather than of the leader's
-parent, so a wait after attaching to a non-leader resolves to the wrong task.
-**Re-measured 2026-09-08, and that is not the bug.** The attach is fine and the
-tracing is fine; the *clean detach* kills the target, and it does so whether the
-target is a thread or a group leader -- while a tracer that is SIGKILLed and
-never detaches leaves it alive. Separately, `waitpid(<tid>, __WALL)` on a traced
-non-leader hangs where `waitpid(-1, __WALL)` returns correctly. Both are in
-[docs/build_555_musts.md](build_555_musts.md) with the measurements, and
-[#503](https://github.com/emkey1/ish-AOK/issues/503) -- the amd64 cousin -- is
-now closed. The cost is not the bug, it is that every future diagnosis is done
-without the two tools that would answer it fastest -- the swap investigation had
-to settle a CPU-spin question from `/proc/<pid>/io` counters for exactly this
-reason. **This is the item most likely to be worth more than its place in the
-list**, and 555 promotes it out of this section: it is the prerequisite for the
-suspend-to-disk inventory, not a parallel track.
+**The debugging tools now work, and that was the highest-value item on this
+list.** ~~`strace` and `gdb` kill the thread they attach to~~ -- **fixed
+2026-09-08**, and the entry was wrong in an instructive way. It was not about
+non-leader threads, and it was not the attach or the tracing: `PTRACE_INTERRUPT`
+sent the tracee a real SIGTRAP, which the ptrace machinery intercepts while the
+task is traced and which becomes an ordinary fatal signal the instant it is not.
+`strace`'s detach interrupts a running tracee and then usually sees that
+tracee's own syscall-stop first, so it detached leaving the trap queued. Two
+smaller bugs went with it: `waitpid(<tid>, __WALL)` on a traced non-leader hung
+(the gdb half), and `ptrace.seized` was never cleared on detach. The
+measurements, the two wrong diagnoses on the way, and what is still open are in
+[docs/build_555_musts.md](build_555_musts.md) §1;
+[#503](https://github.com/emkey1/ish-AOK/issues/503) -- the amd64 cousin -- and
+[#541](https://github.com/emkey1/ish-AOK/issues/541) are both closed.
+
+That this sat for two releases as an unbounded "the tools do not work", and
+turned out to be one line once anyone measured it, is the argument for measuring
+a carried entry before carrying it again. The cost was never the bug: it was
+that every diagnosis in between was made without the two tools that would have
+answered it fastest -- the swap investigation settled a CPU-spin question from
+`/proc/<pid>/io` counters for exactly this reason.
 
 **The conformance long tail**, all in TODO.md with measurements: `PROT_EXEC` is
 never enforced, so guest W^X is decorative -- a contained project with two

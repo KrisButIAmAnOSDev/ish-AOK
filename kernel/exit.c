@@ -208,6 +208,12 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
         tracee->ptrace.signal = 0;
         tracee->ptrace.trap_event = 0;
         tracee->ptrace.eventmsg = 0;
+        tracee->ptrace.seized = false;
+        // Same reason as the explicit PTRACE_DETACH path: an unconsumed
+        // PTRACE_INTERRUPT trap is a stop request, and once this task is
+        // untraced it is a fatal SIGTRAP instead. A tracer that dies between
+        // interrupting a tracee and seeing the stop must not kill it.
+        ptrace_discard_interrupt_traps(tracee);
         if (tracee->ptrace.stopped) {
             tracee->ptrace.stopped = false;
             notify(&tracee->ptrace.cond);
@@ -1075,9 +1081,22 @@ retry:
             err = _ECHILD;
             goto error;
         }
-        task = task->group->leader;
+        // A traced thread's ptrace-stop belongs to THAT THREAD, so it must be
+        // asked about itself. Resolving to the leader first and testing the
+        // leader's ptrace state meant `waitpid(<tid>, ..., __WALL)` never
+        // returned: the thread was stopped, the leader was not, and the wait
+        // slept forever on child_exit. `waitpid(-1, ..., __WALL)` found the
+        // same stop immediately, via the ptracees loop above -- so the tracer
+        // that waits on -1 (strace) worked and the tracer that waits on the
+        // pid it just attached to (gdb's linux_nat_post_attach_wait) hung.
+        // Measured by tests/manual/ptrace_detach_survives.c, which failed
+        // exactly the two wait-by-tid cases and passed the six others.
+        //
+        // The zombie/stop reap below still goes through the leader: a thread
+        // is not reaped as a process here, and reap_if_needed asserts as much.
+        struct task *leader = task->group->leader;
         info->child.pid = id;
-        bool is_child = task->parent != NULL && task->parent->group == current->group;
+        bool is_child = leader->parent != NULL && leader->parent->group == current->group;
         bool is_ptrace_child = task->ptrace.tracer != NULL && task->ptrace.tracer->group == current->group;
         if (!is_child && !is_ptrace_child)
             goto error;
@@ -1085,7 +1104,7 @@ retry:
             info->sig = SIGCHLD_;
             goto found_something;
         }
-        if (reap_if_needed(task, info, rusage, options))
+        if (reap_if_needed(leader, info, rusage, options))
             goto found_something;
     }
 
