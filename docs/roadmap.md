@@ -275,15 +275,22 @@ release; all of it is ready to pick up, and the conformance items in particular
 are what the release-run regression sweeps keep landing on.
 
 **The debugging tools do not work on this kernel, and that taxes everything
-else.** `strace` and `gdb` kill the thread they attach to, because threads here
-are children of their creator rather than of the leader's parent, so a wait
-after attaching to a non-leader resolves to the wrong task. That is in
-`build_554_musts.md`, and [#503](https://github.com/emkey1/ish-AOK/issues/503)
-is its amd64 cousin. The cost is not the bug, it is that every future diagnosis
-is done without the two tools that would answer it fastest -- the swap
-investigation had to settle a CPU-spin question from `/proc/<pid>/io` counters
-for exactly this reason. **This is the item most likely to be worth more than
-its place in the list.**
+else.** This entry said `strace` and `gdb` kill *the thread they attach to*,
+because threads here are children of their creator rather than of the leader's
+parent, so a wait after attaching to a non-leader resolves to the wrong task.
+**Re-measured 2026-09-08, and that is not the bug.** The attach is fine and the
+tracing is fine; the *clean detach* kills the target, and it does so whether the
+target is a thread or a group leader -- while a tracer that is SIGKILLed and
+never detaches leaves it alive. Separately, `waitpid(<tid>, __WALL)` on a traced
+non-leader hangs where `waitpid(-1, __WALL)` returns correctly. Both are in
+[docs/build_555_musts.md](build_555_musts.md) with the measurements, and
+[#503](https://github.com/emkey1/ish-AOK/issues/503) -- the amd64 cousin -- is
+now closed. The cost is not the bug, it is that every future diagnosis is done
+without the two tools that would answer it fastest -- the swap investigation had
+to settle a CPU-spin question from `/proc/<pid>/io` counters for exactly this
+reason. **This is the item most likely to be worth more than its place in the
+list**, and 555 promotes it out of this section: it is the prerequisite for the
+suspend-to-disk inventory, not a parallel track.
 
 **The conformance long tail**, all in TODO.md with measurements: `PROT_EXEC` is
 never enforced, so guest W^X is decorative -- a contained project with two

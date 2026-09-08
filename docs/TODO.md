@@ -608,11 +608,11 @@ loop itself, which is a separate question from the fallbacks.
 
 ## Reported issues
 
-Checked against GitHub on 2026-09-07: 18 open. The previous version of this
-table listed #541 and #542 as fixed while #541 was still open upstream, and was
-missing eight issues filed since. **Closing the issue is part of fixing the
-bug** -- a fix recorded here and not there is a fix the reporter never learns
-about.
+Checked against GitHub on 2026-09-08: **17 open**, down one because
+[#503](https://github.com/emkey1/ish-AOK/issues/503) closed with the breakpoint
+`si_code` fix. **Closing the issue is part of fixing the bug** -- a fix recorded
+here and not there is a fix the reporter never learns about, and #541 is still
+proving that point.
 
 ### Bugs
 
@@ -620,11 +620,10 @@ about.
 |---|---|---|
 | [#482](https://github.com/emkey1/ish-AOK/issues/482) | Wayland applet does not resize properly | body is a screenshot only. Very likely the same root cause as #483's second half -- confirm before treating them as two jobs |
 | [#485](https://github.com/emkey1/ish-AOK/issues/485) | Qt apps (Falkon) cannot connect to session bus | 6 comments |
-| [#503](https://github.com/emkey1/ish-AOK/issues/503) | amd64: gdb next/step after a breakpoint crashes with SIGILL | ours. Related to the strace/gdb entry in `build_554_musts.md`: both tools are unreliable against this kernel, and that costs every later diagnosis |
 | [#521](https://github.com/emkey1/ish-AOK/issues/521) | Buildroot `make` crashes on "checking for working sigaltstack" | body is a screenshot only |
 | [#523](https://github.com/emkey1/ish-AOK/issues/523) | yay (AUR helper) fails on Arch ARM64 | **reported symptom does not reproduce** -- see *Diagnosed* above. What does reproduce is a TLS handshake tail of 15.3 s against a sub-second median, which is a wait not being woken rather than slow work |
 | [#527](https://github.com/emkey1/ish-AOK/issues/527) | pikaur fails on Arch ARM64 | blocked on `systemd-run` |
-| [#541](https://github.com/emkey1/ish-AOK/issues/541) | ptraceomatic does not run: tracee reaped during setup | **fixed 2026-08-20**, and still open on GitHub. Close it |
+| [#541](https://github.com/emkey1/ish-AOK/issues/541) | ptraceomatic does not run: tracee reaped during setup | **fixed 2026-08-20**, and still open on GitHub as of 2026-09-08. Close it -- see `docs/build_555_musts.md` §8, and re-run ptraceomatic alongside the ptrace work there rather than closing it blind |
 | [#568](https://github.com/emkey1/ish-AOK/issues/568) | Network throughput is very slow for downloads and browsing | split out of #559. Two readings with different causes -- guest-side throughput vs device-wide degradation -- and which one it is has not been settled. Same neighbourhood as #523's handshake tail |
 | [#572](https://github.com/emkey1/ish-AOK/issues/572) | Cannot determine a usable wildcard IP (Gradle) | Devuan aarch64 on an iPhone 7 Plus, iOS 15. Gradle wants a bindable local address; worth checking what AOK reports for the interface list before assuming it is a name-resolution problem |
 | [#575](https://github.com/emkey1/ish-AOK/issues/575) | Unable to delete machines | `Roots` already implements `destroyRootNamed:` (app/Roots.h), so this is a UI gap, not a missing capability. It is also the natural home for snapshot and restore -- see the roadmap |
