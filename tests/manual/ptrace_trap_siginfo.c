@@ -186,17 +186,10 @@ static void check_breakpoint_trap(void) {
 }
 
 static void check_single_step_trap(void) {
-#if defined(__riscv)
-    // KNOWN GAP, not a failure of this run: the riscv64 frontend in jit/jit.c
-    // returns cpu_step_to_interrupt_riscv64 unconditionally and never looks at
-    // cpu->tf, so PTRACE_SINGLESTEP runs the tracee to completion exactly like
-    // PTRACE_CONT. i386, amd64 and arm64 each have a cpu_single_step_*; riscv64
-    // does not. Reported rather than skipped silently, because a debugger on a
-    // riscv64 guest will hit this the first time anyone steps.
-    printf("ptrace_trap_siginfo: SKIP single-step (riscv64 has no "
-           "cpu_single_step_riscv64; PTRACE_SINGLESTEP behaves like "
-           "PTRACE_CONT)\n");
-#else
+    // Every guest is expected to single-step, riscv64 included. It was the
+    // odd one out until jit/jit.c grew cpu_single_step_riscv64: its frontend
+    // ignored cpu->tf, so this call ran the tracee to completion like
+    // PTRACE_CONT and the check below caught it as "did not stop".
     siginfo_t si;
     int stopsig = 0;
     if (trap_siginfo(1, &si, &stopsig) != 0)
@@ -222,7 +215,6 @@ static void check_single_step_trap(void) {
         failures_total++;
     }
     test_log_if(0, "single-step: si_code=%d si_addr=%p\n", si.si_code, si.si_addr);
-#endif
 }
 
 // gdb reads and writes the inferior through /proc/<pid>/task/<tid>/mem, and

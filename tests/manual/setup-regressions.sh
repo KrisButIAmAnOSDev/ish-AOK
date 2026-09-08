@@ -151,6 +151,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     need_file riscv64/ptrace_regset.c
+    need_file riscv64/riscv64_singlestep.c
     need_file riscv64/jalr_retcache.c
 fi
 need_file signal_core.c
@@ -706,7 +707,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
     all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop dc_zva"
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
-    all_tests="$all_tests ptrace_regset jalr_retcache"
+    all_tests="$all_tests ptrace_regset jalr_retcache riscv64_singlestep"
 fi
 
 test_selected() {

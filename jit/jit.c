@@ -2477,6 +2477,113 @@ static int cpu_single_step_arm64(struct cpu_state *cpu, struct tlb *tlb) {
     return interrupt;
 }
 
+// The riscv64 half of the same thing, and until now it did not exist: the
+// riscv64 dispatch below returned cpu_step_to_interrupt_riscv64
+// unconditionally and never looked at cpu->tf, so PTRACE_SINGLESTEP ran the
+// tracee to its next stop exactly like PTRACE_CONT -- and returned success
+// while doing it, which is the worst shape a missing feature can take. A
+// debugger on a riscv64 guest saw `stepi` run away, took `step`, `next` and
+// `finish` with it, and nothing anywhere reported a failure.
+//
+// A clone of cpu_single_step_arm64 above with the pc field and the compile
+// function swapped, which is exactly what it can be: gen_step_riscv64 has the
+// same 1/0 "not a terminator" / "already terminated" contract as
+// gen_step_arm64 (unlike amd64, where 0 is overloaded with "cannot
+// translate"), gen_exit already knows how to emit a riscv64 continuation, and
+// poked_ptr is set by the dispatch before either frontend is entered. If a
+// fourth copy of this ever appears, factor it.
+static int cpu_single_step_riscv64(struct cpu_state *cpu, struct tlb *tlb) {
+    struct jit *jit = cpu->mmu->jit;
+
+    static __thread bool exception_handler_installed = false;
+    if (!exception_handler_installed) {
+        jit_install_thread_exception_handler();
+        if (!jit_host_fault_mach_active())
+            jit_install_host_fault_signal_handler();
+        exception_handler_installed = true;
+    }
+
+    // Same rule as cpu_step_to_interrupt_riscv64: this frontend has no entry
+    // refresh, so the first call after execve can still see the TLB bound to
+    // the old, freed mm. gen_step_riscv64 needs a valid TLB immediately, to
+    // fetch the instruction bytes it decodes -- skipping this crashed
+    // single-stepping the very first instruction after starti/execve
+    // (mmu_translate on a stale mmu pointer).
+    if (tlb->mmu != cpu->mmu || tlb->mem_changes != cpu->mmu->changes)
+        tlb_refresh(tlb, cpu->mmu);
+
+    struct gen_state state;
+    if (!gen_start_riscv64(cpu->riscv64_pc, &state))
+        return INT_GPF; // OOM allocating the block
+    state.oom_active = true;
+    // _setjmp, not setjmp: on Darwin (BSD semantics, unlike glibc) plain
+    // setjmp/longjmp save and restore the signal mask, which is a real
+    // sigprocmask SYSCALL -- and this runs once per block compilation, so a
+    // translation-heavy guest pays it constantly. It showed up as
+    // cpu_step_to_interrupt -> setjmp -> sigprocmask in a gcc-compile profile.
+    // Nothing between here and gen()'s longjmp touches the signal mask (this
+    // region is pure decode plus realloc), so there is no mask to preserve.
+    // Same reasoning as the crash-unwind sigsetjmp's savemask=0 below.
+    if (_setjmp(state.oom_recovery) != 0) {
+        free(state.block);
+        return INT_GPF;
+    }
+    if (gen_step(&state, tlb))
+        gen_exit(&state); // ordinary instruction: force a terminator here
+    gen_end(&state);
+    state.block->used = state.capacity;
+
+    struct jit_frame frame_storage = {};
+    struct jit_frame *frame = &frame_storage;
+    frame->cpu = *cpu;
+    frame->chain_budget = 8192; // see jit_frame.chain_budget; unused here (this
+                                // block never chains) but jit_enter reads it
+                                // unconditionally
+
+    // jit_crash_fn (the host fault handler) only treats a fault as JIT-internal
+    // and recoverable via siglongjmp when jit_crash_lock is non-NULL -- with it
+    // NULL, it abort()s the whole process instead. This block isn't in any
+    // shared table (no jit_insert, no cache entry), so nothing else can ever
+    // look it up, jetsam it, or race a free against it -- the real lock isn't
+    // needed for THIS block's safety. Taken anyway purely to satisfy that
+    // contract; a plain read-lock, negligible cost for what's inherently a
+    // rare, deliberate, slow-path operation (a ptrace single-step in flight).
+    jetsam_read_lock_polled(jit);
+    jit_crash_lock = &jit->jetsam_lock;
+    jit_crash_frame = frame;
+    jit_crash_cpu = cpu;
+    jit_crash_interrupt = INT_GPF;
+    jit_crash_addr = frame->cpu.riscv64_pc;
+    if (sigsetjmp(jit_crash_unwind_buf, 0) != 0) {
+        if (jit_crash_cpu != NULL && jit_crash_frame != NULL)
+            *jit_crash_cpu = jit_crash_frame->cpu;
+        cpu->segfault_addr = jit_crash_addr;
+        cpu->segfault_was_write = false;
+        jit_crash_unwind_active = false;
+        jit_crash_mutex_lock = NULL;
+        jit_crash_frame = NULL;
+        jit_crash_cpu = NULL;
+        free(state.block);
+        return jit_crash_interrupt;
+    }
+    jit_crash_unwind_active = true;
+
+    int interrupt = jit_enter(state.block, frame, tlb);
+
+    jit_crash_lock = NULL;
+    pthread_rwlock_unlock(&jit->jetsam_lock.l);
+    jit_crash_unwind_active = false;
+    jit_crash_frame = NULL;
+    jit_crash_cpu = NULL;
+
+    jit_frame_sync_out(cpu, frame);
+    free(state.block);
+
+    if (interrupt == INT_NONE)
+        interrupt = INT_DEBUG;
+    return interrupt;
+}
+
 // riscv64 frontend: a mechanical clone of cpu_step_to_interrupt_arm64
 // above with the pc field and compile function swapped — same jetsam,
 // crash-unwind, cache, and chaining behavior. Kept separate like the
@@ -3362,7 +3469,8 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     if (current != NULL && current->abi == GUEST_ABI_RISCV64) {
         // Same poked_ptr rule as arm64 above.
         cpu->poked_ptr = &cpu->_poked;
-        return cpu_step_to_interrupt_riscv64(cpu, tlb);
+        return cpu->tf ? cpu_single_step_riscv64(cpu, tlb)
+                       : cpu_step_to_interrupt_riscv64(cpu, tlb);
     }
     if (current != NULL && current->abi == GUEST_ABI_AMD64) {
         if (!amd64_jit_is_enabled())
