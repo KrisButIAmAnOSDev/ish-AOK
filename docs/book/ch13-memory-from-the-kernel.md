@@ -218,9 +218,11 @@ working set somewhere to live that is not RAM, and the working set can exist.
 
 The area is a **file**, created at boot and immediately unlinked, so it can never
 appear in the app's container and can never be swept into a backup. Its size is
-the user's decision, taken in Settings; it is **off by default**, because paging
-spends the write endurance of somebody's phone and nothing should start doing
-that on their behalf. The command-line build has `ISH_GUEST_SWAP_MB` instead.
+the user's decision, taken in the iOS Settings app under iSH-AOK; it is **off by
+default**, and stays off until a size has been chosen as well as the switch
+turned on, because paging spends the write endurance of somebody's phone and
+nothing — including a default size picked here — should start doing that on
+their behalf. The command-line build has `ISH_GUEST_SWAP_MB` instead.
 
 It is divided into fixed **slots** of 16 KiB — four guest pages — tracked by a
 free bitmap and an allocation rover. Sixteen kilobytes rather than four because

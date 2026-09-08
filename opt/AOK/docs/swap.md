@@ -12,16 +12,31 @@ has to be turned on deliberately**.
 
 ## Turning it on
 
-In iSH-AOK Settings, under memory: a switch, and a size in MB. Both take effect
-at the next boot of the guest — the area is created when the guest starts, not
-when you flip the switch.
+In the **iOS Settings app** — not the settings inside iSH-AOK — open
+**Settings → iSH-AOK → Simulated Swap**. There are two controls:
+
+- **Enable Swap**, off by default.
+- **Swap Size**, which starts at *Not chosen (swap stays off)* and offers
+  256 MB, 512 MB, 1 GB, 2 GB, 4 GB, 8 GB and 16 GB.
+
+**Both are needed.** Turning the switch on without choosing a size leaves swap
+off, deliberately: picking a size for you would be iSH-AOK deciding how much of
+your flash to write to. If that is the state you are in, the guest says so —
+`cat /proc/ish/swap` reports it rather than just `off`.
+
+**Both take effect the next time iSH-AOK starts**, not when you flip the switch.
+The area is created when the guest boots, at its full size, and does not grow.
+
+The sizes offered do not know how much room your device actually has. If there
+is not enough free space for the size you picked, iSH-AOK leaves swap off rather
+than quietly making a smaller area than you asked for — and again,
+`/proc/ish/swap` says which of the two happened.
 
 Pick a size the way you would on any machine: big enough to hold the cold parts
 of what you run, small enough that you are not writing gigabytes to flash for
-nothing. A few hundred MB is a reasonable starting point. The area is created at
-its full size and does not grow.
+nothing. 256 MB or 512 MB is a reasonable starting point.
 
-From the command-line build there is no Settings screen, so use the environment
+From the command-line build there is no Settings app, so use the environment
 variable instead — see `ISH_GUEST_SWAP_MB` in
 [tuning-knobs.md](tuning-knobs.md).
 

@@ -4,7 +4,7 @@
 
 # Appendix F. The regression suite, annotated
 
-246 C programs in `tests/manual/`, of which **229 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
+249 C programs in `tests/manual/`, of which **232 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
 
 A row with a directory prefix is a per-architecture or accelerator test, kept
 in a subdirectory of `tests/manual/` and registered under that same prefix.
@@ -165,12 +165,14 @@ does not say what it is for.
 | `ptrace_exit_kill.c` | yes | ptrace_exit_kill: a traced task with PTRACE_O_TRACEEXIT that receives SIGKILL while stopped in its PTRACE_EVENT_EXIT report must die cleanly. The... |
 | `ptrace_group_stop.c` | yes | ptrace_group_stop: a SEIZE'd tracee that enters a job-control group-stop must report it to the tracer (as PTRACE_EVENT_STOP) and be resumable to... |
 | `ptrace_thread_follow.c` | yes | ptrace_thread_follow: a tracer using PTRACE_O_TRACECLONE + wait4(__WALL) must be able to follow a CLONE_THREAD worker of its tracee. This is the... |
+| `ptrace_trap_siginfo.c` | yes | The siginfo a SIGTRAP carries, and it is architecture-dependent. |
 | `pty_line_discipline.c` | yes | Covers a set of related pty/tty line-discipline gaps (the first three from issue #423 Tier 3): 1. ECHOKE vs plain ECHOK on VKILL -- and the fact... |
 | `random_seed.c` | yes |  |
 | `reparent_zombie_notify.c` | yes | A zombie handed to a new parent has to be announced to that new parent. |
 | `resource_limits_sched.c` | yes | Resource limits, scheduling policy, nice, and the half of getrusage that is not CPU time. |
 | `riscv64/jalr_retcache.c` | yes | jalr_retcache.c -- the riscv64 JIT's jalr target/return cache. |
 | `riscv64/ptrace_regset.c` | yes | ptrace_regset (riscv64-only): PTRACE_GETREGSET/SETREGSET(NT_PRSTATUS) must report and accept the real riscv64 register file. iSH-AOK's riscv64... |
+| `riscv64/riscv64_singlestep.c` | yes | riscv64_singlestep: PTRACE_SINGLESTEP must execute exactly one guest instruction and stop, not run the tracee to completion. |
 | `rusage_monotonic.c` | yes |  |
 | `scm_rights_pidfd.c` | yes |  |
 | `scm_rights_stress.c` | yes | AF_UNIX SCM_RIGHTS fd-passing must never desync AOK's two-channel bookkeeping (a host "sentinel" fd carrying the message + an internal struct-scm... |
@@ -210,6 +212,7 @@ does not say what it is for.
 | `stat.c` | — |  |
 | `statx_mnt_id_timerfd.c` | yes | systemd >= 260 boot prerequisites: statx STATX_MNT_ID and timerfd TFD_TIMER_CANCEL_ON_SET. |
 | `subreaper_not_inherited.c` | yes | PR_SET_CHILD_SUBREAPER is per-process and does not survive fork. |
+| `swap_roundtrip.c` | yes | A page that goes out to swap must come back byte-for-byte. |
 | `syscall_wiring.c` | yes | Syscalls that were implemented but not reachable, because the per-ABI table entry was missing. The implementation existing is not the same as the... |
 | `sysctl_write_rules.c` | yes | What /proc/sys accepts, what it refuses, and what it admits to not having. |
 | `sysfs_cpu_topology.c` | yes | /sys/devices/system/cpu: per-CPU topology and cache attributes. |
