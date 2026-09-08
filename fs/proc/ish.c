@@ -9,6 +9,7 @@
 #include "kernel/calls.h"
 #include "emu/memory.h"
 #include "kernel/swap.h"
+#include "fs/fake-snapshot.h"
 #include "fs/poll.h"
 #include "util/sync.h"
 #include "platform/platform.h"
@@ -218,6 +219,155 @@ static int proc_ish_update_swap(struct proc_entry *UNUSED(entry), struct proc_da
     }
     int err = swap_enable((uint64_t) mb * 1024 * 1024);
     return err < 0 ? err : 0;
+}
+
+// ---------------------------------------------------------------------------
+// /proc/ish/snapshot -- a copy-on-write point-in-time copy of the booted root
+// ---------------------------------------------------------------------------
+
+// Gated on a launch-time environment variable, the same shape swap's guest
+// control uses and for the same reason: this writes a whole second root into
+// the container, so on an installed app it would let any guest root process
+// spend the user's storage. The shipping trigger for a snapshot is meant to be
+// the Machines screen, not a guest write -- this is the development control
+// that makes the mechanism reachable from the CLI while it is being built.
+//
+// getenv rather than a cached flag set at startup: this path runs once per
+// snapshot, the environment does not change under a running process, and a
+// startup hook would be a second place to keep in sync for no benefit.
+static bool snapshot_guest_control_allowed(void) {
+    const char *env = getenv("ISH_GUEST_SNAPSHOT");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
+static lock_t snapshot_last_lock = LOCK_INITIALIZER;
+static struct fakefs_snapshot_stats snapshot_last;
+static char snapshot_last_name[64];
+static int snapshot_last_err;
+static bool snapshot_last_valid;
+
+// The booted root's data directory, as the root mount records it. Returns false
+// when / is not a fakefs mount -- which is a real configuration (a realfs root
+// under the CLI), not an error worth asserting on.
+static bool snapshot_root_data_path(char *out, size_t size) {
+    char root_path[] = "/";
+    struct mount *root = mount_find(root_path);
+    if (root == NULL)
+        return false;
+    bool ok = false;
+    if (root->source != NULL) {
+        size_t n = strlen(root->source);
+        // Only a fakefs root has the "<root>/data" shape fakefs_snapshot needs.
+        if (n > 5 && strcmp(root->source + n - 5, "/data") == 0 && n < size) {
+            memcpy(out, root->source, n + 1);
+            ok = true;
+        }
+    }
+    mount_release(root);
+    return ok;
+}
+
+static int proc_ish_show_snapshot(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char data_path[PATH_MAX];
+    if (snapshot_root_data_path(data_path, sizeof data_path))
+        proc_printf(buf, "source           %s\n", data_path);
+    else
+        proc_printf(buf, "source           (not a fakefs root -- nothing to snapshot)\n");
+    proc_printf(buf, "guest_control    %s\n",
+                snapshot_guest_control_allowed() ? "on" : "off (ISH_GUEST_SNAPSHOT unset)");
+
+    lock(&snapshot_last_lock, 0);
+    if (snapshot_last_valid) {
+        proc_printf(buf, "\nlast snapshot    %s\n", snapshot_last_name);
+        proc_printf(buf, "  result         %s\n",
+                    snapshot_last_err == 0 ? "ok" : "FAILED");
+        if (snapshot_last_err != 0 && snapshot_last.error[0] != '\0')
+            proc_printf(buf, "  error          %s\n", snapshot_last.error);
+        proc_printf(buf, "  quiesced       %s", snapshot_last.quiesced ? "yes" : "no");
+        if (!snapshot_last.quiesced)
+            proc_printf(buf, "  (%u transaction(s) still in flight)",
+                        snapshot_last.quiesce_stragglers);
+        proc_printf(buf, "\n");
+        proc_printf(buf, "  data           %lu ms", snapshot_last.clone_ms);
+        if (snapshot_last.entries > 0)
+            proc_printf(buf, "  (%lu entries copied -- no clone support on this host)",
+                        snapshot_last.entries);
+        proc_printf(buf, "\n");
+        proc_printf(buf, "  meta.db        %lu ms\n", snapshot_last.db_ms);
+        proc_printf(buf, "  total          %lu ms\n", snapshot_last.total_ms);
+    }
+    unlock(&snapshot_last_lock);
+
+    if (snapshot_guest_control_allowed())
+        proc_printf(buf, "\n  echo <name> > /proc/ish/snapshot   # clone the booted root to a sibling directory\n\n");
+    // Cost is per directory entry, not per byte -- say so here rather than let
+    // the first user discover it on a root full of node_modules.
+    proc_printf(buf, "A snapshot costs roughly 25us per directory entry and almost nothing\n");
+    proc_printf(buf, "per byte: the file data is shared copy-on-write with the original.\n");
+    return 0;
+}
+
+static int proc_ish_update_snapshot(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!snapshot_guest_control_allowed())
+        return _EPERM;
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size > sizeof(snapshot_last_name) - 1)
+        return _EINVAL;
+    char name[sizeof(snapshot_last_name)];
+    memcpy(name, data->data, data->size);
+    name[data->size] = '\0';
+    // Same embedded-NUL rule as the other writable entries here.
+    if (strlen(name) != data->size)
+        return _EINVAL;
+    char *nl = strchr(name, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+    if (name[0] == '\0')
+        return _EINVAL;
+
+    // The name becomes a host directory beside the booted root, so it must be
+    // one path component and nothing clever. Without this a guest root process
+    // could write a root anywhere on the host the app can reach, which is a
+    // container escape rather than a snapshot.
+    if (strchr(name, '/') != NULL || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return _EINVAL;
+    for (const char *p = name; *p != '\0'; p++) {
+        bool ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.';
+        if (!ok)
+            return _EINVAL;
+    }
+
+    char data_path[PATH_MAX];
+    if (!snapshot_root_data_path(data_path, sizeof data_path))
+        return _EINVAL;
+
+    // <root>/data -> <roots dir>, then <roots dir>/<name>.
+    char dst[PATH_MAX];
+    size_t n = strlen(data_path);
+    char root_dir[PATH_MAX];
+    memcpy(root_dir, data_path, n - 5);     // drop "/data"
+    root_dir[n - 5] = '\0';
+    char *slash = strrchr(root_dir, '/');
+    if (slash == NULL)
+        return _EINVAL;
+    *slash = '\0';
+    if (snprintf(dst, sizeof dst, "%s/%s", root_dir, name) >= (int) sizeof dst)
+        return _ENAMETOOLONG;
+
+    struct fakefs_snapshot_stats stats;
+    int err = fakefs_snapshot(data_path, dst, &stats);
+
+    lock(&snapshot_last_lock, 0);
+    snapshot_last = stats;
+    strncpy(snapshot_last_name, name, sizeof(snapshot_last_name) - 1);
+    snapshot_last_name[sizeof(snapshot_last_name) - 1] = '\0';
+    snapshot_last_err = err;
+    snapshot_last_valid = true;
+    unlock(&snapshot_last_lock);
+
+    return err;   // already a guest _E* code, or 0
 }
 
 static int proc_ish_show_swap_evict(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1189,6 +1339,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"roots", S_IFREG | 0644, .show = proc_ish_show_roots, .update = proc_ish_update_roots},
     {"swap", S_IFREG | 0644, .show = proc_ish_show_swap, .update = proc_ish_update_swap},
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
+    {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},
     {"wake_signals", .show = proc_ish_show_wake_signals},
