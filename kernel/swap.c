@@ -991,7 +991,16 @@ static void swap_thrash_check(uint64_t in_delta, uint64_t out_delta) {
 
 static void *swap_kswapd_main(void *UNUSED_ARG) {
     (void) UNUSED_ARG;
+    // Darwin's pthread_setname_np names the CALLING thread and takes only the
+    // name; every other platform takes the thread as well. Unguarded, this
+    // built on the Mac and broke the Linux CI job on both gcc and clang -- the
+    // second compiler that exists precisely to catch what the Mac build cannot
+    // (see kernel/task.c's update_thread_name, which already does this).
+#if __APPLE__
     pthread_setname_np("kswapd0");
+#else
+    pthread_setname_np(pthread_self(), "kswapd0");
+#endif
     atomic_store_explicit(&swap_kswapd_alive, true, memory_order_release);
     uint64_t last_in = 0, last_out = 0;
     while (!atomic_load_explicit(&swap_kswapd_stop, memory_order_acquire)) {
