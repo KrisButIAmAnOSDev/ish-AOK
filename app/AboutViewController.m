@@ -183,18 +183,11 @@ BOOL ISHLLMClientEnabled(void) {
 
 @end
 
-// How long a burst of store updates is allowed to accumulate before the report
-// is rebuilt. The store posts its notification for EVERY breadcrumb, and a
-// breadcrumb is recorded per guest process exit and per keystroke, so without
-// this the pane rebuilds a multi-kilobyte report from five JSON files, on the
-// main thread, dozens of times a second. Half a second still reads as live.
-static const NSTimeInterval kDiagnosticsCoalesceInterval = 0.5;
-
 // How close to the end counts as "at the end", for deciding whether to follow
 // the tail. One line of the monospaced 12pt font, near enough.
 static const CGFloat kDiagnosticsBottomSlack = 16;
 
-@interface DiagnosticsViewController () <UITextViewDelegate>
+@interface DiagnosticsViewController ()
 // Set when the workspace embeds this in its own window, which already draws a
 // title bar saying "Diagnostics". Without it the pane shows that word twice,
 // stacked.
@@ -203,8 +196,6 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
 
 @implementation DiagnosticsViewController {
     UITextView *_textView;
-    BOOL _rebuildScheduled;   // a coalescing rebuild is already pending
-    BOOL _rebuildDeferred;    // an update arrived while the reader was scrolling
     BOOL _everLoaded;         // the first load starts at the top; later ones do not
 }
 
@@ -222,9 +213,6 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     _textView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _textView.editable = NO;
     _textView.alwaysBounceVertical = YES;
-    // For the scroll callbacks below: an update that lands mid-drag is held
-    // until the finger lifts rather than cancelling the gesture.
-    _textView.delegate = self;
     if (@available(iOS 13.0, *)) {
         _textView.backgroundColor = UIColor.systemBackgroundColor;
         _textView.textColor = UIColor.labelColor;
@@ -245,20 +233,28 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
                                                       action:@selector(refreshDiagnostics:)],
     ];
 
-    [NSNotificationCenter.defaultCenter addObserver:self
-                                           selector:@selector(diagnosticsStoreDidUpdate:)
-                                               name:ISHDiagnosticsStoreDidUpdateNotification
-                                             object:nil];
+    // DELIBERATELY NOT observing ISHDiagnosticsStoreDidUpdateNotification.
+    //
+    // The store posts it for every breadcrumb, so an open pane would rebuild
+    // itself while it is being read -- and reassigning a text view's `.text`
+    // drops any selection the reader has made. Someone highlighting a few lines
+    // to copy them lost the highlight to the next guest process exit, which for
+    // a screen whose whole purpose is getting the log to somebody else is worse
+    // than showing figures a minute old. Refreshing is the Refresh button's job
+    // and nothing else's; the report is a snapshot, and it says when it was
+    // taken. See rebuildReport.
     [self refreshDiagnostics:nil];
-}
-
-- (void)dealloc {
-    [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self refreshDiagnostics:nil];
+    // No refresh here either. viewDidLoad has already taken the snapshot, and
+    // this controller is created fresh every time the screen is opened -- from
+    // the Settings row, from the workspace tool, from the launch-diagnostics
+    // preference -- so there is no path where a reappearance is showing an
+    // empty pane. What it CAN be is a reappearance while the pane is open and
+    // selected, and replacing the text there would drop the selection for no
+    // new information.
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -268,26 +264,8 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     }
 }
 
-// A store update arrived. Coalesce it; do not touch the view yet.
-- (void)diagnosticsStoreDidUpdate:(__unused NSNotification *)notification {
-    if (_rebuildScheduled)
-        return;
-    _rebuildScheduled = YES;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t) (kDiagnosticsCoalesceInterval * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        DiagnosticsViewController *strongSelf = weakSelf;
-        if (strongSelf == nil)
-            return;
-        strongSelf->_rebuildScheduled = NO;
-        [strongSelf rebuildReport];
-    });
-}
-
-// The Refresh button, and every appearance. Explicit, so it is not deferred --
-// but it still keeps the reader where they are, because a manual refresh means
-// "show me the latest", not "take me back to the top".
+// The Refresh button. The ONLY thing that replaces the text after the first
+// load; see the comment in viewDidLoad for why nothing else may.
 - (void)refreshDiagnostics:(id)sender {
     [self rebuildReport];
 }
@@ -307,25 +285,20 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     return _textView.contentOffset.y >= maxOffset - kDiagnosticsBottomSlack;
 }
 
-// Rebuild the text without moving the reader.
+// Take a snapshot of the report and show it, without moving the reader.
 //
-// The old version assigned `.text` and then setContentOffset:CGPointZero, which
-// snapped the view to the top on EVERY store update -- and the store posts one
-// per breadcrumb, i.e. per guest process exit and per keystroke. With a guest
-// doing anything at all the pane could not be scrolled down; reported from
-// Discord as exactly that, with the note that the interesting lines are at the
-// bottom. Nothing about the report wants the offset reset: it is the same
-// document with more appended.
+// Only ever called for the initial load and for the Refresh button. It used to
+// run on every store update -- one per breadcrumb, i.e. per guest process exit
+// and per keystroke -- and did `setContentOffset:CGPointZero` afterwards, so the
+// pane snapped to the top faster than a finger could drag it. Reported from
+// Discord twice over: first that it could not be scrolled down at all, then that
+// the periodic rebuild was dropping copy/paste selections mid-copy. Both are the
+// same root cause, replacing the text under someone who is reading it, and the
+// answer to both is to do it only when asked.
+//
+// The offset is still preserved rather than reset, because a manual Refresh
+// means "show me the latest", not "take me back to the top".
 - (void)rebuildReport {
-    // Never reassign the text under a finger: it cancels the drag, which is the
-    // same complaint by another route. Hold the update until the scrolling
-    // stops -- scrollViewDidEndDragging/Decelerating below pick it back up.
-    if (_textView.isTracking || _textView.isDragging || _textView.isDecelerating) {
-        _rebuildDeferred = YES;
-        return;
-    }
-    _rebuildDeferred = NO;
-
     NSString *report = [ISHDiagnosticsStore diagnosticsReport] ?: @"";
     if (_everLoaded && [report isEqualToString:_textView.text]) {
         // Identical: re-laying it out would cost a relayout and, on a text view
@@ -355,9 +328,10 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
         if (@available(iOS 11.0, *))
             offset.y = -_textView.adjustedContentInset.top;
     } else if (follow) {
-        // Already reading the end: stay on the end as it grows. This is what
-        // makes the pane usable as a live log -- scroll to the bottom once and
-        // it keeps showing the newest lines.
+        // Reading the end when Refresh was pressed: stay on the end, which has
+        // grown. Anchoring to the old offset instead would silently slide the
+        // newest lines out from under someone who pressed Refresh precisely to
+        // see them.
         offset.y = maxOffset;
     } else if (offset.y > maxOffset) {
         // The report shrank under them (the breadcrumb ring wraps at 200, the
@@ -366,24 +340,6 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     }
     [_textView setContentOffset:offset animated:NO];
     _everLoaded = YES;
-}
-
-- (void)applyDeferredRebuildIfNeeded {
-    if (_rebuildDeferred)
-        [self rebuildReport];
-}
-
-- (void)scrollViewDidEndDragging:(__unused UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
-    if (!decelerate)
-        [self applyDeferredRebuildIfNeeded];
-}
-
-- (void)scrollViewDidEndDecelerating:(__unused UIScrollView *)scrollView {
-    [self applyDeferredRebuildIfNeeded];
-}
-
-- (void)scrollViewDidEndScrollingAnimation:(__unused UIScrollView *)scrollView {
-    [self applyDeferredRebuildIfNeeded];
 }
 
 - (void)exportDiagnostics:(id)sender {
