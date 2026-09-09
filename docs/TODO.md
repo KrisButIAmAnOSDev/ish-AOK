@@ -194,14 +194,24 @@ because the area is `F_PREALLOCATE`d and `ftruncate`d to its full size before a
 single page is written. For a user whose worry is flash wear that sounds like
 the wrong shape.
 
-In practice it very nearly is zram already: **a small swap area with a large
-compressed pool.** Compressible frames never touch the file, incompressible ones
-land in the small area, and when it fills the pager simply stops evicting --
-which the eviction path already handles correctly (a failed `swap_slot_write`
-frees the slot and leaves the frame resident, emu/memory.c:3669). So
-`ISH_GUEST_SWAP_MB=16 ISH_GUEST_ZSWAP_MB=256` is a working RAM-first
-configuration today, at a cost of 16 MB of preallocated flash and no writes to
-it unless something incompressible needs evicting.
+In practice most of what matters is available already, but **not by making the
+area small** -- that was the obvious idea and it is wrong. Slots are derived
+from the file's size, so a 16 MB area means at most 16 MB of guest memory can
+ever be evicted, no matter how large the pool is. Measured: with
+`ISH_GUEST_SWAP_MB=16 ISH_GUEST_ZSWAP_MB=256` against a 24 MB region, exactly
+1024 frames (16 MB) were stored and the rest simply stayed resident.
+
+The right framing is that **the area is reserved SPACE and the pool is what
+stops it being WRITTEN**, and wear is about writes, not space. So size the area
+for the eviction capacity you want and the pool to hold its compressed form --
+`ISH_GUEST_SWAP_MB=256` with `ISH_GUEST_ZSWAP_MB=128` covers a 256 MB working
+set at a measured 2.2-2.8x with room to spare. The 256 MB of flash is reserved
+once at enable and then never written to, as long as the frames compress; the
+counter for that is `flash NOT written` in /proc/ish/zswap, which read 16384 KB
+in the run above with zero writes to the file.
+
+What a true RAM-only mode would additionally buy is therefore just the reserved
+space, not the writes.
 
 A true no-file mode would mean `swap_fd < 0` with slots still being handed out,
 and `swap_fd >= 0` is the "does an area exist" test in several places in
