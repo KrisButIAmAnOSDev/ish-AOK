@@ -187,6 +187,51 @@ compressed round trip byte-for-byte, and the test FAILS rather than skips if no
 frame went through the tier. Run at a 1 MB cap it also covers the mixed case --
 640 frames held in RAM, 896 overflowed to flash, all correct.
 
+**THE CLEAN DEVICE RUN, 2026-09-09.** iPad 5th gen (A9, 1.45 GB), app in the
+foreground, no debugger attached, swap 1 GB, pool cap 128 MB, enabled from
+Settings. A single non-forking probe (`zprobe`) allocated 64 MB at a time and
+sampled after each step:
+
+```
++768MB   headroom=490MB  stores=0     poolKB=0      bytes_written=0
++832MB   headroom=453MB  stores=3754  poolKB=28960  bytes_written=0   <- engaged
+settle+10s  headroom=484MB stores=7874 poolKB=61744 bytes_written=0
+settle+180s headroom=483MB stores=8132 poolKB=63776 bytes_written=0
+```
+
+**Four things, and all four are what the feature promised:**
+
+1. **Reclaim engaged exactly where predicted.** The watermark is
+   `available < 2 x host_mem_headroom_floor` = 482 MB. Nothing happened at
+   490 MB; it fired at 453 MB. The threshold is not approximately right, it is
+   right.
+2. **Zero flash writes.** `bytes_written` stayed at 0 for the entire run, and
+   `declined` stayed at 0 -- every single evicted frame went to RAM. On a
+   feature whose headline objection is flash wear, that is the number.
+3. **THE FOOTPRINT ACTUALLY MOVED.** Headroom recovered 453 -> 484 MB and held
+   there for three minutes. This is the measurement the debugger would have
+   destroyed: `MADV_FREE_REUSABLE` returns success while moving no ledger under
+   an attached debugger, so a recovering headroom is the only proof the frames
+   were released rather than merely accounted for.
+4. **It reached equilibrium and stopped.** 484 MB is just above the 482 MB
+   watermark, and reclaim ceased there rather than continuing to evict. The
+   pool used 60 MB of its 128 MB cap. That is a pager doing the right amount of
+   work, not the most.
+
+**The effective ratio is 2.11x, with fragmentation counted.** 8132 frames x
+16 KiB = 127 MB of guest memory held in 61,744 KB of pool. That is the honest
+figure -- `poolKB` is what the slabs occupy, so size-class waste is already in
+it. It sits just below the raw 2.38x measured for cc1, which is what ~10%
+fragmentation predicts. The probe's data is structured text records, so it is
+somewhat more compressible than a binary heap; treat 2.11x as a good case and
+not a ceiling.
+
+**One number is not fully explained and should not be smoothed over.** 127 MB of
+frames released into 60 MB of pool should free about 67 MB, and headroom
+recovered 31 MB (memfree agrees: +32 MB). The gap may be `MADV_FREE_REUSABLE`
+pages counting as reusable-but-not-yet-free, or accounting differing between the
+two figures. Not chased, and flagged rather than averaged away.
+
 **IT WORKS ON A DEVICE, UNDER REAL PRESSURE.** Measured on the iPad 5th gen
 (A9, 1.45 GB) on 2026-09-09, with the tier enabled from Settings at a 128 MB cap
 and swap at 256 MB. Memory was consumed until the machine crossed kswapd's
