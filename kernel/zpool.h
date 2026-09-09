@@ -23,22 +23,24 @@
 //
 // THE DESIGN, and its cost, stated up front. Fixed size classes at 256-byte
 // granularity: an object is rounded up to the next multiple of 256, and each
-// class allocates page-sized slabs carved into equal entries. Internal
-// fragmentation is therefore under 256 bytes per page, which against a measured
-// mean compressed size of roughly 1.7 KB is about 7%. So a raw 2.4x becomes an
-// effective ~2.2x. That is the price of not writing zsmalloc, and it is
-// reported rather than assumed -- see zpool_stats::stored_bytes against
-// ::pool_bytes.
+// class allocates slabs of one object_max carved into equal entries. Internal
+// fragmentation is therefore under 256 bytes per object. Against a 16 KiB frame
+// compressing to a measured ~6.8 KiB that is under 4%; against a 4 KiB frame
+// compressing to ~1.7 KiB it is about 7%. So a raw 2.4x becomes an effective
+// 2.2-2.3x. That is the price of not writing zsmalloc, and it is reported
+// rather than assumed -- see zpool_stats::stored_bytes against ::pool_bytes.
 //
 // NOT THREAD-SAFE by itself. The caller serialises; the pager already holds an
 // address-space barrier where this will be used.
 
-#define ZPOOL_PAGE_SIZE     4096
 #define ZPOOL_GRANULE       256
-// Classes for 256, 512, ... 4096. An object bigger than a page is never stored:
-// the caller keeps those uncompressed, which the phase 0 numbers say is 22
-// pages in 23,184.
-#define ZPOOL_CLASSES       (ZPOOL_PAGE_SIZE / ZPOOL_GRANULE)
+// The largest object the pool will ever be asked to hold. Not 4096: the pager
+// works in FRAMES, and mem_frame_size() is max(real_page_size, PAGE_SIZE),
+// which is 16 KiB on Apple Silicon and 4 KiB on an x86_64 host. The ceiling is
+// given at create time; this is the compile-time bound on it, and it is what
+// sizes the class table.
+#define ZPOOL_OBJECT_MAX    16384
+#define ZPOOL_CLASSES       (ZPOOL_OBJECT_MAX / ZPOOL_GRANULE)
 
 // Opaque handle. ZPOOL_HANDLE_NONE is never returned by a successful store, so
 // it is safe as the "nothing here" value in a page-table entry.
@@ -62,11 +64,16 @@ struct zpool_stats {
 // `max_bytes` caps the slab memory the pool will allocate; a store that would
 // exceed it fails rather than growing, so the feature can be given a size the
 // way swap is. 0 means unlimited, which is for tests only.
-struct zpool *zpool_create(uint64_t max_bytes);
+//
+// `object_max` is the largest object that will be stored -- pass
+// mem_frame_size(). It must be a multiple of ZPOOL_GRANULE and no larger than
+// ZPOOL_OBJECT_MAX. Slabs are one object_max each, so every class holds at
+// least one entry.
+struct zpool *zpool_create(uint64_t max_bytes, size_t object_max);
 void zpool_destroy(struct zpool *pool);
 
-// Copy `size` bytes into the pool. Returns ZPOOL_HANDLE_NONE if the object does
-// not fit a page, or the pool is at its cap and no slab has room.
+// Copy `size` bytes into the pool. Returns ZPOOL_HANDLE_NONE if the object is
+// not smaller than object_max, or the pool is at its cap and no slab has room.
 // `original_size` is recorded for the ratio only.
 zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
                            size_t original_size);

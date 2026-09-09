@@ -12,6 +12,11 @@
 
 #include "kernel/zpool.h"
 
+// Run everything at the frame size the pager actually uses on Apple Silicon.
+// A pool sized for a 4 KiB guest page would pass every test here and truncate
+// every real handle on the hardware this is for.
+#define OBJ 16384
+
 static int failures;
 
 static void check(bool ok, const char *what) {
@@ -32,16 +37,16 @@ static void fill(uint8_t *buf, size_t n, unsigned seed) {
 }
 
 static void test_roundtrip(void) {
-    struct zpool *p = zpool_create(0);
+    struct zpool *p = zpool_create(0, OBJ);
     check(p != NULL, "create");
 
     // Every size class, plus the boundaries either side of each granule.
-    for (size_t size = 1; size < ZPOOL_PAGE_SIZE; size++) {
-        if (size > 600 && size % 97 != 0 && size < ZPOOL_PAGE_SIZE - 3)
+    for (size_t size = 1; size < OBJ; size++) {
+        if (size > 600 && size % 97 != 0 && size < OBJ - 3)
             continue;   // thin out the middle, keep the edges
-        uint8_t in[ZPOOL_PAGE_SIZE], out[ZPOOL_PAGE_SIZE];
+        uint8_t in[OBJ], out[OBJ];
         fill(in, size, (unsigned) size);
-        zpool_handle_t h = zpool_store(p, in, size, ZPOOL_PAGE_SIZE);
+        zpool_handle_t h = zpool_store(p, in, size, OBJ);
         if (h == ZPOOL_HANDLE_NONE) {
             printf("FAIL store size=%zu\n", size);
             failures++;
@@ -61,17 +66,17 @@ static void test_roundtrip(void) {
 }
 
 static void test_rejects(void) {
-    struct zpool *p = zpool_create(0);
-    uint8_t buf[ZPOOL_PAGE_SIZE];
+    struct zpool *p = zpool_create(0, OBJ);
+    uint8_t buf[OBJ];
     fill(buf, sizeof buf, 1);
 
-    // A full page cannot be stored: it saves nothing, and the 12-bit size field
-    // could not represent it. The caller keeps those raw.
-    check(zpool_store(p, buf, ZPOOL_PAGE_SIZE, ZPOOL_PAGE_SIZE) == ZPOOL_HANDLE_NONE,
-          "reject full page");
-    check(zpool_store(p, buf, ZPOOL_PAGE_SIZE + 1, ZPOOL_PAGE_SIZE) == ZPOOL_HANDLE_NONE,
+    // An object at the ceiling cannot be stored: it saves nothing, and the
+    // 14-bit size field could not represent it. The caller keeps those raw.
+    check(zpool_store(p, buf, OBJ, OBJ) == ZPOOL_HANDLE_NONE,
+          "reject object at the ceiling");
+    check(zpool_store(p, buf, OBJ + 1, OBJ) == ZPOOL_HANDLE_NONE,
           "reject oversize");
-    check(zpool_store(p, buf, 0, ZPOOL_PAGE_SIZE) == ZPOOL_HANDLE_NONE,
+    check(zpool_store(p, buf, 0, OBJ) == ZPOOL_HANDLE_NONE,
           "reject zero");
 
     // Handles that were never issued must be refused, not followed. These are
@@ -82,13 +87,17 @@ static void test_rejects(void) {
     check(!zpool_load(p, ((zpool_handle_t) 999 << 24) | 100, buf, sizeof buf, &got),
           "reject unknown slab");
 
-    zpool_handle_t h = zpool_store(p, buf, 100, ZPOOL_PAGE_SIZE);
+    zpool_handle_t h = zpool_store(p, buf, 100, OBJ);
     check(h != ZPOOL_HANDLE_NONE, "store 100");
     // An entry index past the end of the slab, with an otherwise valid handle.
-    check(!zpool_load(p, h | ((zpool_handle_t) 0xFFF << 12), buf, sizeof buf, &got),
+    // Entry occupies bits 23..14, so set them all: 1023 entries is past any
+    // slab this pool builds.
+    check(!zpool_load(p, h | ((zpool_handle_t) 0x3FF << 14), buf, sizeof buf, &got),
           "reject bad entry index");
-    // A size larger than the class holds.
-    check(!zpool_load(p, (h & ~(zpool_handle_t) 0xFFF) | 0xFFF, buf, sizeof buf, &got),
+    // A size larger than the class this handle's slab was cut for. Size is
+    // bits 13..0; 0x3FFF is 16383, far past the 256-byte class holding a
+    // 100-byte object.
+    check(!zpool_load(p, (h & ~(zpool_handle_t) 0x3FFF) | 0x3FFF, buf, sizeof buf, &got),
           "reject oversized size field");
     // A destination that is too small must fail rather than overflow.
     check(!zpool_load(p, h, buf, 10, &got), "reject short destination");
@@ -105,19 +114,19 @@ static void test_rejects(void) {
 // Space must be reused. A pool that leaks a slab per fill/empty cycle would
 // pass every round-trip test and still exhaust memory on a device.
 static void test_reuse(void) {
-    struct zpool *p = zpool_create(0);
+    struct zpool *p = zpool_create(0, OBJ);
     uint8_t buf[512];
     fill(buf, sizeof buf, 7);
 
     zpool_handle_t hs[4096];
     for (int i = 0; i < 4096; i++)
-        hs[i] = zpool_store(p, buf, sizeof buf, ZPOOL_PAGE_SIZE);
+        hs[i] = zpool_store(p, buf, sizeof buf, OBJ);
     struct zpool_stats first;
     zpool_get_stats(p, &first);
     for (int i = 0; i < 4096; i++)
         zpool_free(p, hs[i]);
     for (int i = 0; i < 4096; i++)
-        hs[i] = zpool_store(p, buf, sizeof buf, ZPOOL_PAGE_SIZE);
+        hs[i] = zpool_store(p, buf, sizeof buf, OBJ);
     struct zpool_stats second;
     zpool_get_stats(p, &second);
 
@@ -130,16 +139,16 @@ static void test_reuse(void) {
 // The cap is what makes this safe to ship as a sized, opt-in feature: past it,
 // stores fail and the caller falls back rather than the pool eating the device.
 static void test_cap(void) {
-    struct zpool *p = zpool_create(64 * 1024);   // 16 slabs
+    struct zpool *p = zpool_create(16 * OBJ, OBJ);   // 16 slabs
     uint8_t buf[256];
     fill(buf, sizeof buf, 3);
     int stored = 0;
     for (int i = 0; i < 10000; i++)
-        if (zpool_store(p, buf, sizeof buf, ZPOOL_PAGE_SIZE) != ZPOOL_HANDLE_NONE)
+        if (zpool_store(p, buf, sizeof buf, OBJ) != ZPOOL_HANDLE_NONE)
             stored++;
     struct zpool_stats st;
     zpool_get_stats(p, &st);
-    check(st.pool_bytes <= 64 * 1024, "pool respected its cap");
+    check(st.pool_bytes <= 16 * OBJ, "pool respected its cap");
     check(stored > 0, "stored something before the cap");
     check(st.store_failures > 0, "reported the refusals");
     zpool_destroy(p);
@@ -148,18 +157,18 @@ static void test_cap(void) {
 // Mixed sizes, interleaved store and free, with content verified at the end --
 // the shape that catches a free list threaded through the wrong class.
 static void test_mixed(void) {
-    struct zpool *p = zpool_create(0);
+    struct zpool *p = zpool_create(0, OBJ);
     enum { N = 3000 };
     static zpool_handle_t h[N];
     static size_t sz[N];
     static uint8_t ref[N][64];
 
     for (int i = 0; i < N; i++) {
-        sz[i] = (size_t) (17 + (i * 131) % 4000);
-        uint8_t in[ZPOOL_PAGE_SIZE];
+        sz[i] = (size_t) (17 + (i * 131) % (OBJ - 100));
+        uint8_t in[OBJ];
         fill(in, sz[i], (unsigned) i);
         memcpy(ref[i], in, 64 < sz[i] ? 64 : sz[i]);
-        h[i] = zpool_store(p, in, sz[i], ZPOOL_PAGE_SIZE);
+        h[i] = zpool_store(p, in, sz[i], OBJ);
         check(h[i] != ZPOOL_HANDLE_NONE, "mixed store");
         if (i % 3 == 0 && i > 0) {           // churn
             zpool_free(p, h[i - 1]);
@@ -169,7 +178,7 @@ static void test_mixed(void) {
     for (int i = 0; i < N; i++) {
         if (h[i] == ZPOOL_HANDLE_NONE)
             continue;
-        uint8_t out[ZPOOL_PAGE_SIZE];
+        uint8_t out[OBJ];
         size_t got = 0;
         check(zpool_load(p, h[i], out, sizeof out, &got), "mixed load");
         check(got == sz[i], "mixed size");

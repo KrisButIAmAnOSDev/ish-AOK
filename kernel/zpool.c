@@ -10,9 +10,15 @@
 // HANDLE ENCODING, and it is deliberately not a pointer:
 //
 //     bits 63..24  slab index      (40 bits -- 2^40 slabs is far past the cap)
-//     bits 23..12  entry index     (12 bits -- at most 16 entries per slab)
-//     bits 11..0   stored size     (12 bits -- 0..4095, and 4096 is impossible
-//                                   because an object that size is refused)
+//     bits 23..14  entry index     (10 bits -- at most 64 entries per slab, so
+//                                   1024 is ample headroom)
+//     bits 13..0   stored size     (14 bits -- 0..16383, and object_max itself
+//                                   is impossible because that size is refused)
+//
+// The size field is 14 bits rather than 12 because the pager stores FRAMES, and
+// a frame is mem_frame_size() -- 16 KiB on Apple Silicon, not 4 KiB. Sizing it
+// for a guest page would have silently truncated every frame handle on the
+// hardware this feature is for.
 //
 // A handle is therefore self-describing: freeing or loading needs no side
 // table, and a zeroed page-table entry reads as ZPOOL_HANDLE_NONE. The +1 on
@@ -36,6 +42,8 @@ struct zpool_slab {
 
 struct zpool {
     struct zpool_slab *slabs;
+    size_t object_max;        // slab size, and the ceiling on a stored object
+    uint16_t classes;         // object_max / ZPOOL_GRANULE
     uint32_t slab_count;
     uint32_t slab_capacity;
     // Head of each class's partial-slab list: slab index + 1, or 0.
@@ -52,11 +60,19 @@ static uint8_t *entry_ptr(struct zpool_slab *slab, uint16_t entry) {
     return slab->mem + (size_t) entry * class_entry_size(slab->class_index);
 }
 
-struct zpool *zpool_create(uint64_t max_bytes) {
+struct zpool *zpool_create(uint64_t max_bytes, size_t object_max) {
+    // A ceiling that is not a whole number of granules, or larger than the
+    // class table, would index past `partial` -- refuse rather than clamp, so a
+    // caller passing a frame size this build cannot serve finds out here.
+    if (object_max == 0 || object_max > ZPOOL_OBJECT_MAX ||
+            object_max % ZPOOL_GRANULE != 0)
+        return NULL;
     struct zpool *pool = calloc(1, sizeof *pool);
     if (pool == NULL)
         return NULL;
     pool->max_bytes = max_bytes;
+    pool->object_max = object_max;
+    pool->classes = (uint16_t) (object_max / ZPOOL_GRANULE);
     return pool;
 }
 
@@ -72,7 +88,7 @@ void zpool_destroy(struct zpool *pool) {
 // Add a slab for `class_index` and return its index, or UINT32_MAX.
 static uint32_t slab_new(struct zpool *pool, uint16_t class_index) {
     if (pool->max_bytes != 0 &&
-            pool->stats.pool_bytes + ZPOOL_PAGE_SIZE > pool->max_bytes)
+            pool->stats.pool_bytes + pool->object_max > pool->max_bytes)
         return UINT32_MAX;
 
     if (pool->slab_count == pool->slab_capacity) {
@@ -84,7 +100,7 @@ static uint32_t slab_new(struct zpool *pool, uint16_t class_index) {
         pool->slab_capacity = want;
     }
 
-    uint8_t *mem = malloc(ZPOOL_PAGE_SIZE);
+    uint8_t *mem = malloc(pool->object_max);
     if (mem == NULL)
         return UINT32_MAX;
 
@@ -92,7 +108,7 @@ static uint32_t slab_new(struct zpool *pool, uint16_t class_index) {
     struct zpool_slab *slab = &pool->slabs[idx];
     slab->mem = mem;
     slab->class_index = class_index;
-    slab->entries = (uint16_t) (ZPOOL_PAGE_SIZE / class_entry_size(class_index));
+    slab->entries = (uint16_t) (pool->object_max / class_entry_size(class_index));
     slab->used = 0;
     slab->free_head = 0;
     slab->next_partial = pool->partial[class_index];
@@ -106,7 +122,7 @@ static uint32_t slab_new(struct zpool *pool, uint16_t class_index) {
         memcpy(entry_ptr(slab, e), &next, sizeof next);
     }
 
-    pool->stats.pool_bytes += ZPOOL_PAGE_SIZE;
+    pool->stats.pool_bytes += pool->object_max;
     pool->stats.slabs++;
     return idx;
 }
@@ -128,9 +144,9 @@ static void partial_remove(struct zpool *pool, uint32_t idx) {
 
 zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
                            size_t original_size) {
-    // An object that needs a whole page or more saves nothing and cannot be
-    // encoded (the size field is 12 bits). The caller stores those raw.
-    if (pool == NULL || size == 0 || size >= ZPOOL_PAGE_SIZE) {
+    // An object that needs the whole ceiling or more saves nothing and cannot
+    // be encoded. The caller stores those raw.
+    if (pool == NULL || size == 0 || size >= pool->object_max) {
         if (pool != NULL)
             pool->stats.store_failures++;
         return ZPOOL_HANDLE_NONE;
@@ -165,7 +181,7 @@ zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
     pool->stats.stores++;
 
     return ((zpool_handle_t) (idx + 1) << 24) |
-           ((zpool_handle_t) entry << 12) |
+           ((zpool_handle_t) entry << 14) |
            (zpool_handle_t) size;
 }
 
@@ -178,8 +194,8 @@ static bool handle_decode(struct zpool *pool, zpool_handle_t handle,
     if (pool == NULL || handle == ZPOOL_HANDLE_NONE)
         return false;
     uint64_t slab_id = handle >> 24;
-    uint16_t entry = (uint16_t) ((handle >> 12) & 0xFFF);
-    size_t size = (size_t) (handle & 0xFFF);
+    uint16_t entry = (uint16_t) ((handle >> 14) & 0x3FF);
+    size_t size = (size_t) (handle & 0x3FFF);
     if (slab_id == 0 || slab_id > pool->slab_count || size == 0)
         return false;
     struct zpool_slab *slab = &pool->slabs[slab_id - 1];
