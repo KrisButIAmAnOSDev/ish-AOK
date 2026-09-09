@@ -181,6 +181,11 @@ extern NSString *const kPreferenceInitialWindowKey;
 // bigger hole in the user's free space rather than a bigger win.
 extern const NSInteger ISHSwapMaxSizeMB;
 extern const NSInteger ISHCompressedMemoryMaxSizeMB;
+// The ceiling actually enforced: a quarter of this device's RAM, floored at
+// 64 MB and capped at ISHCompressedMemoryMaxSizeMB. The pool is resident
+// memory and competes with what it saves, so a fixed number is wrong on a
+// small device -- see the definition.
+NSInteger ISHCompressedMemoryMaxForDevice(void);
 
 // "Open Everything as Default User" targets whatever account this rootfs already has at UID
 // 1000 (the conventional "first regular user" UID on Debian/Devuan/Alpine) -- no account is

@@ -66,7 +66,39 @@ const NSInteger ISHSwapMaxSizeMB = 16384;
 // The pool is RESIDENT memory, unlike the swap area which is disk, so its
 // ceiling is much lower: a pool larger than the device's RAM is not a
 // configuration, it is a jetsam kill waiting for a workload.
-const NSInteger ISHCompressedMemoryMaxSizeMB = 4096;
+// CLAMPED AGAINST THE DEVICE, not a fixed number.
+//
+// The first version was a flat 4096, chosen against swap's 16384 on the
+// reasoning that the pool is resident memory where the swap area is disk. That
+// is the right reasoning and the wrong number: on the 1.45 GB iPad this was
+// tested on, a 4 GB pool is not a configuration, it is a jetsam kill waiting
+// for a workload -- and the pool competes for the very memory it is saving,
+// since its own bytes are charged to phys_footprint exactly like the frames
+// they replaced.
+//
+// A quarter of physical RAM, floored so a small device still gets a usable
+// choice and capped so a large one does not get an absurd one. A quarter
+// because at the measured 2.2-2.8x that holds roughly 60-70% of RAM's worth of
+// guest memory, which is a large win while leaving three quarters of the
+// machine for everything else.
+static NSInteger ISHComputeCompressedMemoryMax(void) {
+    uint64_t ram = NSProcessInfo.processInfo.physicalMemory;
+    NSInteger quarter = (NSInteger) (ram / (4 * 1024 * 1024));
+    if (quarter < 64)
+        quarter = 64;
+    if (quarter > 4096)
+        quarter = 4096;
+    return quarter;
+}
+
+const NSInteger ISHCompressedMemoryMaxSizeMB = 4096;   // the absolute ceiling
+
+NSInteger ISHCompressedMemoryMaxForDevice(void) {
+    static NSInteger cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cached = ISHComputeCompressedMemoryMax(); });
+    return cached;
+}
 static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
@@ -212,7 +244,13 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceEnableSwapKey: @(NO),
             kPreferenceSwapSizeMBKey: @(0),
             kPreferenceEnableCompressedMemoryKey: @(NO),
-            kPreferenceCompressedMemorySizeMBKey: @(0),
+            // 128 MB, not 0. Swap's size registers as 0 ("no size chosen")
+            // because picking one would be AOK deciding how much of the user's
+            // FLASH to write to. This is RAM, it is bounded by the cap, and it
+            // writes nothing -- so a switch that does nothing until you also
+            // pick a number is just a foot-gun. The switch still defaults OFF;
+            // this only decides what you get when you turn it on.
+            kPreferenceCompressedMemorySizeMBKey: @(128),
             kPreferenceEnableLLMClientKey: @(NO),
             kPreferenceLLMProviderKey: @"OpenRouter Free",
             kPreferenceLLMServerURLKey: @"https://openrouter.ai/api/v1",
@@ -959,11 +997,11 @@ void amd64_jit_preference_set(bool enabled) {
 
 - (NSInteger)compressedMemorySizeMB {
     NSInteger value = [_defaults integerForKey:kPreferenceCompressedMemorySizeMBKey];
-    return MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxSizeMB);
+    return MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxForDevice());
 }
 
 - (void)setCompressedMemorySizeMB:(NSInteger)value {
-    [_defaults setInteger:MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxSizeMB)
+    [_defaults setInteger:MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxForDevice())
                    forKey:kPreferenceCompressedMemorySizeMBKey];
 }
 
@@ -971,7 +1009,7 @@ void amd64_jit_preference_set(bool enabled) {
     if (![*value isKindOfClass:NSNumber.class])
         return NO;
     NSInteger v = [*value integerValue];
-    return v >= 0 && v <= ISHCompressedMemoryMaxSizeMB;
+    return v >= 0 && v <= ISHCompressedMemoryMaxForDevice();
 }
 
 - (BOOL)validateSwapSizeMB:(id *)value error:(NSError **)error {
