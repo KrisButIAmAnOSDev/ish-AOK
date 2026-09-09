@@ -187,6 +187,43 @@ compressed round trip byte-for-byte, and the test FAILS rather than skips if no
 frame went through the tier. Run at a 1 MB cap it also covers the mixed case --
 640 frames held in RAM, 896 overflowed to flash, all correct.
 
+**IT WORKS ON A DEVICE, UNDER REAL PRESSURE.** Measured on the iPad 5th gen
+(A9, 1.45 GB) on 2026-09-09, with the tier enabled from Settings at a 128 MB cap
+and swap at 256 MB. Memory was consumed until the machine crossed kswapd's
+watermark -- which is `available < 2 x host_mem_headroom_floor`, so 482 MB
+against the 241 MB floor:
+
+```
+headroom 483 MB   pressure WARN (throttle engaged, growth still allowed)
+t+10s   stores=13419   bytes_written=0   headroom=482
+```
+
+kswapd engaged at the predicted threshold to the megabyte, evicted **13,419
+frames** -- 13419 x 16 KiB, about 210 MB of guest memory -- and
+**`bytes_written` stayed at 0**. Not one byte reached flash. That is the whole
+claim of the feature, on real hardware, under pressure that arrived on its own
+rather than being forced through a development control.
+
+**AND THE APP WAS JETSAM-KILLED SHORTLY AFTER**, which is the other half of the
+result and must not be filed under "test setup". The immediate cause was
+mine -- 850 MB of allocation on a 1.45 GB device, in two large steps, which is
+more than reclaim could stay ahead of. But there is a design point underneath it
+that is true regardless:
+
+**THE POOL IS RESIDENT MEMORY AND COMPETES WITH WHAT IT SAVES.** Compressing
+210 MB into a pool of at most 128 MB saves at most 82 MB; it does not save 210.
+The pool's own bytes are charged to `phys_footprint` exactly like the frames it
+replaced. So a cap that is generous relative to the device's RAM can make
+pressure worse rather than better, and the ceiling this shipped with -- 4 GB,
+chosen against swap's 16 GB -- is far too generous for a 1.5 GB device to be
+offered without guidance.
+
+**Open, and it is the next thing to settle**: whether the cap should be clamped
+against device RAM (a fraction of it), or merely advised. Unresolved here
+because the evidence does not distinguish "the pool made it worse" from "I
+allocated too much too fast", and picking one without the data would be exactly
+the kind of story this file exists to avoid.
+
 **RAM-ONLY IS NOT BUILT, AND MOSTLY DOES NOT NEED TO BE.** This is zswap (a
 cache in front of a swap area), not zram (a replacement for one), so it does
 nothing unless swap is enabled -- and enabling swap costs flash immediately,
