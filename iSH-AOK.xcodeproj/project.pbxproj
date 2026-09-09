@@ -222,7 +222,9 @@
 		BBA8E2C1236FF5EA00515F76 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BBA8E2C0236FF5EA00515F76 /* SystemConfiguration.framework */; };
 		BBAEE339249B58E80069EBB5 /* libbz2.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = BBAEE338249B58E80069EBB5 /* libbz2.tbd */; };
 		C0A000012E00000100000011 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000012E00000100000010 /* libz.tbd */; };
+		C0A000012E00000100000022 /* libcompression.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000012E00000100000020 /* libcompression.tbd */; };
 		C0A000012E00000100000012 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000012E00000100000010 /* libz.tbd */; };
+		C0A000012E00000100000021 /* libcompression.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000012E00000100000020 /* libcompression.tbd */; };
 		BBBCE7E321D2F02200CA00B3 /* About.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BBBCE7E521D2F02200CA00B3 /* About.storyboard */; };
 		BBBF7B5C2415CDBB00EC4C14 /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = BBBF7B5B2415CDBB00EC4C14 /* Settings.bundle */; };
 		BBBFE94921C5CFF100509DD5 /* NSError+ISHErrno.m in Sources */ = {isa = PBXBuildFile; fileRef = BB13F4DD21C5770000343E17 /* NSError+ISHErrno.m */; };
@@ -715,6 +717,7 @@
 		BBA8E2C0236FF5EA00515F76 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		BBAEE338249B58E80069EBB5 /* libbz2.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libbz2.tbd; path = usr/lib/libbz2.tbd; sourceTree = SDKROOT; };
 		C0A000012E00000100000010 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libz.tbd; path = usr/lib/libz.tbd; sourceTree = SDKROOT; };
+		C0A000012E00000100000020 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
 		BBAEE33A249BDADC0069EBB5 /* ProgressReportViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ProgressReportViewController.h; sourceTree = "<group>"; };
 		BBAEE33B249BDADC0069EBB5 /* ProgressReportViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ProgressReportViewController.m; sourceTree = "<group>"; };
 		BBBCE7E421D2F02200CA00B3 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/About.storyboard; sourceTree = "<group>"; };
@@ -777,6 +780,7 @@
 			files = (
 				497F6D87254E62E100C82F46 /* libish.a in Frameworks */,
 				C0A000012E00000100000012 /* libz.tbd in Frameworks */,
+				C0A000012E00000100000021 /* libcompression.tbd in Frameworks */,
 				BBFB2C7E259026C200545EAB /* libish_emu.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -803,6 +807,7 @@
 				BBA8E2C1236FF5EA00515F76 /* SystemConfiguration.framework in Frameworks */,
 				BBAEE339249B58E80069EBB5 /* libbz2.tbd in Frameworks */,
 				C0A000012E00000100000011 /* libz.tbd in Frameworks */,
+				C0A000012E00000100000022 /* libcompression.tbd in Frameworks */,
 				BBA110ED2A1B2C3D4E5F0002 /* liblzma.xcframework in Frameworks */,
 				BB6DB261216435340047A611 /* libiconv.tbd in Frameworks */,
 				BBFB55662158644C00DFE6DE /* libresolv.tbd in Frameworks */,
@@ -1164,6 +1169,7 @@
 				C0A000012E00000100000009 /* AudioToolbox.framework */,
 				BBAEE338249B58E80069EBB5 /* libbz2.tbd */,
 				C0A000012E00000100000010 /* libz.tbd */,
+				C0A000012E00000100000020 /* libcompression.tbd */,
 				BE6DA9592C0D243E00A7A001 /* MetricKit.framework */,
 				BBA8E2C0236FF5EA00515F76 /* SystemConfiguration.framework */,
 				BB235536235D49B300139E00 /* CoreLocation.framework */,
