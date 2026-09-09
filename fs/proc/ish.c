@@ -302,8 +302,21 @@ static int proc_ish_show_snapshot(struct proc_entry *UNUSED(entry), struct proc_
         proc_printf(buf, "\n  echo <name> > /proc/ish/snapshot   # clone the booted root to a sibling directory\n\n");
     // Cost is per directory entry, not per byte -- say so here rather than let
     // the first user discover it on a root full of node_modules.
+    //
+    // Platform-conditional, because the unconditional version was a capability
+    // lie: it promised copy-on-write sharing on a host that has no clone
+    // support and had just made a full byte-for-byte copy. Caught by running
+    // the fallback on Linux, where the same text printed beside "6982 entries
+    // copied -- no clone support on this host".
+#if defined(__APPLE__)
     proc_printf(buf, "A snapshot costs roughly 25us per directory entry and almost nothing\n");
-    proc_printf(buf, "per byte: the file data is shared copy-on-write with the original.\n");
+    proc_printf(buf, "per byte: the file data is shared copy-on-write with the original,\n");
+    proc_printf(buf, "so it costs no space until the two copies diverge.\n");
+#else
+    proc_printf(buf, "This host has no copy-on-write clone support, so a snapshot is a full\n");
+    proc_printf(buf, "copy: it costs time proportional to the data and as much space as the\n");
+    proc_printf(buf, "original. (On iOS and macOS it is an APFS clone and costs neither.)\n");
+#endif
     return 0;
 }
 
