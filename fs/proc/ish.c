@@ -10,6 +10,7 @@
 #include "emu/memory.h"
 #include "kernel/swap.h"
 #include "fs/fake-snapshot.h"
+#include "kernel/memcomp.h"
 #include "fs/poll.h"
 #include "util/sync.h"
 #include "platform/platform.h"
@@ -265,6 +266,128 @@ static bool snapshot_root_data_path(char *out, size_t size) {
     }
     mount_release(root);
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// /proc/ish/mem_compress -- phase 0 for guest-memory compression
+// ---------------------------------------------------------------------------
+//
+// A measurement, not a feature. See kernel/memcomp.c for what it is answering
+// and why the obvious answer ("the OS already compresses, so don't bother") is
+// wrong: the host's compression does not move phys_footprint, which is the
+// ledger jetsam kills on, so it buys AOK no headroom at all.
+
+static lock_t memcomp_last_lock = LOCK_INITIALIZER;
+static struct memcomp_result memcomp_last;
+static bool memcomp_last_valid;
+static dword_t memcomp_last_pid;
+
+static void proc_ish_show_memcomp_algo(struct proc_data *buf, const char *name,
+                                       const struct memcomp_algo *a,
+                                       uint64_t bytes_in, uint64_t pages) {
+    if (pages == 0)
+        return;
+    double ratio = a->bytes_out > 0 ? (double) bytes_in / (double) a->bytes_out : 0;
+    proc_printf(buf, "  %-6s ratio %5.2fx   saved %6llu MB of %llu MB\n",
+                name, ratio,
+                (unsigned long long) ((bytes_in - a->bytes_out) / 1048576),
+                (unsigned long long) (bytes_in / 1048576));
+    proc_printf(buf, "         compress %6.2f us/page   decompress %6.2f us/page\n",
+                (double) a->ns_compress / (double) pages / 1000.0,
+                (double) a->ns_decompress / (double) pages / 1000.0);
+    proc_printf(buf, "         >=8x %llu  >=4x %llu  >=2x %llu  >=1.33x %llu  worse %llu\n",
+                (unsigned long long) a->buckets[0], (unsigned long long) a->buckets[1],
+                (unsigned long long) a->buckets[2], (unsigned long long) a->buckets[3],
+                (unsigned long long) a->buckets[4]);
+    proc_printf(buf, "         incompressible %llu   verify_failures %llu%s\n",
+                (unsigned long long) a->incompressible,
+                (unsigned long long) a->verify_failures,
+                a->verify_failures != 0 ? "   <-- BROKEN, ratio above means nothing" : "");
+}
+
+static int proc_ish_show_mem_compress(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    if (!memcomp_available()) {
+        proc_printf(buf, "no compressor on this host -- nothing to measure\n");
+        return 0;
+    }
+    lock(&memcomp_last_lock, 0);
+    if (!memcomp_last_valid) {
+        unlock(&memcomp_last_lock);
+        proc_printf(buf, "no measurement yet\n");
+        proc_printf(buf, "\n  echo <pid> > /proc/ish/mem_compress   # measure that process's resident pages\n\n");
+        proc_printf(buf, "Reports what AOK-level compression would buy. The HOST already compresses\n");
+        proc_printf(buf, "idle memory for free, but that does not move phys_footprint -- the ledger\n");
+        proc_printf(buf, "jetsam kills on -- so only compression AOK does itself can help.\n");
+        return 0;
+    }
+    struct memcomp_result r = memcomp_last;
+    dword_t pid = memcomp_last_pid;
+    unlock(&memcomp_last_lock);
+
+    proc_printf(buf, "last measurement pid %d\n", (int) pid);
+    proc_printf(buf, "  resident pages  %llu  (%llu MB at %zu-byte pages)\n",
+                (unsigned long long) r.pages,
+                (unsigned long long) (r.bytes_in / 1048576), r.page_size);
+    proc_printf(buf, "  walk took       %llu ms for all three algorithms\n\n",
+                (unsigned long long) (r.wall_ns / 1000000));
+    proc_ish_show_memcomp_algo(buf, "lz4", &r.lz4, r.bytes_in, r.pages);
+    proc_ish_show_memcomp_algo(buf, "lzfse", &r.lzfse, r.bytes_in, r.pages);
+    proc_ish_show_memcomp_algo(buf, "zlib", &r.zlib, r.bytes_in, r.pages);
+    return 0;
+}
+
+static int proc_ish_update_mem_compress(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    if (!memcomp_available())
+        return _ENOSYS;
+    if (data->size == 0 || data->size > 32)
+        return _EINVAL;
+    char text[33];
+    memcpy(text, data->data, data->size);
+    text[data->size] = '\0';
+    if (strlen(text) != data->size)
+        return _EINVAL;
+    char *end = NULL;
+    long want = strtol(text, &end, 10);
+    while (end != NULL && (*end == '\n' || *end == ' '))
+        end++;
+    if (end == NULL || *end != '\0' || want <= 0)
+        return _EINVAL;
+
+    // Identical pinning to proc_ish_update_swap_evict, and for the identical
+    // reason: pids_lock does not protect task->mm, do_exit frees it with
+    // neither lock held, and walking a dying address space dereferences NULL
+    // (three crash reports, same stack). trylock rather than lock, because
+    // do_exit spins in exit_wait_backoff() holding general_lock and a task
+    // mid-exit has nothing worth measuring.
+    struct task *task = pid_get_task_ref((dword_t) want);
+    if (task == NULL)
+        return _ESRCH;
+    struct mm *mm = NULL;
+    if (trylock(&task->general_lock) == 0) {
+        if (task->mm != NULL) {
+            mm = task->mm;
+            mm_retain(mm);
+        }
+        unlock(&task->general_lock);
+    }
+    task_ref_cnt_mod(task, -1);
+    if (mm == NULL)
+        return _ESRCH;
+
+    struct memcomp_result result;
+    int err = memcomp_measure_mem(&mm->mem, &result);
+    mm_release(mm);
+    if (err != 0)
+        return err;
+
+    lock(&memcomp_last_lock, 0);
+    memcomp_last = result;
+    memcomp_last_pid = (dword_t) want;
+    memcomp_last_valid = true;
+    unlock(&memcomp_last_lock);
+    return 0;
 }
 
 static int proc_ish_show_snapshot(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1353,6 +1476,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"swap", S_IFREG | 0644, .show = proc_ish_show_swap, .update = proc_ish_update_swap},
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
     {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
+    {"mem_compress", S_IFREG | 0644, .show = proc_ish_show_mem_compress, .update = proc_ish_update_mem_compress},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},
     {"wake_signals", .show = proc_ish_show_wake_signals},

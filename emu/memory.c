@@ -837,6 +837,63 @@ static size_t mem_page_count_walk(struct mem *mem, bool resident_only) {
     return count;
 }
 
+// Call `cb` once for every RESIDENT page of this address space, with a host
+// pointer to that page's bytes.
+//
+// Exists so a caller outside this file can iterate real guest pages without
+// the page-table internals being exported -- mem_next_chunk_root,
+// PGDIR_LEAF_BASE and struct pt_directory_chunk are deliberately private, and
+// the first consumer (kernel/memcomp.c) tried to reach them and could not.
+//
+// Resident only, and that is not a filter but a correctness requirement: a page
+// the pager has taken has no host bytes to read, and touching it through the
+// guest would fault it back in and change the state being examined. Same
+// conservative-hint caveat as mem_resident_page_count -- the entry's
+// swap_state can say SWAPPED over a frame a forked sibling brought back -- so
+// this UNDER-reports rather than handing out a pointer that is not there.
+//
+// The caller must hold the mm alive (mm_retain); this takes no lock of its own,
+// exactly as the page-count walks above do, and for the same reason: a page
+// that changes under a sampler is a page either counted or not, and no caller
+// of a whole-address-space walk can mean anything more precise.
+void mem_walk_resident_pages(struct mem *mem, mem_page_visitor_t cb, void *ctx) {
+    if (mem == NULL || cb == NULL)
+        return;
+    for (page_t root = mem_next_chunk_root(mem, 0); root < MEM_PGDIR_ROOT_SIZE;
+            root = mem_next_chunk_root(mem, root + 1)) {
+        if (PGDIR_LEAF_BASE(root, 0) >= mem->page_limit)
+            return;
+        struct pt_directory_chunk *chunk =
+            atomic_load_explicit(&mem->pgdir_root[root], memory_order_acquire);
+        if (chunk == NULL)
+            continue;
+        for (page_t mid = mem_next_leaf_mid(chunk, 0); mid < MEM_PGDIR_MID_SIZE;
+                mid = mem_next_leaf_mid(chunk, mid + 1)) {
+            struct pt_entry *entries =
+                atomic_load_explicit(&chunk->leaves[mid], memory_order_acquire);
+            if (entries == NULL)
+                continue;
+            page_t base = PGDIR_LEAF_BASE(root, mid);
+            if (base >= mem->page_limit)
+                return;
+            size_t limit = MEM_PTDIR_SIZE;
+            if (base + MEM_PTDIR_SIZE > mem->page_limit)
+                limit = (size_t) (mem->page_limit - base);
+            for (size_t i = 0; i < limit; i++) {
+                struct data *data = entries[i].data;
+                if (data == NULL)
+                    continue;
+                if (atomic_load_explicit(&entries[i].swap_state,
+                            memory_order_relaxed) != PT_RESIDENT)
+                    continue;
+                if (data->data == NULL)
+                    continue;
+                cb((const char *) data->data + entries[i].offset, ctx);
+            }
+        }
+    }
+}
+
 size_t mem_mapped_page_count(struct mem *mem) {
     return mem_page_count_walk(mem, false);
 }

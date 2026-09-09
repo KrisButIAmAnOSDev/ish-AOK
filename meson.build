@@ -183,6 +183,17 @@ sqlite3 = cc.find_library('sqlite3')
 # link. required: false so a host without it still builds, with tar and gzip
 # excluded exactly as they were before.
 zlib = cc.find_library('z', required: false, has_headers: ['zlib.h'])
+
+# libcompression: Apple's in-OS compressor (LZ4, LZFSE, ZLIB). Public on macOS
+# 10.11+ and iOS 9+, so like zlib above this costs nothing but the link -- no
+# vendored code, nothing to keep up to date. Used by kernel/memcomp.c, the
+# phase-0 measurement for guest-memory compression. required: false so a host
+# without it still builds; memcomp_available() then reports no compressor and
+# the /proc surface says so rather than lying.
+libcompression = cc.find_library('compression', required: false, has_headers: ['compression.h'])
+if libcompression.found()
+    add_project_arguments('-DISH_HAVE_LIBCOMPRESSION=1', language: 'c')
+endif
 if zlib.found()
     # kernel/smallclue_glue.c defines tar/gzip/gunzip/zcat stubs when this is
     # absent. add_project_arguments has to run before any target is declared,
@@ -264,7 +275,7 @@ endif
 if not have_curl_shim and host_machine.system() in ['darwin', 'ios']
     warning('no Objective-C compiler -- curl and wget will be stubs')
 endif
-dependencies = [librt, libm, libdl, libatomic, threads, sqlite3]
+dependencies = [librt, libm, libdl, libatomic, threads, sqlite3, libcompression]
 if zlib.found()
     dependencies += zlib
 endif
@@ -518,7 +529,7 @@ src = [
     'kernel/time.c',
     'kernel/binfmt_misc.c',
     'kernel/mmap.c',
-    'kernel/swap.c',
+    'kernel/memcomp.c', 'kernel/swap.c',
     'kernel/uname.c',
     'kernel/tls.c',
     'kernel/futex.c',
