@@ -58,6 +58,13 @@ void zswap_set_preference(bool enabled, unsigned size_mb) {
     pthread_mutex_unlock(&zswap_lock);
 }
 
+unsigned zswap_requested_mb(void) {
+    pthread_mutex_lock(&zswap_lock);
+    unsigned mb = (zswap_pref_seen && zswap_pref_enabled) ? zswap_pref_size_mb : 0;
+    pthread_mutex_unlock(&zswap_lock);
+    return mb;
+}
+
 void zswap_startup(void) {
     pthread_mutex_lock(&zswap_lock);
     bool on = zswap_pref_seen && zswap_pref_enabled;

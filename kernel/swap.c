@@ -68,10 +68,30 @@ static lock_t swap_config_lock = LOCK_INITIALIZER;
 static _Atomic bool swap_on;
 
 static int swap_fd = -1;
+// RAM-ONLY MODE. The area has slots but no file: every eviction must be taken
+// by the compressed tier or refused, and nothing is ever written to storage.
+//
+// This is zram rather than zswap, and it exists because the two answer different
+// worries. zswap needs a swap area, and creating one costs flash IMMEDIATELY --
+// the file is F_PREALLOCATE'd and ftruncate'd to its full size before a single
+// page is written. A user whose concern is wear or free space should not have to
+// hand over a gigabyte of storage to enable the feature whose entire point is
+// not writing to storage.
+static bool swap_ram_only;
+
 static uint64_t swap_slot_size;        // one host frame
 static uint32_t swap_slot_count;       // slots in the area, INCLUDING slot 0
 static uint32_t swap_slots_used;       // allocated, i.e. out on disk
 static uint64_t *swap_free_bitmap;     // 1 = free
+// "An area exists to allocate slots from", which is NOT the same as "a file is
+// open" once RAM-only mode exists. The bitmap is allocated with the area and
+// freed with it, in both modes, so it is the honest test. Every site that used
+// to ask `swap_fd >= 0` to mean this now asks here; the sites that genuinely
+// need a descriptor to do I/O still check the fd, and in RAM-only mode they are
+// unreachable because the tier takes every slot.
+static bool swap_area_live_locked(void) {
+    return swap_free_bitmap != NULL;
+}
 static uint32_t swap_alloc_rover;      // where the last search stopped
 
 static _Atomic uint64_t swap_stat_alloc_fail;
@@ -207,10 +227,11 @@ static int swap_reserve(int fd, uint64_t bytes) {
 // lock story is that swap_lock is a leaf that is never held across I/O -- a
 // claim that was not actually true while the close path did both under it.
 static int swap_file_detach_locked(uint64_t **bitmap_out) {
-    int fd = swap_fd;
+    int fd = swap_fd;           // -1 in RAM-only mode; the caller must not close it
     *bitmap_out = swap_free_bitmap;
     swap_fd = -1;
     swap_free_bitmap = NULL;
+    swap_ram_only = false;
     swap_slot_count = 0;
     zswap_set_slot_geometry(0, 0);      // drops the pool with the area
     swap_slots_used = 0;
@@ -239,7 +260,7 @@ static void swap_disable_locked(void);
 static void swap_kswapd_start_locked(void);
 static void swap_kswapd_stop_locked(void);
 
-static int swap_enable_locked(uint64_t bytes) {
+static int swap_enable_locked(uint64_t bytes, bool ram_only) {
     uint64_t frame = mem_frame_size();
     if (frame == 0)
         return _EINVAL;
@@ -256,7 +277,7 @@ static int swap_enable_locked(uint64_t bytes) {
     uint32_t slots = (uint32_t) usable_slots + 1;
 
     lock(&swap_lock, 0);
-    if (swap_fd >= 0) {
+    if (swap_area_live_locked()) {
         bool same_size = swap_slot_count == slots && swap_slot_size == frame;
         bool draining = !atomic_load_explicit(&swap_on, memory_order_relaxed);
         unlock(&swap_lock);
@@ -274,7 +295,7 @@ static int swap_enable_locked(uint64_t bytes) {
         // the gap.
         swap_disable_locked();
         lock(&swap_lock, 0);
-        if (swap_fd >= 0) {
+        if (swap_area_live_locked()) {
             unlock(&swap_lock);
             return _EBUSY;          // still draining after the disable
         }
@@ -294,22 +315,31 @@ static int swap_enable_locked(uint64_t bytes) {
     if (bitmap == NULL)
         return _ENOMEM;
 
-    int fd = host_unlinked_tmpfd();
-    if (fd < 0) {
+    // RAM-only: no file at all. Not a zero-length one, not a sparse one -- the
+    // point is that nothing is reserved and nothing can be written. Slots are
+    // pure addressing here; the compressed pool is the only storage.
+    int fd = -1;
+    if (!ram_only)
+        fd = host_unlinked_tmpfd();
+    if (!ram_only && fd < 0) {
         free(bitmap);
         return fd;
     }
-    int err = swap_reserve(fd, total);
-    if (err == 0 && ftruncate(fd, (off_t) total) != 0)
-        err = errno == ENOSPC ? _ENOSPC : _EIO;
-    if (err != 0) {
-        close(fd);
-        free(bitmap);
-        return err;                 // never a smaller area than was asked for
+    int err = 0;
+    if (!ram_only) {
+        err = swap_reserve(fd, total);
+        if (err == 0 && ftruncate(fd, (off_t) total) != 0)
+            err = errno == ENOSPC ? _ENOSPC : _EIO;
+        if (err != 0) {
+            close(fd);
+            free(bitmap);
+            return err;             // never a smaller area than was asked for
+        }
     }
 
     lock(&swap_lock, 0);
     swap_fd = fd;
+    swap_ram_only = ram_only;
     swap_slot_size = frame;
     swap_slot_count = slots;
     // Tell the compressed tier the shape of the area it is fronting. It drops
@@ -347,7 +377,7 @@ static void swap_disable_locked(void) {
     swap_kswapd_stop_locked();
 
     lock(&swap_lock, 0);
-    bool anything_to_do = swap_fd >= 0;
+    bool anything_to_do = swap_area_live_locked();
     unlock(&swap_lock);
     if (!anything_to_do)
         return;
@@ -439,7 +469,21 @@ static _Atomic uint64_t swap_last_enable_bytes;
 
 int swap_enable(uint64_t bytes) {
     lock(&swap_config_lock, 0);
-    int err = swap_enable_locked(bytes);
+    int err = swap_enable_locked(bytes, false);
+    atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
+    atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
+    unlock(&swap_config_lock);
+    return err;
+}
+
+// Same, but with no backing file: every eviction must be taken by the
+// compressed tier or refused. `bytes` is the ADDRESSABLE size -- how much guest
+// memory may be evicted -- not the memory this will use, which is the
+// compressed pool's own cap. See swap_ram_only.
+int swap_enable_ram_only(uint64_t bytes) {
+
+    lock(&swap_config_lock, 0);
+    int err = swap_enable_locked(bytes, true);
     atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
     atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
     unlock(&swap_config_lock);
@@ -480,7 +524,7 @@ int swap_slot_alloc(uint32_t *slot_out) {
         return _ENOSPC;
     }
     if (!atomic_load_explicit(&swap_on, memory_order_acquire) ||
-            swap_fd < 0 || swap_free_bitmap == NULL) {
+            !swap_area_live_locked()) {
         unlock(&swap_lock);
         // Counted, because "there was no area to evict into" and "the area the
         // user chose is full" are different things the /proc report should not
@@ -536,7 +580,7 @@ void swap_slot_free(uint32_t slot) {
         swap_alloc_rover = slot;
     }
     bool drained = swap_slots_used == 0 &&
-        !atomic_load_explicit(&swap_on, memory_order_relaxed) && swap_fd >= 0;
+        !atomic_load_explicit(&swap_on, memory_order_relaxed) && swap_area_live_locked();
     int fd = -1;
     uint64_t *bitmap = NULL;
     if (drained) {
@@ -584,6 +628,18 @@ int swap_slot_write(uint32_t slot, const void *buf, size_t len) {
         atomic_fetch_add_explicit(&swap_stat_pswpout, len / PAGE_SIZE,
                                   memory_order_relaxed);
         return 0;
+    }
+    // RAM-only: there is nowhere else for this frame to go. Refusing is the
+    // correct and safe answer -- the caller frees the slot and leaves the frame
+    // resident (emu/memory.c), so an incompressible frame or a full pool simply
+    // stops being evictable rather than being lost or silently written
+    // somewhere. This is the branch that makes a file-less area sound.
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (ram_only) {
+        atomic_fetch_add_explicit(&swap_stat_io_errors, 0, memory_order_relaxed);
+        return _ENOSPC;
     }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
@@ -857,6 +913,20 @@ int swap_slot_read(uint32_t slot, void *buf, size_t len) {
         atomic_fetch_add_explicit(&swap_stat_pswpin, len / PAGE_SIZE,
                                   memory_order_relaxed);
         return 0;
+    }
+    // RAM-only: the pool is the ONLY place this frame's bytes ever were. If the
+    // tier does not have it, they are gone -- there is no file to fall through
+    // to, and reading one would hand the guest whatever those blocks contained.
+    // That is a bug in the tier or in slot accounting, not a recoverable state,
+    // so say so as loudly as possible rather than returning plausible garbage.
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (ram_only) {
+        printk("swap: BUG -- RAM-only slot %u is not in the compressed pool; "
+               "its contents are gone and there is no file to read\n", slot);
+        atomic_fetch_add_explicit(&swap_stat_io_errors, 1, memory_order_relaxed);
+        return _EIO;
     }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
@@ -1195,10 +1265,40 @@ void swap_set_preference(bool enabled, unsigned size_mb) {
     atomic_store_explicit(&swap_pref_seen, true, memory_order_release);
 }
 
+// Compressed memory with no swap area behind it. The addressable size is
+// derived from the pool's cap rather than asked for separately: slots are pure
+// addressing here (one bit of bitmap and eight bytes of table each), the pool is
+// the real limit, and the device runs showed that making the ADDRESSABLE size
+// the binding constraint is the mistake -- eviction stops dead when slots run
+// out however much pool is left. Eight times the cap means the pool always runs
+// out first, which is the constraint the user actually chose.
+static void swap_start_ram_only(unsigned pool_mb) {
+    uint64_t addressable = (uint64_t) pool_mb * 8 * 1024 * 1024;
+    int err = swap_enable_ram_only(addressable);
+    if (err < 0) {
+        printk("zram: could not create a %u MB file-less area (%d)\n", pool_mb, err);
+        return;
+    }
+    zswap_startup();
+    if (!zswap_enabled()) {
+        // The area exists but nothing can use it: every eviction would be
+        // refused. Take it back down rather than leave a pager that cannot page.
+        printk("zram: the compressed tier did not come up; disabling the area\n");
+        swap_disable();
+    }
+}
+
 void swap_startup(void) {
     if (atomic_load_explicit(&swap_pref_seen, memory_order_acquire)) {
-        if (!atomic_load_explicit(&swap_pref_enabled, memory_order_relaxed))
+        if (!atomic_load_explicit(&swap_pref_enabled, memory_order_relaxed)) {
+            // Swap off. Compressed memory can still run on its own, with no
+            // file and nothing ever written to storage -- which is the
+            // configuration for a user whose worry is flash rather than RAM.
+            unsigned pool_mb = zswap_requested_mb();
+            if (pool_mb > 0)
+                swap_start_ram_only(pool_mb);
             return;
+        }
         unsigned mb = atomic_load_explicit(&swap_pref_size_mb, memory_order_relaxed);
         if (mb == 0) {
             // Refused rather than guessed, and said out loud. The UI is
@@ -1258,14 +1358,20 @@ void swap_startup(void) {
         }
     }
     long want = strtol(mb, NULL, 10);
+    // ISH_GUEST_SWAP_MB=0 with a tier size asks for RAM-only, the same shape
+    // Settings gets when the swap switch is off and the compressed one is on.
+    if (want <= 0) {
+        unsigned pool_mb = zswap_requested_mb();
+        if (pool_mb > 0)
+            swap_start_ram_only(pool_mb);
+        return;
+    }
     // Record it as the preference as well. swapon(2) restores the area at the
     // size that was chosen for it, and on this branch the env knob IS that
     // choice -- without this, swapoff then swapon on the CLI could not come
     // back, which is the only place the pair can be exercised at all.
     if (want > 0)
         atomic_store_explicit(&swap_pref_size_mb, (unsigned) want, memory_order_relaxed);
-    if (want <= 0)
-        return;
     int err = swap_enable((uint64_t) want * 1024 * 1024);
     if (err < 0)
         printk("swap: ISH_GUEST_SWAP_MB=%s refused (%d)\n", mb, err);
@@ -1292,7 +1398,8 @@ void swap_get_stats(struct swap_stats *out) {
     // never true at once -- "on" beside a slot count from before an enable, or
     // "off, draining" beside the totals of an area that had just been created.
     out->enabled = atomic_load_explicit(&swap_on, memory_order_relaxed);
-    out->draining = swap_fd >= 0 && !out->enabled;
+    out->draining = swap_area_live_locked() && !out->enabled;
+    out->ram_only = swap_ram_only;
     out->write_budget_bytes = swap_write_budget;
     out->written_window_bytes = swap_written_window;
     unlock(&swap_lock);
@@ -1348,6 +1455,7 @@ size_t swap_status_text(char *buf, size_t size) {
     int n = snprintf(buf, size,
         "enabled          %s\n"
         "state            %s\n"
+        "backing          %s\n"
         "slot_size        %llu\n"
         "slots_total      %llu\n"
         "slots_free       %llu\n"
@@ -1367,6 +1475,12 @@ size_t swap_status_text(char *buf, size_t size) {
         "%s",
         s.enabled ? "yes" : "no",
         s.enabled ? "on" : (s.draining ? "off, draining" : "off"),
+        // Say which one this is. "state on" with no file behind it would read
+        // as "writing to flash" to anyone who did not know RAM-only mode
+        // existed, which is the opposite of what it is doing.
+        !s.enabled ? "none" :
+            (s.ram_only ? "compressed memory only -- NO file, nothing is ever written to storage"
+                        : "a swap file"),
         (unsigned long long) s.slot_size,
         (unsigned long long) s.slots_total,
         (unsigned long long) s.slots_free,

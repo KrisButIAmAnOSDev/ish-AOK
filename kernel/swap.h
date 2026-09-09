@@ -56,6 +56,10 @@ bool swap_enabled(void);
 // Idempotent for the same size. A different size is a disable followed by an
 // enable, so it pages everything back in first.
 int swap_enable(uint64_t bytes);
+// An area with slots but NO FILE: every eviction must be taken by the
+// compressed tier or refused, and nothing is ever written to storage. `bytes`
+// is the addressable size, not the memory used -- see swap_ram_only in swap.c.
+int swap_enable_ram_only(uint64_t bytes);
 
 // Turn the pager off: stop new eviction, fault every evicted page back into its
 // address space, then release the slot table and truncate and close the file.
@@ -245,7 +249,10 @@ struct swap_stats {
     uint64_t write_budget_bytes, written_window_bytes;
     uint64_t budget_refusals;  // evictions refused because the window is spent
     bool enabled;
-    bool draining;             // disabled, but slots are still out
+    bool draining;
+    // No backing file: the compressed tier is the only storage. See
+    // swap_ram_only in swap.c.
+    bool ram_only;             // disabled, but slots are still out
     bool quiesced;             // suspension gate held: no new eviction I/O
     bool kswapd_running;
     bool thrashing;            // background reclaim paused: pages come straight back

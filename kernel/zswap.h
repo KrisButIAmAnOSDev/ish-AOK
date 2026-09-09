@@ -50,6 +50,9 @@ void zswap_set_preference(bool enabled, unsigned size_mb);
 // Apply whatever was recorded. Called once from the boot path, after
 // swap_startup, because the tier is meaningless without an area to front.
 void zswap_startup(void);
+// What Settings asked for, in MiB, or 0 if the tier was not requested. Read by
+// the boot path to decide whether a RAM-only area is wanted at all.
+unsigned zswap_requested_mb(void);
 
 // Turn the tier on with a cap in MiB, or off with 0. Safe to call at any time;
 // disabling frees the pool, which forces every slot it held back to the file on
