@@ -47,6 +47,7 @@ ptrace_group_stop.c
 ptrace_trap_siginfo.c
 swap_roundtrip.c
 zswap_roundtrip.c
+zswap_fork_cow.c
 ptrace_thread_follow.c
 epoll_mod_wake.c
 epoll_oneshot_rearm.c
