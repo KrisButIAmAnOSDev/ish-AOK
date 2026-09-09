@@ -127,6 +127,52 @@ Two other absences are unrelated to this and are simply not worth it: **splice**
 on `/dev/fuse` (the transfers are not copy-bound) and the **`fsopen()`-based
 mount API** (a whole syscall family, and libfuse falls back cleanly).
 
+### Darwin compresses our memory already, and it buys us nothing
+
+Measured 2026-09-09 on this Mac, because "should AOK compress guest memory?"
+turns on whether the host is already doing it for us. It is -- and the result is
+the opposite of the obvious one.
+
+**Darwin compresses idle anonymous memory with no memory pressure at all.** A
+process that dirties 1 GiB and then does nothing has essentially all of it in
+the compressor within ~25 seconds:
+
+```
+COMPRESSIBLE (repeating byte)      INCOMPRESSIBLE (random)
+after dirtying  fp=1025.4 c=   0.0    after dirtying  fp=1025.4 c=   0.0
+after 25s idle  fp=1025.4 c=1024.2    after 25s idle  fp=1025.4 c=1023.9
+```
+
+(`fp` = `task_vm_info.phys_footprint`, `c` = `.compressed`, MB. Interleaved A/B,
+two rounds.)
+
+**And `phys_footprint` does not move.** 1025.4 MB in every arm -- whether the
+gigabyte compresses ~infinitely or not at all, whether the compressor has taken
+it or not. The ledger charges for the pages regardless of how well they
+compressed.
+
+**Why that matters more than it looks.** jetsam kills on `phys_footprint`
+(platform/darwin.c says so, and the swap budget is measured against it, not
+RSS). So the host's compression -- which is already happening, for free, to
+every cold guest page -- **buys AOK no headroom whatsoever**. It cannot be
+relied on to keep the app alive, and no amount of making guest memory more
+compressible will help by itself.
+
+**Which inverts the design question.** AOK-level compression is not redundant
+with the host's; it is the only kind that can help, because AOK would compress
+into its *own* smaller buffer and then actually release the originals -- and
+released pages do move the footprint. That is zram's model: hold N pages'
+worth of data in a pool of roughly N/ratio, and the footprint falls by the
+difference. It also composes with the pager: compress in RAM first, and only
+spend flash when the compressed pool is full, which cuts writes by the same
+ratio (see the swap write budget).
+
+**Not yet established, and needed before building anything:** the compression
+ratio and CPU cost on *real guest pages* rather than synthetic ones, the added
+latency on the fault path, and confirmation on a device that iOS's
+`phys_footprint` behaves as macOS's does here. The measurement above is macOS
+and uses `malloc`, not guest memory through AOK's page tables.
+
 ### PI futexes are ENOSYS
 
 Measured 2026-09-01 alongside the futex argument-validation work
