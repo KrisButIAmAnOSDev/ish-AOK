@@ -187,6 +187,46 @@ compressed round trip byte-for-byte, and the test FAILS rather than skips if no
 frame went through the tier. Run at a 1 MB cap it also covers the mixed case --
 640 frames held in RAM, 896 overflowed to flash, all correct.
 
+**UNDER A REAL DATABASE, WITH DECOMPRESSION ON THE CRITICAL PATH.** The runs
+above evicted memory and left it alone; nothing faulted back in any volume, so
+the decompress path was barely exercised (46 loads). This one puts it under
+sustained load. MariaDB 11.8.6 on the same iPad, 512 MB InnoDB buffer pool,
+sysbench 1.0.20 `oltp_read_write` over 2 tables x 394k rows (188 MB), two
+threads.
+
+Memory was pushed down until kswapd evicted part of the buffer pool -- reclaim
+fired at headroom 478 MB against the 482 MB watermark, **the second independent
+confirmation of that threshold** (nothing at 494, fired at 478) -- then sysbench
+was run against a buffer pool that was partly compressed:
+
+```
+                      TPS    avg ms   95th ms   errors   zswap loads
+cold baseline        3.48    571.89    787.74        0     64 ->  64
+partly compressed    4.42    452.25    707.07        0    162 -> 674
+```
+
+**512 frames were decompressed on the fault path during a 90-second run, with
+zero errors.** That is the correctness result: sysbench's point-selects and
+updates run against InnoDB pages that went out through the compressor and came
+back, and a decompression fault would surface as a query error or a wrong row,
+not silently. It did not.
+
+`declined` stayed 0 and `bytes_written` stayed 0 across the whole exercise, so
+real InnoDB pages compress as well as the synthetic ones did and none reached
+flash.
+
+**Do NOT read the TPS column as "compression makes it faster."** The two runs
+are not a controlled A/B: the baseline ran immediately after the data load with
+a cold buffer pool doing real disk I/O, and the second had a warmer one. The
+defensible claim is the weaker one -- **serving 512 faults from the compressed
+pool cost no measurable throughput or latency** -- and that is the question a
+user actually has.
+
+**Ratio on a mix including real InnoDB pages: 2.42x.** The reclaim added 7,278
+frames (113 MB of guest memory) for 46.8 MB of pool growth. That is close to the
+2.38x measured for cc1 on the Mac and above the 2.11x of the synthetic run, so
+database pages compress at least as well as the text records did.
+
 **THE CLEAN DEVICE RUN, 2026-09-09.** iPad 5th gen (A9, 1.45 GB), app in the
 foreground, no debugger attached, swap 1 GB, pool cap 128 MB, enabled from
 Settings. A single non-forking probe (`zprobe`) allocated 64 MB at a time and
