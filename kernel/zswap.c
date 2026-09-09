@@ -42,6 +42,34 @@ static uint8_t *zswap_cbuf;             // compression destination
 
 static struct zswap_stats zswap_stats_live;
 
+// What Settings asked for, remembered even when it arrives before startup.
+// Plain statics under the same mutex as everything else here rather than
+// atomics: they are written once per launch from the app's main thread and read
+// once from the boot path.
+static bool zswap_pref_seen;
+static bool zswap_pref_enabled;
+static unsigned zswap_pref_size_mb;
+
+void zswap_set_preference(bool enabled, unsigned size_mb) {
+    pthread_mutex_lock(&zswap_lock);
+    zswap_pref_enabled = enabled;
+    zswap_pref_size_mb = size_mb;
+    zswap_pref_seen = true;
+    pthread_mutex_unlock(&zswap_lock);
+}
+
+void zswap_startup(void) {
+    pthread_mutex_lock(&zswap_lock);
+    bool on = zswap_pref_seen && zswap_pref_enabled;
+    unsigned mb = zswap_pref_size_mb;
+    pthread_mutex_unlock(&zswap_lock);
+    // A size of 0 is "no size chosen", which keeps the tier off however the
+    // switch reads -- the same rule swap uses, and for the same reason: there
+    // is no size to derive from device RAM that would not be a guess.
+    if (on && mb > 0)
+        zswap_configure(mb);
+}
+
 bool zswap_enabled(void) {
 #if defined(ZSWAP_HAVE_COMPRESSION)
     // Relaxed read of a pointer that only changes under the lock, in a

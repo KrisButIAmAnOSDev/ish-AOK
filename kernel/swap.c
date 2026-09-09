@@ -1213,6 +1213,8 @@ void swap_startup(void) {
         int err = swap_enable((uint64_t) mb * 1024 * 1024);
         if (err < 0)
             printk("swap: enable failed (%d)\n", err);
+        else
+            zswap_startup();    // only once there is an area for it to front
         return;
     }
     // The CLI and Xcode-scheme path. Nothing on this branch is reachable from
@@ -1233,14 +1235,18 @@ void swap_startup(void) {
         atomic_store_explicit(&swap_fail_reads, true, memory_order_relaxed);
         printk("swap: FAULT INJECTION -- every slot read will fail\n");
     }
-    // The compressed tier, sized separately and off unless asked for. Read on
-    // the same branch as everything else here, so an installed app cannot reach
-    // it until it is wired to Settings the way swap's size is.
+    // The compressed tier's launch override. Settings is the shipping route
+    // (zswap_startup, called from the boot path); this is the CLI and Xcode one,
+    // and it wins because a developer who set it meant it.
     const char *zmb = getenv("ISH_GUEST_ZSWAP_MB");
     if (zmb != NULL && zmb[0] != '\0') {
         long z = strtol(zmb, NULL, 10);
+        // Recorded rather than applied, so there is exactly one place the tier
+        // is brought up -- and it is after swap_enable below, because a pool
+        // with no area in front of it has nothing to front. Same reason the
+        // size is recorded as a preference just below.
         if (z > 0)
-            zswap_configure((uint32_t) z);
+            zswap_set_preference(true, (unsigned) z);
     }
     const char *budget = getenv("ISH_GUEST_SWAP_WRITE_BUDGET_MB");
     if (budget != NULL && budget[0] != '\0') {
@@ -1263,6 +1269,8 @@ void swap_startup(void) {
     int err = swap_enable((uint64_t) want * 1024 * 1024);
     if (err < 0)
         printk("swap: ISH_GUEST_SWAP_MB=%s refused (%d)\n", mb, err);
+    else
+        zswap_startup();
 }
 
 // ---------------------------------------------------------------------------

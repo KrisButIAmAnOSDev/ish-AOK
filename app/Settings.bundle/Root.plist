@@ -108,6 +108,58 @@ The sizes offered here do not know how much room this device actually has. If th
 				<integer>16384</integer>
 			</array>
 		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+			<key>Title</key>
+			<string>Compressed Memory</string>
+			<key>FooterText</key>
+			<string>Keeps swapped-out memory compressed in RAM instead of writing it to storage. Typically 2-3x, so a 128 MB pool holds roughly 300 MB of guest memory, and it comes back far faster than a read from flash — and does not write to flash at all, so it does not count against the daily write budget. Needs Swap enabled. Uses the RAM you give it.</string>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+			<key>Title</key>
+			<string>Enable Compressed Memory</string>
+			<key>Key</key>
+			<string>Enable Compressed Memory</string>
+			<key>DefaultValue</key>
+			<false/>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Title</key>
+			<string>Compressed Memory Size</string>
+			<key>Key</key>
+			<string>Compressed Memory Size MB</string>
+			<key>DefaultValue</key>
+			<integer>0</integer>
+			<key>Titles</key>
+			<array>
+				<string>Not chosen (stays off)</string>
+				<string>32 MB</string>
+				<string>64 MB</string>
+				<string>128 MB</string>
+				<string>256 MB</string>
+				<string>512 MB</string>
+				<string>1 GB</string>
+				<string>2 GB</string>
+				<string>4 GB</string>
+			</array>
+			<key>Values</key>
+			<array>
+				<integer>0</integer>
+				<integer>32</integer>
+				<integer>64</integer>
+				<integer>128</integer>
+				<integer>256</integer>
+				<integer>512</integer>
+				<integer>1024</integer>
+				<integer>2048</integer>
+				<integer>4096</integer>
+			</array>
+		</dict>
 	</array>
 </dict>
 </plist>

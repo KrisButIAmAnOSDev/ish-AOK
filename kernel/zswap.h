@@ -41,6 +41,16 @@
 // OFF BY DEFAULT, and sized, for the same reason swap is: it spends the user's
 // memory, and how much is their decision.
 
+// Record what Settings asked for. RECORDS ONLY -- nothing allocates until
+// zswap_startup() acts on it, so this is safe to call from a KVO observer, for
+// the same reason swap_set_preference is (kernel/swap.h). Settings take effect
+// at the next launch: resizing a live pool would mean faulting everything back
+// first, which is deliberately not offered.
+void zswap_set_preference(bool enabled, unsigned size_mb);
+// Apply whatever was recorded. Called once from the boot path, after
+// swap_startup, because the tier is meaningless without an area to front.
+void zswap_startup(void);
+
 // Turn the tier on with a cap in MiB, or off with 0. Safe to call at any time;
 // disabling frees the pool, which forces every slot it held back to the file on
 // its next read -- so it is only called where the pager is quiesced.

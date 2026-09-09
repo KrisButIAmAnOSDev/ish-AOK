@@ -57,6 +57,7 @@
 #include "app/LocationDevice.h"
 #include "fs/fake-db.h"
 #include "kernel/swap.h"
+#include "kernel/zswap.h"
 #include "fs/sockrestart.h"
 #import <os/log.h>
 #import <os/lock.h>
@@ -2405,6 +2406,12 @@ static BOOL ISHPublishSwapConfiguration(NSInteger *outSizeMB) {
     NSInteger sizeMB = prefs.swapSizeMB; // already clamped to 0...ISHSwapMaxSizeMB
     BOOL enabled = prefs.shouldEnableSwap;
     swap_set_preference(enabled ? true : false, (unsigned) sizeMB);
+    // The compressed tier rides the same publish, for the same reason and with
+    // the same contract: it only RECORDS, and zswap_startup acts on it. Both
+    // are read once at boot, so a preference changed in the same turn as a boot
+    // must already be recorded when the boot path looks.
+    zswap_set_preference(prefs.shouldEnableCompressedMemory ? true : false,
+                         (unsigned) prefs.compressedMemorySizeMB);
     if (outSizeMB != NULL)
         *outSizeMB = sizeMB;
     return enabled;
@@ -3607,7 +3614,7 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     // is recorded for the next boot and does not reach a running pager -- swap
     // is sized once at launch and is deliberately not resizable in place
     // (docs/simulated_swap_plan.md section 3.13).
-    [UserPreferences.shared observe:@[@"shouldEnableSwap", @"swapSizeMB"] options:NSKeyValueObservingOptionInitial
+    [UserPreferences.shared observe:@[@"shouldEnableSwap", @"swapSizeMB", @"shouldEnableCompressedMemory", @"compressedMemorySizeMB"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         ISHPublishSwapConfiguration(NULL);
     }];

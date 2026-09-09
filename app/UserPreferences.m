@@ -34,6 +34,8 @@ static NSString *const kPreferenceEnablePixAccelKey = @"Enable Pixman Accel";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
 static NSString *const kPreferenceEnableSwapKey = @"Enable Swap";
 static NSString *const kPreferenceSwapSizeMBKey = @"Swap Size MB";
+static NSString *const kPreferenceEnableCompressedMemoryKey = @"Enable Compressed Memory";
+static NSString *const kPreferenceCompressedMemorySizeMBKey = @"Compressed Memory Size MB";
 static NSString *const kPreferenceEnableLLMClientKey = @"Enable LLM Client";
 static NSString *const kPreferenceLLMProviderKey = @"LLM Provider";
 static NSString *const kPreferenceLLMServerURLKey = @"LLM Server URL";
@@ -61,6 +63,10 @@ static NSString *const kPreferenceLoginAsDefaultUserKey = @"Login As Default Use
 
 const int ISHDefaultUserAccountUID = 1000;
 const NSInteger ISHSwapMaxSizeMB = 16384;
+// The pool is RESIDENT memory, unlike the swap area which is disk, so its
+// ceiling is much lower: a pool larger than the device's RAM is not a
+// configuration, it is a jetsam kill waiting for a workload.
+const NSInteger ISHCompressedMemoryMaxSizeMB = 4096;
 static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
@@ -205,6 +211,8 @@ void amd64_jit_preference_set(bool enabled) {
             // value instead of an empty one.
             kPreferenceEnableSwapKey: @(NO),
             kPreferenceSwapSizeMBKey: @(0),
+            kPreferenceEnableCompressedMemoryKey: @(NO),
+            kPreferenceCompressedMemorySizeMBKey: @(0),
             kPreferenceEnableLLMClientKey: @(NO),
             kPreferenceLLMProviderKey: @"OpenRouter Free",
             kPreferenceLLMServerURLKey: @"https://openrouter.ai/api/v1",
@@ -339,6 +347,8 @@ void amd64_jit_preference_set(bool enabled) {
 	        kPreferenceEnableExtraLockingKey: property(shouldEnableExtraLocking),
             kPreferenceEnableSwapKey: property(shouldEnableSwap),
             kPreferenceSwapSizeMBKey: property(swapSizeMB),
+            kPreferenceEnableCompressedMemoryKey: property(shouldEnableCompressedMemory),
+            kPreferenceCompressedMemorySizeMBKey: property(compressedMemorySizeMB),
             kPreferenceCapsLockMappingKey: property(capsLockMapping),
             kPreferenceOptionMappingKey: property(optionMapping),
             kPreferenceBacktickEscapeKey: property(backtickMapEscape),
@@ -927,6 +937,41 @@ void amd64_jit_preference_set(bool enabled) {
 - (void)setSwapSizeMB:(NSInteger)swapSizeMB {
     [_defaults setInteger:MIN(MAX(swapSizeMB, (NSInteger)0), ISHSwapMaxSizeMB)
                    forKey:kPreferenceSwapSizeMBKey];
+}
+
+// MARK: shouldEnableCompressedMemory / compressedMemorySizeMB
+//
+// Same shape as the two above, and clamped on the way OUT for the same reason:
+// the iOS Settings pane and anything else editing the domain directly write
+// these keys with none of our code running, so a stored 2^40 would otherwise
+// reach the pool as a real request.
+- (BOOL)shouldEnableCompressedMemory {
+    return [_defaults boolForKey:kPreferenceEnableCompressedMemoryKey];
+}
+
+- (void)setShouldEnableCompressedMemory:(BOOL)value {
+    [_defaults setBool:value forKey:kPreferenceEnableCompressedMemoryKey];
+}
+
+- (BOOL)validateShouldEnableCompressedMemory:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+- (NSInteger)compressedMemorySizeMB {
+    NSInteger value = [_defaults integerForKey:kPreferenceCompressedMemorySizeMBKey];
+    return MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxSizeMB);
+}
+
+- (void)setCompressedMemorySizeMB:(NSInteger)value {
+    [_defaults setInteger:MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxSizeMB)
+                   forKey:kPreferenceCompressedMemorySizeMBKey];
+}
+
+- (BOOL)validateCompressedMemorySizeMB:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class])
+        return NO;
+    NSInteger v = [*value integerValue];
+    return v >= 0 && v <= ISHCompressedMemoryMaxSizeMB;
 }
 
 - (BOOL)validateSwapSizeMB:(id *)value error:(NSError **)error {
