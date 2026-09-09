@@ -348,6 +348,48 @@ the evidence does not distinguish "the pool made it worse" from "the area was
 too small and I allocated too much too fast" -- and picking one without the data
 is exactly the kind of story this file exists to prevent.
 
+**ZRAM VERIFIED ON A DEVICE, 2026-09-09.** Everything about the file-less mode
+had been proven on the CLI, where /proc/ish/swap_evict can force an eviction --
+a control that is EPERM on an installed app by design. So on the iPad 5th gen,
+with swap OFF and compressed memory ON from Settings, memory was consumed until
+kswapd engaged on its own and then every allocated region was read back:
+
+```
+loads      201 -> 11389     11,188 frames faulted back OUT OF THE POOL
+bad bytes  0                every one byte-for-byte correct
+stores   14038 -> 25373
+bytes_written  0            nothing reached storage, because there is no file
+```
+
+That is roughly 175 MB of guest memory compressed, released, and restored
+exactly, on the oldest hardware AOK supports, with no swap file in existence.
+
+**THE FIRST ATTEMPT REPORTED PASS AND PROVED NOTHING**, which is worth recording
+because it is the third instance of the same mistake in this feature's history.
+It verified only the region it had filled first, and reported `loads 70 -> 70` --
+the counter never moved, so the bytes it checked had never left RAM. 14,038
+frames had been evicted; none of them were the ones being checked. The pass
+condition was `bad == 0 && stores > 0 && bytes_written == 0`, which neglected the
+one thing that mattered.
+
+Fixed by verifying EVERY allocated region rather than one, and by requiring
+`loads` to move for a PASS -- it reports INCONCLUSIVE otherwise.
+
+**The rule, stated because it caught three separate green results here:** for a
+feature that only acts under a condition, the test must assert THE CONDITION WAS
+REACHED, not merely that nothing broke. `swap_roundtrip` passed with 4096 frames
+declined and 0 stored; a sysbench run showed 3.75 TPS with the tier never
+engaging; and this reported clean bytes that never left memory. In all three the
+counters, not the assertion, were what exposed it.
+
+**Also observed: reclaim lags a fast allocator.** `stores` stayed at 0 through an
+entire 896 MB allocation and only climbed once it stopped. That is the
+second-chance clock working as designed -- a frame must survive two sweeps
+untouched before the third may take it -- but it means the tier protects against
+sustained pressure rather than a burst that outruns kswapd. Worth saying in
+release notes, so a user who hits a limit during a fast allocation does not
+conclude the feature is broken.
+
 **RAM-ONLY IS BUILT** (2026-09-09), so there are two modes and both ship:
 
 | Settings | mode | storage cost |
