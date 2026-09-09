@@ -211,6 +211,21 @@ way out) is the shape the numbers point at.
 failed to fit, and 22 of 23,184 got no smaller. A raw-storage fallback is still
 required for correctness, but it will not be a common path.
 
+**The algorithm cannot be chosen once on a development machine.** Relative codec
+speed is not a constant across Apple SoCs -- the implementations are hand-tuned
+per architecture, LZFSE was designed by Apple for their own hardware, and newer
+parts have paths older ones lack. Measured, same build, same instrument: on an
+M4 lz4 decompressed in 1.89 us against zlib's 13.55, and on an A9 iPad lz4 took
+11.41 against zlib's 5.64. **The ordering inverted.**
+
+That is either a genuine hardware difference or an artifact of lz4 always being
+measured first and paying for a cold destination buffer, and the instrument now
+rotates the order per page so the two can be told apart. Whichever it turns out
+to be, the design consequence is the same: **pick the codec at runtime from a
+short self-test, or expose it, rather than hardcoding the one that won on the
+maintainer's Mac.** An A9 is the floor AOK supports and it disagreed with the
+newest hardware about which compressor is fastest.
+
 **What is NOT established, and none of it should be skipped:**
 - **CPU.** Measured on an M4. A phone is slower -- call it 2-3x, so ~5 us
   decompress -- which is still far below a flash read, but it is an assumption

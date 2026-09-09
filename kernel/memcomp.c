@@ -139,12 +139,33 @@ static void memcomp_visit_page(const void *page, void *vctx) {
     // even the ratios were being taken from three slightly different pages.
     memcpy(c->srcbuf, page, c->page_size);
     const uint8_t *p = c->srcbuf;
-    measure_one(&c->out->lz4, COMPRESSION_LZ4, p, c->page_size,
-                c->cbuf, c->cbuf_size, c->dbuf, c->scratch);
-    measure_one(&c->out->lzfse, COMPRESSION_LZFSE, p, c->page_size,
-                c->cbuf, c->cbuf_size, c->dbuf, c->scratch);
-    measure_one(&c->out->zlib, COMPRESSION_ZLIB, p, c->page_size,
-                c->cbuf, c->cbuf_size, c->dbuf, c->scratch);
+
+    // ROTATE which algorithm goes first, so position and algorithm are
+    // independent. Whoever runs first on a page pays for bringing the
+    // destination buffer into cache and for any lazily-bound symbol, and with a
+    // fixed order that cost lands on the same algorithm every time.
+    //
+    // This is not hypothetical tuning. On an M4 lz4 decompressed in 1.89 us
+    // against zlib's 13.55; on an A9 iPad the same build reported lz4 11.41 and
+    // zlib 5.64 -- the ordering INVERTED. Either Apple's codecs differ by SoC
+    // (their relative speeds are not a constant, and newer parts have paths an
+    // A9 does not), or lz4 was simply always first and always paying. Rotating
+    // separates those two explanations: if the inversion survives rotation it
+    // is the hardware, and the algorithm has to be chosen per device rather
+    // than picked once on a development Mac.
+    static const compression_algorithm order[3][3] = {
+        { COMPRESSION_LZ4,   COMPRESSION_LZFSE, COMPRESSION_ZLIB  },
+        { COMPRESSION_LZFSE, COMPRESSION_ZLIB,  COMPRESSION_LZ4   },
+        { COMPRESSION_ZLIB,  COMPRESSION_LZ4,   COMPRESSION_LZFSE },
+    };
+    const compression_algorithm *round = order[c->out->pages % 3];
+    for (int k = 0; k < 3; k++) {
+        struct memcomp_algo *slot =
+            round[k] == COMPRESSION_LZ4   ? &c->out->lz4 :
+            round[k] == COMPRESSION_LZFSE ? &c->out->lzfse : &c->out->zlib;
+        measure_one(slot, round[k], p, c->page_size,
+                    c->cbuf, c->cbuf_size, c->dbuf, c->scratch);
+    }
 }
 #endif
 
