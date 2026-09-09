@@ -211,25 +211,39 @@ way out) is the shape the numbers point at.
 failed to fit, and 22 of 23,184 got no smaller. A raw-storage fallback is still
 required for correctness, but it will not be a common path.
 
-**The algorithm cannot be chosen once on a development machine.** Relative codec
-speed is not a constant across Apple SoCs -- the implementations are hand-tuned
-per architecture, LZFSE was designed by Apple for their own hardware, and newer
-parts have paths older ones lack. Measured, same build, same instrument: on an
-M4 lz4 decompressed in 1.89 us against zlib's 13.55, and on an A9 iPad lz4 took
-11.41 against zlib's 5.64. **The ordering inverted.**
+**On-device, and the earlier inversion is explained -- it was not hardware.**
+Measured on an iPad 5th gen (iPad6,12, A9 at 1.07 GHz, the oldest part AOK
+supports) against a real Python heap, pid verified:
 
-That is either a genuine hardware difference or an artifact of lz4 always being
-measured first and paying for a cold destination buffer, and the instrument now
-rotates the order per page so the two can be told apart. Whichever it turns out
-to be, the design consequence is the same: **pick the codec at runtime from a
-short self-test, or expose it, rather than hardcoding the one that won on the
-maintainer's Mac.** An A9 is the floor AOK supports and it disagreed with the
-newest hardware about which compressor is fastest.
+| host | workload | resident | lz4 ratio | lz4 compress | lz4 decompress |
+|------|----------|---------:|----------:|-------------:|---------------:|
+| M4 Mac | cc1     |   138 MB |     2.38x |      6.30 us |        1.94 us |
+| A9 iPad| python  |    33 MB |     2.83x |      7.61 us |        3.07 us |
+
+**The A9 decompresses only 1.6x slower than an M4**, not the 2-3x guessed, and
+on real data the algorithm ordering is the same on both: lz4 fastest, zlib
+slowest. That closes the CPU gap, and it closes it favourably -- 3 us on the
+slowest supported device is still two orders of magnitude under a flash read.
+
+The inversion that prompted all this (lz4 11.41 us against zlib 5.64 on the
+same device) came from **degenerate input, not from the SoC**. Those earlier
+device samples were near-empty pages -- 4431 of 4500 in the >=8x bucket, ratios
+of 25x and 136x -- and when a page compresses to almost nothing the measurement
+is fixed API overhead rather than throughput, which does not rank the codecs the
+way real data does. The first device numbers should not have been quoted, and
+the lesson is the ordinary one: **a ratio of 136x is not a good result, it is a
+warning that the input is not representative.**
+
+The order-rotation added to the instrument is kept anyway. It is cheap, it makes
+position and algorithm independent, and it is the thing that would have
+distinguished these two explanations without needing a second workload.
+
+**Hardware acceleration remains a real consideration even though it was not the
+cause here** -- Apple's codecs are tuned per architecture and their relative
+speeds need not be constant -- so the runtime pick below is still the right
+design. It is now a cheap insurance policy rather than a necessity.
 
 **What is NOT established, and none of it should be skipped:**
-- **CPU.** Measured on an M4. A phone is slower -- call it 2-3x, so ~5 us
-  decompress -- which is still far below a flash read, but it is an assumption
-  until measured on a device.
 - **The pool allocator.** Compressed pages are variable-sized, so they need one;
   Linux uses zsmalloc and it is not small. Fragmentation overhead is unmeasured
   and eats directly into the ratio above.
