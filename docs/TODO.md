@@ -204,11 +204,24 @@ frames** -- 13419 x 16 KiB, about 210 MB of guest memory -- and
 claim of the feature, on real hardware, under pressure that arrived on its own
 rather than being forced through a development control.
 
-**AND THE APP WAS JETSAM-KILLED SHORTLY AFTER**, which is the other half of the
-result and must not be filed under "test setup". The immediate cause was
-mine -- 850 MB of allocation on a 1.45 GB device, in two large steps, which is
-more than reclaim could stay ahead of. But there is a design point underneath it
-that is true regardless:
+**AND THEN THE DEVICE STOPPED ANSWERING -- BUT NOT, IT TURNS OUT, BECAUSE OF A
+JETSAM KILL.** An earlier version of this entry said it was one. That was not
+established and is probably wrong: the maintainer found the app **backgrounded,
+not dead**, and iOS destroys a backgrounded app's listening socket, which is
+already documented in this file. "Connection reset", then "timed out during
+banner exchange", is exactly what that looks like from the other end -- and it
+is a far better fit than the memory-pressure story I reached for, which was that
+fork was failing under pressure. Both readings explain the symptom; only one of
+them was checked, and it was not mine.
+
+**So no jetsam kill is confirmed at any point in this work.** What is confirmed
+is that the app stopped being reachable over ssh while under heavy memory
+pressure, twice. The practical consequence for anyone repeating this: keep the
+app in the FOREGROUND for the duration, or the guest is suspended out from under
+the measurement.
+
+There is still a design point worth keeping, and it does not depend on how the
+app stopped:
 
 **THE POOL IS RESIDENT MEMORY AND COMPETES WITH WHAT IT SAVES.** Compressing
 210 MB into a pool of at most 128 MB saves at most 82 MB; it does not save 210.
