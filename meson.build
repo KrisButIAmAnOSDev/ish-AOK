@@ -529,7 +529,7 @@ src = [
     'kernel/time.c',
     'kernel/binfmt_misc.c',
     'kernel/mmap.c',
-    'kernel/memcomp.c', 'kernel/swap.c',
+    'kernel/memcomp.c', 'kernel/zpool.c', 'kernel/swap.c',
     'kernel/uname.c',
     'kernel/tls.c',
     'kernel/futex.c',
@@ -1648,6 +1648,13 @@ if not meson.is_cross_build()
     # test for floating point library
     float80_test = executable('float80_test', ['emu/float80.c', 'emu/float80-test.c'], dependencies: [libm])
     test('float80', float80_test)
+
+    # The compressed-page pool holds guest memory the guest can no longer see,
+    # so a bug in it is silent corruption. Host unit test rather than a guest
+    # one because the pool has no guest-visible surface of its own.
+    zpool_test = executable('zpool_test', ['kernel/zpool.c', 'kernel/zpool-test.c'],
+        include_directories: includes)
+    test('zpool', zpool_test)
 
     # riscv64 decode.h check: RVC expansion + immediate reassembly against
     # llvm-mc-derived vectors (tests/riscv64/decode_vectors.h, checked in).
