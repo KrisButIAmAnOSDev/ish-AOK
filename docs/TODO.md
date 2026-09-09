@@ -218,11 +218,37 @@ pressure worse rather than better, and the ceiling this shipped with -- 4 GB,
 chosen against swap's 16 GB -- is far too generous for a 1.5 GB device to be
 offered without guidance.
 
-**Open, and it is the next thing to settle**: whether the cap should be clamped
-against device RAM (a fraction of it), or merely advised. Unresolved here
-because the evidence does not distinguish "the pool made it worse" from "I
-allocated too much too fast", and picking one without the data would be exactly
-the kind of story this file exists to avoid.
+**AND THE BINDING CONSTRAINT WAS THE SWAP AREA, NOT THE POOL.** ktop's last
+frame before the kill settles it:
+
+```
+Mem[  1.18G/1.42G ]      Swp[  208.2M/256.0M ]
+  827  /tmp/cold 400   VIRT 411728  RES 305232
+  882  /tmp/cold 450   VIRT 462928  RES 356432
+```
+
+208 of 256 MB of slots were consumed -- 81% -- with `bytes_written` still 0, so
+every one of those slots held its data in RAM. About 190 MB had genuinely left
+the two cold processes (VIRT minus RES). But **slots are allocated per evicted
+frame whether or not the bytes go to flash**, so the 256 MB area was about to
+run out, and when it does eviction stops completely however much pool is left.
+
+That is the sizing rule, and it is not the obvious one:
+
+- **The swap area size caps how much memory can be evicted at all.** It is the
+  address space of the pager.
+- **The pool size decides how much of that costs RAM instead of flash.**
+
+So the two are not alternatives and the area cannot be made small (which an
+earlier version of this entry wrongly suggested). Against 850 MB of demand, a
+256 MB area could never have kept up no matter what the pool did.
+
+**Open, and it is the next thing to settle**: whether the pool cap should be
+clamped against device RAM, and whether the UI should relate the two sizes at
+all rather than offering them as independent numbers. Unresolved here because
+the evidence does not distinguish "the pool made it worse" from "the area was
+too small and I allocated too much too fast" -- and picking one without the data
+is exactly the kind of story this file exists to prevent.
 
 **RAM-ONLY IS NOT BUILT, AND MOSTLY DOES NOT NEED TO BE.** This is zswap (a
 cache in front of a swap area), not zram (a replacement for one), so it does
