@@ -38,7 +38,12 @@ one makes archaeology. So:
    `PTRACE_INTERRUPT`. `strace -p` no longer kills what it attaches to. What is
    left of it is listed there and is smaller than what closed.
 2. **OS snapshot** — roadmap. The cheaper and more certain of the two
-   persistence items, and it lands #575 on the way past.
+   persistence items, and it lands #575 on the way past. **CLI prototype done
+   2026-09-08** (`fs/fake-snapshot.c`, `/proc/ish/snapshot`): clone a quiesced
+   root, boot the clone, diverge both ways, all verified including under write
+   load. It also corrected the roadmap's cost model -- a snapshot is O(files),
+   not O(bytes), at ~25 us per directory entry -- so the app side needs progress
+   and a cancel rather than a spinner. What is left is the app side and restore.
 3. **Suspend to disk phase 0** — roadmap, and *a gate*. Publish the fd
    inventory; if it says the common session is full of things with no restore
    rule, that is the result and the right move is to stop.

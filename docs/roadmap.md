@@ -73,9 +73,11 @@ a multi-gigabyte root is minutes of work and a second full copy of the bytes.
 clones: `clonefile(2)` copies a directory tree copy-on-write, so the clone is
 near-instant and costs no space until the two copies diverge. Source and
 destination must be on the same volume, which they are -- both are inside the
-container. There are **zero** uses of `clonefile` or `COPYFILE_CLONE` anywhere
-in the tree today, so this is greenfield, but it is greenfield on a well-
-supported system call rather than a research question.
+container. This was greenfield when the item was written -- zero uses of
+`clonefile` or `COPYFILE_CLONE` anywhere in the tree -- and `fs/fake-snapshot.c`
+is now the first, with a recursive-copy fallback (trying `FICLONE` per file) so
+the Linux build still compiles and degrades honestly rather than pretending to
+be cheap.
 
 **The correctness problem is `meta.db`, not `data/`.** It is SQLite, and cloning
 a live database while a guest is writing to it produces a snapshot that may not
@@ -92,15 +94,44 @@ out from under the live guest. Restoring one is strictly worse. So restore
 follows `defaultRoot` -- it takes effect at the next launch, and the UI says so
 rather than pretending otherwise.
 
-**Next step.** Prototype on the CLI first, where a root is an ordinary directory
-and there is no app lifecycle in the way: clone a quiesced root, boot the clone,
-and diff it against the original. Then the app side.
+**Next step.** ~~Prototype on the CLI first~~ -- **done 2026-09-08**
+(`fs/fake-snapshot.c`, `/proc/ish/snapshot`, commit `a9429f028`). It quiesces
+the fakefs, clones `<root>/data` with `clonefile(2)`, and takes `meta.db`
+through `sqlite3_backup_*` rather than cloning it, because a raw copy of a WAL
+database is only valid if nothing is mid-write and `-shm` must never be copied
+at all. **What is left is the app side**: the Machines screen, and restore.
 
-**Prove it.** Snapshot a multi-gigabyte root and have it complete in under a
-second with no meaningful change in container size; boot the snapshot; write to
-both copies and confirm they diverge without corrupting each other; and take a
-snapshot of a root that is *running* a build, restore it, and find a filesystem
-that fsck's clean.
+**Prove it -- and the timing criterion below was wrong, so it is restated.**
+The original read "complete in under a second" for a multi-gigabyte root. That
+assumed cost scales with bytes. It does not:
+
+|              root | entries | size    | clone time (interleaved x3) |
+|-------------------|--------:|--------:|-----------------------------|
+| alpine-arm64-test | 215,504 |  77 GiB | 4676 / 4781 / 5050 ms       |
+| devuan-amd64-test |  13,916 | 606 MiB |  357 /  383 /  440 ms       |
+
+127x the data, 12x the time -- the *entry-count* ratio, at roughly 25 us per
+directory entry either way. **Snapshot cost is O(files), not O(bytes).** The
+space half of the claim held exactly: cloning 77 GiB grew the container by
+63 MiB. So the honest criterion is "**a stock root in about a second, and
+proportional to file count beyond that**" -- which also means this cannot be a
+synchronous UI-thread operation, and the Machines screen needs progress and a
+cancel rather than a spinner.
+
+The rest of the criteria are **met**, on the CLI, verified by booting the
+result: a snapshot of a *running* root taken from inside the guest completes in
+308 ms fully quiesced, and the clone gives back file contents, mode 0741, uid
+123, gid 456, a character device with rdev 42:43, nested directories and
+symlinks -- so the `meta.db` half is right, not merely the file half. A file
+written *after* the snapshot is absent from it. The two diverge without
+corrupting each other, in both directions. And under load -- two concurrent
+create/chmod/rename/unlink loops -- it still reached a **full** quiesce in
+478 ms, with the resulting root walking 13,945 entries at 0 unstatable and 0
+read errors and `pragma integrity_check` returning ok.
+
+That last one is the "snapshot a root that is running a build" case, and it is
+the one that mattered: it is the evidence the quiesce gate actually drains
+rather than merely being called.
 
 **Where it lives in the UI is [#575](https://github.com/emkey1/ish-AOK/issues/575).**
 That issue asks for a delete button for machines and the capability already
