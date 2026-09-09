@@ -480,6 +480,78 @@ struct meminfo {
     unsigned long swap_total_kb, swap_free_kb;
 };
 
+// ---- AOK's compressed memory, and whether swap has a file behind it --------
+//
+// /proc/meminfo cannot answer either question. In RAM-only mode AOK still
+// reports a SwapTotal -- slots are allocated per evicted frame whether or not
+// the bytes reach storage -- so a swap meter drawn from meminfo alone announces
+// "Swp 2.0M/512M" on a device where nothing is on storage at all and no file
+// exists. That is the opposite of what the feature does, and it was reported
+// from an iPad as exactly that confusion.
+//
+// Both files are AOK's own and absent everywhere else; a kernel without them
+// simply gets no compression line and the old swap behaviour.
+struct zswapinfo {
+    int enabled;
+    int swap_has_file;          // a real file backs the area
+    unsigned long cap_mb;
+    unsigned long objects;
+    unsigned long pool_kb;      // what the pool occupies, retained slabs included
+    unsigned long stored_kb;    // compressed bytes currently live
+    unsigned long original_kb;  // what those frames occupied before
+};
+
+// A TUI has no natural way to be fed controlled input, which is why the meters
+// went untested until a device reported one showing the wrong thing. KTOP_PROC
+// points the AOK-specific reads at a directory of fixture files instead, so the
+// four display states can be rendered on demand. Unset in every normal run, and
+// it only redirects AOK's own files -- /proc/meminfo and the process table are
+// untouched.
+static FILE *ktop_open_proc(const char *leaf) {
+    const char *root = getenv("KTOP_PROC");
+    if (root == NULL)
+        return fopen(leaf, "r");
+    char path[512];
+    const char *base = strrchr(leaf, '/');
+    snprintf(path, sizeof(path), "%s/%s", root, base ? base + 1 : leaf);
+    return fopen(path, "r");
+}
+
+static void read_zswapinfo(struct zswapinfo *z) {
+    memset(z, 0, sizeof(*z));
+    char line[256];
+
+    FILE *f = ktop_open_proc("/proc/ish/zswap");
+    if (f != NULL) {
+        if (fgets(line, sizeof(line), f) != NULL && strncmp(line, "on", 2) == 0) {
+            z->enabled = 1;
+            sscanf(line, "on cap %lu MB", &z->cap_mb);
+        }
+        while (fgets(line, sizeof(line), f) != NULL) {
+            sscanf(line, "objects %lu", &z->objects);
+            sscanf(line, "pool %lu KB", &z->pool_kb);
+            sscanf(line, "stored %lu KB", &z->stored_kb);
+            sscanf(line, "original %lu KB", &z->original_kb);
+        }
+        fclose(f);
+    }
+
+    // Absent the file (an older kernel, or a non-AOK one), assume a real swap
+    // file so the meter behaves exactly as it always did.
+    z->swap_has_file = 1;
+    f = ktop_open_proc("/proc/ish/swap");
+    if (f != NULL) {
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (strncmp(line, "backing", 7) != 0)
+                continue;
+            // "a swap file" is the only backing that is actually on storage.
+            z->swap_has_file = strstr(line, "swap file") != NULL;
+            break;
+        }
+        fclose(f);
+    }
+}
+
 static void read_meminfo(struct meminfo *mi) {
     memset(mi, 0, sizeof(*mi));
     FILE *f = fopen("/proc/meminfo", "r");
@@ -1050,7 +1122,13 @@ static void draw_header(int cols, int ncpu,
         putchar('\n');
         rows++;
     }
-    if (mi->swap_total_kb > 0) {
+    struct zswapinfo z;
+    read_zswapinfo(&z);
+
+    // Swap, only when something is actually on storage. In RAM-only mode AOK
+    // still reports a SwapTotal, so the old `swap_total_kb > 0` test drew a
+    // swap meter for an area with no file -- see read_zswapinfo.
+    if (mi->swap_total_kb > 0 && z.swap_has_file) {
         unsigned long sw_used = mi->swap_total_kb - mi->swap_free_kb;
         char su[16], st[16];
         format_kb_unit(sw_used, su, sizeof(su));
@@ -1060,6 +1138,37 @@ static void draw_header(int cols, int ncpu,
         const char *colors[1] = {C_BAR_RED};
         fputs("\033[K", stdout);
         draw_meter("Swp", mem_inner, fracs, colors, 1, text);
+        putchar('\n');
+        rows++;
+    }
+
+    // Compressed memory, only when it is on. The bar is how full the pool is
+    // against its cap, because that is the resource the user chose and the one
+    // that runs out; the text is what it is buying them.
+    //
+    // The saving is computed from STORED against ORIGINAL -- live compressed
+    // bytes against the memory those frames occupied -- and not from the pool's
+    // size. The pool retains empty slabs after a free so they can be reused, so
+    // pool-against-original reads as a loss on a guest that has faulted most of
+    // its memory back, which is the opposite of the truth.
+    if (z.enabled) {
+        unsigned long cap_kb = z.cap_mb * 1024;
+        char pu[16], pc[16];
+        format_kb_unit(z.pool_kb, pu, sizeof(pu));
+        format_kb_unit(cap_kb, pc, sizeof(pc));
+        if (z.original_kb > 0 && z.stored_kb <= z.original_kb) {
+            int saved = (int) (((z.original_kb - z.stored_kb) * 100) / z.original_kb);
+            double ratio = (double) z.original_kb / (double) (z.stored_kb ? z.stored_kb : 1);
+            snprintf(text, sizeof(text), "%s/%s  %d%% saved, %.1fx", pu, pc, saved, ratio);
+        } else {
+            // On, but holding nothing yet. Say so rather than print 0% saved,
+            // which reads as "this is not working".
+            snprintf(text, sizeof(text), "%s/%s  idle", pu, pc);
+        }
+        const double fracs[1] = {cap_kb > 0 ? (double) z.pool_kb / (double) cap_kb : 0.0};
+        const char *colors[1] = {C_BAR_BLUE};
+        fputs("\033[K", stdout);
+        draw_meter("Cmp", mem_inner, fracs, colors, 1, text);
         putchar('\n');
         rows++;
     }
