@@ -173,6 +173,68 @@ latency on the fault path, and confirmation on a device that iOS's
 `phys_footprint` behaves as macOS's does here. The measurement above is macOS
 and uses `malloc`, not guest memory through AOK's page tables.
 
+### Guest-memory compression: phase 0 measured, and it looks worth building
+
+Follows the entry above -- the host's own compression buys AOK nothing, so only
+compression AOK does itself can help. `kernel/memcomp.c` and
+`/proc/ish/mem_compress` measure what it would buy, on real guest pages.
+Measured 2026-09-09 on an M4 Mac, every round trip decompressed and compared
+(`verify_failures 0` throughout, and that guard earned itself twice -- see
+below).
+
+**cc1 compiling 28 MB of C, 90 MB resident anonymous -- the representative one:**
+
+| algo  | ratio | compress | decompress | >=8x | >=4x | >=2x | >=1.33x | worse |
+|-------|------:|---------:|-----------:|-----:|-----:|-----:|--------:|------:|
+| lz4   | 2.23x |  7.06 us |    1.89 us | 3573 | 1666 | 5191 |   12732 |    22 |
+| lzfse | 3.23x | 55.56 us |    9.47 us | 4580 | 3078 |14885 |     641 |     0 |
+| zlib  | 3.60x | 70.90 us |   13.55 us | 5105 | 3355 |14712 |      12 |     0 |
+
+Two other workloads for shape, neither as representative: a synthetic
+malloc mix (64 MB) gave lz4 2.45x, and `sort` over repetitive text (41 MB) gave
+lz4 6.50x -- that last one is inflated by the input being `yes`-generated lines
+and should not be quoted as a result.
+
+**The decision.** `lz4` for an in-RAM pool. 2.23x on a real workload for
+**1.89 us to decompress on the fault path**, against the hundreds of
+microseconds a read from flash costs -- so holding a page compressed in RAM is
+roughly two orders of magnitude cheaper than having paged it out, which is the
+entire zram argument and it survives being quantified here.
+
+lzfse and zlib buy 45-60% more ratio for 5-7x the decompress cost. That is the
+wrong trade for a hot pool and possibly the right one for what is actually
+written to flash, where the cost is paid once and the ratio directly reduces
+the 24-hour write budget. A two-tier design (lz4 in RAM, something denser on the
+way out) is the shape the numbers point at.
+
+**Incompressible pages are a rounding error, not a design burden**: 0 pages
+failed to fit, and 22 of 23,184 got no smaller. A raw-storage fallback is still
+required for correctness, but it will not be a common path.
+
+**What is NOT established, and none of it should be skipped:**
+- **CPU.** Measured on an M4. A phone is slower -- call it 2-3x, so ~5 us
+  decompress -- which is still far below a flash read, but it is an assumption
+  until measured on a device.
+- **The pool allocator.** Compressed pages are variable-sized, so they need one;
+  Linux uses zsmalloc and it is not small. Fragmentation overhead is unmeasured
+  and eats directly into the ratio above.
+- **Device confirmation** that iOS's `phys_footprint` ignores compression the
+  way macOS's does. The whole argument rests on it.
+- Only two genuinely representative workloads. A JVM, a Python, and a Node
+  process would each have a different shape.
+
+**Two instrument bugs worth remembering**, both caught by the measurement's own
+guards rather than by review:
+- The first run reported exactly one verify failure per algorithm, all three
+  identical -- not how three independent compressors fail. The pages belong to a
+  RUNNING process and were written between the compress and the compare. Each
+  page is copied to a private buffer now, which also makes the three algorithms
+  measure the same bytes.
+- The second run **killed the emulator**: SIGBUS/KERN_MEMORY_ERROR reading a
+  file-backed page whose host bytes were not there. `mem_walk_resident_pages`
+  now yields only anonymous, host-readable pages. See the commit; that filter is
+  a safety requirement, not a preference.
+
 ### PI futexes are ENOSYS
 
 Measured 2026-09-01 alongside the futex argument-validation work
