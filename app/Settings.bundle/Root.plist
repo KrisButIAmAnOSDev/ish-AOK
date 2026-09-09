@@ -118,7 +118,7 @@ The sizes offered here do not know how much room this device actually has. If th
 
 Works on its own — Swap is NOT required, and with Swap off nothing is ever written to storage at all. If Swap is also on, this sits in front of it and only what does not compress reaches the file.
 
-Uses the RAM you give it. The maximum offered is a quarter of this device's memory.</string>
+Uses the RAM you give it, and it counts against the same memory limit the guest does — so a pool bigger than the device can spare makes things worse, not better. Anything above a quarter of this device's memory is reduced to that.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
