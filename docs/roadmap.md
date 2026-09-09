@@ -133,11 +133,31 @@ That last one is the "snapshot a root that is running a build" case, and it is
 the one that mattered: it is the evidence the quiesce gate actually drains
 rather than merely being called.
 
-**Where it lives in the UI is [#575](https://github.com/emkey1/ish-AOK/issues/575).**
-That issue asks for a delete button for machines and the capability already
-exists behind it (`destroyRootNamed:`), so the Machines screen is being touched
-regardless. Snapshot, restore and delete belong in one place, and shipping the
-delete button alone would mean touching that screen twice.
+**Where it lives in the UI is [#575](https://github.com/emkey1/ish-AOK/issues/575)
+-- and that issue is not what this document said it was.** It read as "add a
+delete button". Read 2026-09-09, the button already exists: `deleteFilesystem`
+in `RootDetailViewController` (app/RootsTableViewController.m), with a
+confirmation alert, correct disabling for the booted and default root, and a
+footer explaining which of the two applies. `destroyRootNamed:` behind it is
+sound, down to re-exposing the root if the removal half-fails.
+
+**What is actually missing is reachability.** In the machines *list*,
+`canEditRowAtIndexPath` returns YES only for the cached-archives section, so
+swipe-to-delete on an installed machine does nothing at all -- no row action, no
+refusal, no explanation. Delete exists only after tapping into the detail
+screen. "Unable to delete machines" is the expected report from someone who
+swiped and gave up, and it is a discoverability bug rather than a missing
+capability. Unverified against the reporter's device, but it is the only path in
+this screen that silently does nothing.
+
+Second, and separate: when the machine *is* the booted or default one, the
+footer states the rule and offers no remedy. A user with a single machine has no
+route forward at all. Whatever ships should say what to do, not only what is
+refused.
+
+Snapshot, restore and delete still belong in one place, so the screen is being
+touched regardless -- but the delete work is a row action and a sentence, not a
+button and a capability.
 
 ### Suspend to disk
 
