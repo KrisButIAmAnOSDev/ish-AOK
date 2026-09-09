@@ -173,7 +173,47 @@ latency on the fault path, and confirmation on a device that iOS's
 `phys_footprint` behaves as macOS's does here. The measurement above is macOS
 and uses `malloc`, not guest memory through AOK's page tables.
 
-### Guest-memory compression: phase 0 measured, and it looks worth building
+### Guest-memory compression: BUILT (phases 1-2), and what is left
+
+**Phases 1 and 2 are in** as of 2026-09-09. `kernel/zpool.c` is a size-classed
+pool for compressed frames (host unit test, `meson test -C build zpool`), and
+`kernel/zswap.c` puts it in front of the swap area by intercepting
+`swap_slot_write`/`read`/`free`. Nothing about eviction eligibility, the fault
+path, fork/COW or the address-space barrier changed -- that seam was already a
+backing-store interface, which is why the integration is three call sites.
+
+Verified end to end by `tests/manual/zswap_roundtrip.c`: 24 MB survives a
+compressed round trip byte-for-byte, and the test FAILS rather than skips if no
+frame went through the tier. Run at a 1 MB cap it also covers the mixed case --
+640 frames held in RAM, 896 overflowed to flash, all correct.
+
+**RAM-ONLY IS NOT BUILT, AND MOSTLY DOES NOT NEED TO BE.** This is zswap (a
+cache in front of a swap area), not zram (a replacement for one), so it does
+nothing unless swap is enabled -- and enabling swap costs flash immediately,
+because the area is `F_PREALLOCATE`d and `ftruncate`d to its full size before a
+single page is written. For a user whose worry is flash wear that sounds like
+the wrong shape.
+
+In practice it very nearly is zram already: **a small swap area with a large
+compressed pool.** Compressible frames never touch the file, incompressible ones
+land in the small area, and when it fills the pager simply stops evicting --
+which the eviction path already handles correctly (a failed `swap_slot_write`
+frees the slot and leaves the frame resident, emu/memory.c:3669). So
+`ISH_GUEST_SWAP_MB=16 ISH_GUEST_ZSWAP_MB=256` is a working RAM-first
+configuration today, at a cost of 16 MB of preallocated flash and no writes to
+it unless something incompressible needs evicting.
+
+A true no-file mode would mean `swap_fd < 0` with slots still being handed out,
+and `swap_fd >= 0` is the "does an area exist" test in several places in
+kernel/swap.c. That is a real change to a pager rather than a flag, and it buys
+the last 16 MB. Worth doing deliberately, not on the way past.
+
+**The Settings design follows from that**: the two sizes are separate knobs, and
+the swap-file one should be allowed to be small rather than implying a large
+area. Not yet wired -- `ISH_GUEST_ZSWAP_MB` is a launch variable, so the tier is
+reachable from the CLI and Xcode and not from an installed app.
+
+### Phase 0, the measurements the above rests on
 
 Follows the entry above -- the host's own compression buys AOK nothing, so only
 compression AOK does itself can help. `kernel/memcomp.c` and
