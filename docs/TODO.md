@@ -207,6 +207,23 @@ written to flash, where the cost is paid once and the ratio directly reduces
 the 24-hour write budget. A two-tier design (lz4 in RAM, something denser on the
 way out) is the shape the numbers point at.
 
+**A real server, measured on the A9: mariadbd with a 131k-row InnoDB table,
+293 MB resident anonymous** (out of 1.35 GB of *mapped* RSS -- the gap is
+AOK's RSS counting address space, and it is worth knowing that four fifths of
+what a database appears to hold is not resident at all). lz4 5.42x at 3.05 us
+compress and 8.45 us decompress; zlib 9.82x.
+
+**Read that ratio with care.** 55,760 of 75,106 pages land in the >=8x bucket,
+because InnoDB allocates a large buffer pool that is mostly untouched. That is
+not a measurement error -- a real server genuinely does hold that memory, and
+compressing it really is nearly free -- but it means 5.42x is an *expected
+benefit* number and not a *worst case* one. For CPU planning use the dense-data
+figures (python on the same device: 2.83x, 3.07 us), because a page that
+compresses to nothing costs almost nothing to compress. Note also that lz4's
+decompress there (8.45 us) exceeds its compress (3.05 us), which is backwards
+for lz4 and is the same near-empty-page effect: decompressing a trivial input
+still has to write 4 KB, and on an A9 that write is what is being timed.
+
 **Incompressible pages are a rounding error, not a design burden**: 0 pages
 failed to fit, and 22 of 23,184 got no smaller. A raw-storage fallback is still
 required for correctness, but it will not be a common path.
@@ -247,8 +264,26 @@ design. It is now a cheap insurance policy rather than a necessity.
 - **The pool allocator.** Compressed pages are variable-sized, so they need one;
   Linux uses zsmalloc and it is not small. Fragmentation overhead is unmeasured
   and eats directly into the ratio above.
-- **Device confirmation** that iOS's `phys_footprint` ignores compression the
-  way macOS's does. The whole argument rests on it.
+- ~~Device confirmation that iOS's `phys_footprint` ignores compression.~~
+  **CONFIRMED on an iPad 5th gen, 2026-09-09**, and it is the finding the whole
+  case rests on. `/proc/ish/mem_guard` headroom, while a guest process held
+  250 MB of a single repeating byte -- maximally compressible, the easiest
+  possible case for the compressor:
+
+  ```
+  baseline  890 MB
+  t+25s     722 MB   <- the 250 MB is charged
+  t+70s     723 MB
+  t+130s    723 MB
+  t+190s    726 MB   <- never comes back
+  ```
+
+  macOS compressed the equivalent buffer within 25 seconds. iOS charges for it
+  regardless, for at least three minutes of idle. **The host's compression buys
+  AOK no jetsam headroom on a device**, which is exactly what it does on the
+  Mac, and it means only compression AOK performs itself -- into its own
+  smaller buffer, releasing the originals -- can move the number that kills the
+  app.
 - Only two genuinely representative workloads. A JVM, a Python, and a Node
   process would each have a different shape.
 
