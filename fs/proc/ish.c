@@ -11,6 +11,7 @@
 #include "kernel/swap.h"
 #include "fs/fake-snapshot.h"
 #include "kernel/memcomp.h"
+#include "kernel/zswap.h"
 #include "fs/poll.h"
 #include "util/sync.h"
 #include "platform/platform.h"
@@ -303,6 +304,50 @@ static void proc_ish_show_memcomp_algo(struct proc_data *buf, const char *name,
                 (unsigned long long) a->incompressible,
                 (unsigned long long) a->verify_failures,
                 a->verify_failures != 0 ? "   <-- BROKEN, ratio above means nothing" : "");
+}
+
+// /proc/ish/zswap -- the compressed tier in front of the swap area.
+//
+// Read-only. There is no write control because the tier has no development
+// knob worth exposing: it is sized at launch (ISH_GUEST_ZSWAP_MB) and will be
+// sized from Settings, the way swap is. What this exists for is proving it
+// actually did something -- a swap test that passes with the tier enabled
+// proves nothing unless the counters moved.
+static int proc_ish_show_zswap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct zswap_stats z;
+    zswap_get_stats(&z);
+    if (!z.enabled) {
+        proc_printf(buf, "off\n\n");
+        proc_printf(buf, "A compressed cache in front of the swap area: a frame that compresses\n");
+        proc_printf(buf, "is kept in RAM instead of written to flash, which costs no write budget\n");
+        proc_printf(buf, "and comes back about two orders of magnitude faster than a disk read.\n");
+        proc_printf(buf, "Needs swap enabled -- it fronts the swap area rather than replacing it.\n");
+        return 0;
+    }
+    proc_printf(buf, "on               cap %llu MB\n",
+                (unsigned long long) (z.max_bytes / (1024 * 1024)));
+    proc_printf(buf, "objects          %llu\n", (unsigned long long) z.objects);
+    proc_printf(buf, "pool             %llu KB  (what it occupies)\n",
+                (unsigned long long) (z.pool_bytes / 1024));
+    proc_printf(buf, "stored           %llu KB  (compressed bytes live in it)\n",
+                (unsigned long long) (z.stored_bytes / 1024));
+    proc_printf(buf, "original         %llu KB  (what those frames occupied)\n",
+                (unsigned long long) (z.original_bytes / 1024));
+    // Only with live objects: with none, pool_bytes is retained empty slabs
+    // and the ratio would describe nothing.
+    if (z.objects > 0 && z.pool_bytes > 0 && z.original_bytes > 0)
+        proc_printf(buf, "effective ratio  %llu.%02llux  (original / pool, so fragmentation is counted)\n",
+                    (unsigned long long) (z.original_bytes / z.pool_bytes),
+                    (unsigned long long) ((z.original_bytes * 100 / z.pool_bytes) % 100));
+    proc_printf(buf, "\n");
+    proc_printf(buf, "stores           %llu  (frames kept in RAM)\n", (unsigned long long) z.stores);
+    proc_printf(buf, "declined         %llu  (incompressible or pool full -- went to flash)\n",
+                (unsigned long long) z.store_declined);
+    proc_printf(buf, "loads            %llu  (faults served from RAM)\n", (unsigned long long) z.loads);
+    proc_printf(buf, "frees            %llu\n", (unsigned long long) z.frees);
+    proc_printf(buf, "flash NOT written %llu KB  (the wear saving, off the 24h budget)\n",
+                (unsigned long long) (z.bytes_not_written / 1024));
+    return 0;
 }
 
 static int proc_ish_show_mem_compress(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1477,6 +1522,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
     {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
     {"mem_compress", S_IFREG | 0644, .show = proc_ish_show_mem_compress, .update = proc_ish_update_mem_compress},
+    {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},
     {"wake_signals", .show = proc_ish_show_wake_signals},

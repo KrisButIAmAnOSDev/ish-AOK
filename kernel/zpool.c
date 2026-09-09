@@ -142,8 +142,7 @@ static void partial_remove(struct zpool *pool, uint32_t idx) {
     }
 }
 
-zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
-                           size_t original_size) {
+zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size) {
     // An object that needs the whole ceiling or more saves nothing and cannot
     // be encoded. The caller stores those raw.
     if (pool == NULL || size == 0 || size >= pool->object_max) {
@@ -177,7 +176,6 @@ zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
 
     pool->stats.objects++;
     pool->stats.stored_bytes += size;
-    pool->stats.original_bytes += original_size;
     pool->stats.stores++;
 
     return ((zpool_handle_t) (idx + 1) << 24) |

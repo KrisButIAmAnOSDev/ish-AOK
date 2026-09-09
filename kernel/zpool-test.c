@@ -46,7 +46,7 @@ static void test_roundtrip(void) {
             continue;   // thin out the middle, keep the edges
         uint8_t in[OBJ], out[OBJ];
         fill(in, size, (unsigned) size);
-        zpool_handle_t h = zpool_store(p, in, size, OBJ);
+        zpool_handle_t h = zpool_store(p, in, size);
         if (h == ZPOOL_HANDLE_NONE) {
             printf("FAIL store size=%zu\n", size);
             failures++;
@@ -72,11 +72,11 @@ static void test_rejects(void) {
 
     // An object at the ceiling cannot be stored: it saves nothing, and the
     // 14-bit size field could not represent it. The caller keeps those raw.
-    check(zpool_store(p, buf, OBJ, OBJ) == ZPOOL_HANDLE_NONE,
+    check(zpool_store(p, buf, OBJ) == ZPOOL_HANDLE_NONE,
           "reject object at the ceiling");
-    check(zpool_store(p, buf, OBJ + 1, OBJ) == ZPOOL_HANDLE_NONE,
+    check(zpool_store(p, buf, OBJ + 1) == ZPOOL_HANDLE_NONE,
           "reject oversize");
-    check(zpool_store(p, buf, 0, OBJ) == ZPOOL_HANDLE_NONE,
+    check(zpool_store(p, buf, 0) == ZPOOL_HANDLE_NONE,
           "reject zero");
 
     // Handles that were never issued must be refused, not followed. These are
@@ -87,7 +87,7 @@ static void test_rejects(void) {
     check(!zpool_load(p, ((zpool_handle_t) 999 << 24) | 100, buf, sizeof buf, &got),
           "reject unknown slab");
 
-    zpool_handle_t h = zpool_store(p, buf, 100, OBJ);
+    zpool_handle_t h = zpool_store(p, buf, 100);
     check(h != ZPOOL_HANDLE_NONE, "store 100");
     // An entry index past the end of the slab, with an otherwise valid handle.
     // Entry occupies bits 23..14, so set them all: 1023 entries is past any
@@ -120,13 +120,13 @@ static void test_reuse(void) {
 
     zpool_handle_t hs[4096];
     for (int i = 0; i < 4096; i++)
-        hs[i] = zpool_store(p, buf, sizeof buf, OBJ);
+        hs[i] = zpool_store(p, buf, sizeof buf);
     struct zpool_stats first;
     zpool_get_stats(p, &first);
     for (int i = 0; i < 4096; i++)
         zpool_free(p, hs[i]);
     for (int i = 0; i < 4096; i++)
-        hs[i] = zpool_store(p, buf, sizeof buf, OBJ);
+        hs[i] = zpool_store(p, buf, sizeof buf);
     struct zpool_stats second;
     zpool_get_stats(p, &second);
 
@@ -144,7 +144,7 @@ static void test_cap(void) {
     fill(buf, sizeof buf, 3);
     int stored = 0;
     for (int i = 0; i < 10000; i++)
-        if (zpool_store(p, buf, sizeof buf, OBJ) != ZPOOL_HANDLE_NONE)
+        if (zpool_store(p, buf, sizeof buf) != ZPOOL_HANDLE_NONE)
             stored++;
     struct zpool_stats st;
     zpool_get_stats(p, &st);
@@ -168,7 +168,7 @@ static void test_mixed(void) {
         uint8_t in[OBJ];
         fill(in, sz[i], (unsigned) i);
         memcpy(ref[i], in, 64 < sz[i] ? 64 : sz[i]);
-        h[i] = zpool_store(p, in, sz[i], OBJ);
+        h[i] = zpool_store(p, in, sz[i]);
         check(h[i] != ZPOOL_HANDLE_NONE, "mixed store");
         if (i % 3 == 0 && i > 0) {           // churn
             zpool_free(p, h[i - 1]);

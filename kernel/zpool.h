@@ -53,7 +53,6 @@ struct zpool_stats {
     uint64_t objects;         // live stored objects
     uint64_t stored_bytes;    // sum of their compressed sizes
     uint64_t pool_bytes;      // what the pool actually occupies (slabs)
-    uint64_t original_bytes;  // sum of their uncompressed sizes
     uint64_t stores;
     uint64_t loads;
     uint64_t frees;
@@ -74,9 +73,7 @@ void zpool_destroy(struct zpool *pool);
 
 // Copy `size` bytes into the pool. Returns ZPOOL_HANDLE_NONE if the object is
 // not smaller than object_max, or the pool is at its cap and no slab has room.
-// `original_size` is recorded for the ratio only.
-zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size,
-                           size_t original_size);
+zpool_handle_t zpool_store(struct zpool *pool, const void *data, size_t size);
 
 // Copy the object back out. `out_size` must be at least the stored size; the
 // stored size is written to *size_out. False if the handle is not live.

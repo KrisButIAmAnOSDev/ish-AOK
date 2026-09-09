@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 
 #include "kernel/swap.h"
+#include "kernel/zswap.h"
 #include "fs/devices.h"
 #include "fs/dev.h"
 #include "kernel/fs.h"
@@ -211,6 +212,7 @@ static int swap_file_detach_locked(uint64_t **bitmap_out) {
     swap_fd = -1;
     swap_free_bitmap = NULL;
     swap_slot_count = 0;
+    zswap_set_slot_geometry(0, 0);      // drops the pool with the area
     swap_slots_used = 0;
     swap_alloc_rover = 0;
     swap_slot_size = 0;
@@ -310,6 +312,9 @@ static int swap_enable_locked(uint64_t bytes) {
     swap_fd = fd;
     swap_slot_size = frame;
     swap_slot_count = slots;
+    // Tell the compressed tier the shape of the area it is fronting. It drops
+    // anything it held: those handles describe slots of the old geometry.
+    zswap_set_slot_geometry(slots, frame);
     swap_slots_used = 0;
     swap_free_bitmap = bitmap;
     // Every slot free except 0, which is SWAP_SLOT_NONE and must never be
@@ -512,6 +517,11 @@ int swap_slot_alloc(uint32_t *slot_out) {
 void swap_slot_free(uint32_t slot) {
     if (slot == SWAP_SLOT_NONE)
         return;
+    // Unconditional, and outside swap_lock: the tier is a no-op for a slot it
+    // never held, and holding two locks across it would be an ordering rule
+    // nobody needs. Missing this would leak the compressed object permanently,
+    // because the slot number is the only thing that knows its handle.
+    zswap_forget(slot);
     lock(&swap_lock, 0);
     if (swap_free_bitmap == NULL || slot >= swap_slot_count) {
         unlock(&swap_lock);
@@ -562,6 +572,19 @@ static int swap_fd_for_slot(uint32_t slot, off_t *at_out, size_t len) {
 }
 
 int swap_slot_write(uint32_t slot, const void *buf, size_t len) {
+    // The compressed tier gets first refusal. A frame it keeps costs no flash
+    // write at all -- not against the 24-hour budget, not against the device's
+    // wear -- and comes back roughly two orders of magnitude faster than one
+    // read from the file. It declines for an incompressible frame or a full
+    // pool, and then this proceeds exactly as it always did.
+    //
+    // Before the quiesce gate deliberately: that gate exists so the app is
+    // never mid-WRITE when iOS freezes it, and this path does no I/O.
+    if (zswap_store(slot, buf, len)) {
+        atomic_fetch_add_explicit(&swap_stat_pswpout, len / PAGE_SIZE,
+                                  memory_order_relaxed);
+        return 0;
+    }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
     if (fd < 0)
@@ -826,6 +849,14 @@ int swap_slot_read(uint32_t slot, void *buf, size_t len) {
     if (atomic_load_explicit(&swap_fail_reads, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&swap_stat_io_errors, 1, memory_order_relaxed);
         return _EIO;
+    }
+    // Served from RAM if the tier took it on the way out. After the
+    // fault-injection knob above, so "every slot read will fail" keeps meaning
+    // exactly that.
+    if (zswap_load(slot, buf, len)) {
+        atomic_fetch_add_explicit(&swap_stat_pswpin, len / PAGE_SIZE,
+                                  memory_order_relaxed);
+        return 0;
     }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
@@ -1201,6 +1232,15 @@ void swap_startup(void) {
     if (getenv("ISH_GUEST_SWAP_FAIL_READS") != NULL) {
         atomic_store_explicit(&swap_fail_reads, true, memory_order_relaxed);
         printk("swap: FAULT INJECTION -- every slot read will fail\n");
+    }
+    // The compressed tier, sized separately and off unless asked for. Read on
+    // the same branch as everything else here, so an installed app cannot reach
+    // it until it is wired to Settings the way swap's size is.
+    const char *zmb = getenv("ISH_GUEST_ZSWAP_MB");
+    if (zmb != NULL && zmb[0] != '\0') {
+        long z = strtol(zmb, NULL, 10);
+        if (z > 0)
+            zswap_configure((uint32_t) z);
     }
     const char *budget = getenv("ISH_GUEST_SWAP_WRITE_BUDGET_MB");
     if (budget != NULL && budget[0] != '\0') {

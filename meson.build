@@ -529,7 +529,7 @@ src = [
     'kernel/time.c',
     'kernel/binfmt_misc.c',
     'kernel/mmap.c',
-    'kernel/memcomp.c', 'kernel/zpool.c', 'kernel/swap.c',
+    'kernel/memcomp.c', 'kernel/zpool.c', 'kernel/zswap.c', 'kernel/swap.c',
     'kernel/uname.c',
     'kernel/tls.c',
     'kernel/futex.c',
