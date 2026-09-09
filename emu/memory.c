@@ -888,6 +888,33 @@ void mem_walk_resident_pages(struct mem *mem, mem_page_visitor_t cb, void *ctx) 
                     continue;
                 if (data->data == NULL)
                     continue;
+                // ANONYMOUS ONLY, and this is a safety requirement rather than
+                // a preference. A file-backed page's host bytes may not exist:
+                // reading past the end of a mapping whose file was truncated
+                // raises SIGBUS, which is what tests/manual/mmap_truncate_sigbus
+                // exists to check the guest survives -- and a HOST read of the
+                // same page kills the emulator outright, with no guest signal
+                // to catch it.
+                //
+                // MEASURED: the first consumer walked cc1's 101 MB and died
+                // with EXC_BAD_ACCESS / KERN_MEMORY_ERROR in _platform_memmove
+                // under memcomp_visit_page. The 64 MB malloc-only workload
+                // before it was pure anonymous memory and never hit one.
+                //
+                // It is also the right filter for the question being asked: the
+                // pager evicts anonymous memory, and a file-backed page is
+                // re-read from its file rather than compressed or swapped.
+                if (data->fd != NULL)
+                    continue;
+                // And the host mapping has to be readable. A guest
+                // mprotect(PROT_NONE) region, or a page the pager has protected
+                // on its way out, is mapped without PROT_READ; host_page_prot
+                // is the cached mirror of that, when the platform mirrors at
+                // all. NULL means "not tracked", which is the pre-mirroring
+                // behaviour and no worse than before.
+                if (data->host_page_prot != NULL &&
+                        !(data->host_page_prot[mem_host_page_index(&entries[i])] & P_READ))
+                    continue;
                 cb((const char *) data->data + entries[i].offset, ctx);
             }
         }

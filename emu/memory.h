@@ -246,8 +246,10 @@ void mem_next_page(struct mem *mem, page_t *page);
 // Visitor for mem_walk_resident_pages: `page` is a host pointer to PAGE_SIZE
 // bytes of guest memory, valid only for the duration of the call.
 typedef void (*mem_page_visitor_t)(const void *page, void *ctx);
-// Iterate every resident page. See the definition in emu/memory.c for the
-// residency caveat and the locking contract.
+// Iterate every resident, ANONYMOUS, host-readable page. File-backed pages are
+// skipped because reading one from the host can raise SIGBUS and kill the
+// emulator; see the definition in emu/memory.c for that, the residency caveat,
+// and the locking contract.
 void mem_walk_resident_pages(struct mem *mem, mem_page_visitor_t cb, void *ctx);
 size_t mem_mapped_page_count(struct mem *mem);
 // Pages with a live entry whose contents are actually in host memory right
