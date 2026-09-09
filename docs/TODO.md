@@ -348,36 +348,39 @@ the evidence does not distinguish "the pool made it worse" from "the area was
 too small and I allocated too much too fast" -- and picking one without the data
 is exactly the kind of story this file exists to prevent.
 
-**RAM-ONLY IS NOT BUILT, AND MOSTLY DOES NOT NEED TO BE.** This is zswap (a
-cache in front of a swap area), not zram (a replacement for one), so it does
-nothing unless swap is enabled -- and enabling swap costs flash immediately,
-because the area is `F_PREALLOCATE`d and `ftruncate`d to its full size before a
-single page is written. For a user whose worry is flash wear that sounds like
-the wrong shape.
+**RAM-ONLY IS BUILT** (2026-09-09), so there are two modes and both ship:
 
-In practice most of what matters is available already, but **not by making the
-area small** -- that was the obvious idea and it is wrong. Slots are derived
-from the file's size, so a 16 MB area means at most 16 MB of guest memory can
-ever be evicted, no matter how large the pool is. Measured: with
-`ISH_GUEST_SWAP_MB=16 ISH_GUEST_ZSWAP_MB=256` against a 24 MB region, exactly
-1024 frames (16 MB) were stored and the rest simply stayed resident.
+| Settings | mode | storage cost |
+|---|---|---|
+| swap on + compressed memory on | **zswap** -- pool in front of the file | area preallocated, writes ~0 |
+| swap **off** + compressed memory on | **zram** -- pool is the only storage | **none, ever** |
 
-The right framing is that **the area is reserved SPACE and the pool is what
-stops it being WRITTEN**, and wear is about writes, not space. So size the area
-for the eviction capacity you want and the pool to hold its compressed form --
-`ISH_GUEST_SWAP_MB=256` with `ISH_GUEST_ZSWAP_MB=128` covers a 256 MB working
-set at a measured 2.2-2.8x with room to spare. The 256 MB of flash is reserved
-once at enable and then never written to, as long as the frames compress; the
-counter for that is `flash NOT written` in /proc/ish/zswap, which read 16384 KB
-in the run above with zero writes to the file.
+No new switch: "Enable Compressed Memory" works either way. The zram mode exists
+because requiring swap was an awkward ask -- enabling swap costs flash
+immediately, since the area is `F_PREALLOCATE`d and `ftruncate`d to full size
+before a page is written, so a user whose worry is wear or free space had to
+hand over a gigabyte of storage to turn on the feature whose point is not
+writing to storage.
 
-What a true RAM-only mode would additionally buy is therefore just the reserved
-space, not the writes.
+It was small because the eviction path was already right: a refused
+`swap_slot_write` frees the slot and leaves the frame resident
+(emu/memory.c:3669), so "pool full" and "does not compress" simply mean that
+frame stops being evictable. Nothing lost, nothing written. What made it
+invasive was `swap_fd >= 0` doing double duty as "does an area exist" -- six
+sites meant that and now ask `swap_area_live_locked()`, which tests the bitmap,
+allocated and freed with the area in both modes.
 
-A true no-file mode would mean `swap_fd < 0` with slots still being handed out,
-and `swap_fd >= 0` is the "does an area exist" test in several places in
-kernel/swap.c. That is a real change to a pager rather than a flag, and it buys
-the last 16 MB. Worth doing deliberately, not on the way past.
+**In zram mode an incompressible frame is simply never evicted.** There is
+nowhere for it to go, and that is correct rather than a limitation: it stays
+resident, exactly as it would with the feature off. Demonstrated by
+`swap_roundtrip` SKIPPING in that mode -- its pattern is a per-byte hash, so all
+4096 frames were declined and none moved.
+
+**All four configurations verified separately**, because they exercise different
+paths: default (201/201 guest suite, zpool unit test); swap only (round trip
+PASS with 67 MB genuinely written, so the file path still does real I/O); zswap
+(all three tests PASS); zram (round trip and fork invariant PASS, zero bytes
+written).
 
 **The Settings design follows from that**: the two sizes are separate knobs, and
 the swap-file one should be allowed to be small rather than implying a large
