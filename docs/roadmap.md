@@ -133,6 +133,31 @@ That last one is the "snapshot a root that is running a build" case, and it is
 the one that mattered: it is the evidence the quiesce gate actually drains
 rather than merely being called.
 
+**Compression: two products, not one flag** (maintainer's call, 2026-09-09 --
+"snapshots and suspends should support compress/decompress of some sort, at
+least optionally").
+
+For a *snapshot* this cannot be an option on the clone, because compression
+costs exactly what the clone saves. The clone is cheap only because the blocks
+are SHARED: 63 MiB for 77 GiB. Compressing means reading and rewriting every
+byte, so time goes back to O(bytes) and space to O(compressed size), and the
+copy-on-write divergence property is gone. That is not a snapshot with a
+checkbox; it is an archive.
+
+**And the archive already exists and already compresses**: `fakefs_export`
+(tools/fakefs.c) writes pax through `archive_write_add_filter_gzip`, surfaced as
+`exportRootNamed:toArchive:`. So the two things to offer are:
+
+- **Snapshot** -- instant, ~free, same device, for "try something and go back".
+- **Export** -- slow, small, portable, survives a device move or a backup.
+
+They differ by three orders of magnitude in cost, so the screen must name which
+one the user is getting rather than hide it behind a "compress" toggle. What is
+missing is not compression; it is that export is not presented as the archival
+half of the same idea. Worth considering a zstd filter over gzip when that is
+touched -- libarchive already has one and it is markedly faster at similar
+ratios -- but that is a tuning question, not this decision.
+
 **Where it lives in the UI is [#575](https://github.com/emkey1/ish-AOK/issues/575)
 -- and that issue is not what this document said it was.** It read as "add a
 delete button". Read 2026-09-09, the button already exists: `deleteFilesystem`
@@ -217,6 +242,27 @@ can be stated and reported, which is the difference between a limit and a lie.
 syscall, no native program on the stack -- rather than at an arbitrary
 instruction. That is a real restriction and it should be written into the design
 rather than discovered.
+
+**Compression belongs here, and more than it belongs to snapshots** (same
+maintainer call, 2026-09-09). A checkpoint is the opposite shape from a clone: a
+serialized blob of guest pages, written once and read once, with no block
+sharing to lose. Guest pages compress well -- 2-4x is typical for anonymous
+memory -- so it is close to pure win, and it should be optional the way swap's
+size is.
+
+**The stronger case is the pager itself, which today compresses nothing.**
+`kernel/swap.c` writes raw frames. Real systems do not: iOS and macOS compress
+memory before swapping, and Linux has zram/zswap. Compressing before the write
+means proportionally FEWER BYTES REACH FLASH, which is the concern users
+actually raise about enabling swap -- it stretches the 4 GiB/24h write budget by
+the compression ratio and reduces wear by the same factor. That argues for doing
+it in the pager *before* the checkpoint, because swap writes the same memory
+repeatedly while a checkpoint writes it once.
+
+Not scheduled here yet, and deliberately: it wants a measurement first -- ratio
+and CPU cost on real guest pages, against the eviction latency budget the thrash
+guard already assumes. The precedent to follow is the JIT code-cache study: a
+number and a gate before any estimate.
 
 **Next step is phase 0, and phase 0 is a gate, not a feature.** Two things, in
 order. First, an inventory: walk a real booted guest and enumerate everything
