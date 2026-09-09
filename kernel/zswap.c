@@ -53,8 +53,33 @@ bool zswap_enabled(void) {
 #endif
 }
 
-// Free everything. Caller holds the lock.
-static void zswap_teardown_locked(void) {
+// Free everything. Caller holds the lock. Returns false and changes NOTHING if
+// the pool still holds frames.
+//
+// THE TRAP THIS CLOSES, and it is silent corruption rather than a crash. A slot
+// stored here was never written to the swap file -- that is the entire point.
+// If the pool goes away while a slot still names an object in it, zswap_load
+// declines, swap_slot_read falls through to the file, and the guest is handed
+// whatever those blocks happened to contain. The frame is not lost loudly; it
+// comes back as plausible garbage.
+//
+// So teardown is refused while anything is live. Every legitimate caller
+// already reaches this with an empty pool -- swap_disable faults every frame
+// back before the geometry changes, and the startup path configures the size
+// before any area exists -- so a refusal here means a caller that did not
+// quiesce, which is a bug worth seeing rather than absorbing.
+static bool zswap_teardown_locked(void) {
+    if (zswap_pool != NULL) {
+        struct zpool_stats ps;
+        zpool_get_stats(zswap_pool, &ps);
+        if (ps.objects > 0) {
+            printk("zswap: REFUSING to tear down with %llu frames still held -- "
+                   "the caller did not fault them back first, and dropping them "
+                   "would hand the guest garbage from the swap file\n",
+                   (unsigned long long) ps.objects);
+            return false;
+        }
+    }
     if (zswap_pool != NULL) {
         zpool_destroy(zswap_pool);
         __atomic_store_n(&zswap_pool, NULL, __ATOMIC_RELEASE);
@@ -65,6 +90,7 @@ static void zswap_teardown_locked(void) {
     zswap_scratch = NULL;
     free(zswap_cbuf);
     zswap_cbuf = NULL;
+    return true;
 }
 
 // Build the pool and the slot table, if the geometry and the cap are both
@@ -107,7 +133,10 @@ static void zswap_build_locked(void) {
 
 void zswap_configure(uint32_t max_mb) {
     pthread_mutex_lock(&zswap_lock);
-    zswap_teardown_locked();
+    if (!zswap_teardown_locked()) {
+        pthread_mutex_unlock(&zswap_lock);
+        return;                 // live frames; the existing pool stays
+    }
     zswap_max_bytes = (uint64_t) max_mb * 1024 * 1024;
     zswap_stats_live.max_bytes = zswap_max_bytes;
     zswap_build_locked();
@@ -117,8 +146,12 @@ void zswap_configure(uint32_t max_mb) {
 void zswap_set_slot_geometry(uint32_t slot_count, size_t slot_size) {
     pthread_mutex_lock(&zswap_lock);
     // The area was rebuilt, so anything the pool held describes slots that no
-    // longer mean the same thing. Drop it rather than reinterpret it.
-    zswap_teardown_locked();
+    // longer mean the same thing. Drop it rather than reinterpret it -- but
+    // only if it is empty; see zswap_teardown_locked.
+    if (!zswap_teardown_locked()) {
+        pthread_mutex_unlock(&zswap_lock);
+        return;
+    }
     zswap_slot_count = slot_count;
     zswap_slot_size = slot_size;
     zswap_build_locked();

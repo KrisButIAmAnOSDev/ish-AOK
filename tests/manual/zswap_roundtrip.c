@@ -32,6 +32,21 @@
 //
 // On an installed app it SKIPs, for the same reason swap_roundtrip does: the
 // forced-eviction control is a CLI/Xcode development gate.
+//
+// TWO CONFIGURATIONS ARE WORTH RUNNING, and this test passes in both by
+// asserting nothing about how many frames were declined:
+//
+//   ISH_GUEST_ZSWAP_MB=128   the pool swallows the whole region -- 1536 stored,
+//                            0 declined. Exercises the compressed path only.
+//   ISH_GUEST_ZSWAP_MB=1     the pool fills partway -- measured 640 stored and
+//                            896 declined to flash. This is the one that proves
+//                            the MIXED case: frames that overflowed to the file
+//                            and frames held in RAM must both come back
+//                            byte-for-byte, and a pool that stops accepting
+//                            must not lose what it already holds.
+//
+// A cap of 4 MB does NOT overflow, which is worth knowing before choosing one:
+// the pattern here compresses about 10x, so 24 MB of it fits in 2.4 MB.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
