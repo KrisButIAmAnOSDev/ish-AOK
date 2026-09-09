@@ -1265,15 +1265,34 @@ void swap_set_preference(bool enabled, unsigned size_mb) {
     atomic_store_explicit(&swap_pref_seen, true, memory_order_release);
 }
 
-// Compressed memory with no swap area behind it. The addressable size is
-// derived from the pool's cap rather than asked for separately: slots are pure
-// addressing here (one bit of bitmap and eight bytes of table each), the pool is
-// the real limit, and the device runs showed that making the ADDRESSABLE size
-// the binding constraint is the mistake -- eviction stops dead when slots run
-// out however much pool is left. Eight times the cap means the pool always runs
-// out first, which is the constraint the user actually chose.
+// Compressed memory with no swap area behind it.
+//
+// The addressable size is derived from the pool's cap rather than asked for
+// separately, and the MULTIPLIER IS USER-VISIBLE, which is the thing to get
+// right. Two constraints pull against each other:
+//
+//   - Too small and slots become the binding constraint. Eviction stops dead
+//     when they run out however much pool is left, which is the mistake the
+//     device runs caught: a 256 MB area capped eviction at 256 MB regardless of
+//     the pool.
+//   - Too large and it lies. This is what /proc/meminfo reports as SwapTotal
+//     and what /proc/swaps advertises, so ktop and free(1) print it. The first
+//     version used 8x, and a 128 MB pool showed up on an iPad as "Swp
+//     2.0M/1.00G" -- a gigabyte of swap the user does not have, on a device
+//     where the whole point is that nothing is on storage at all.
+//
+// 4x. Above the 2.2-2.8x measured on real workloads, so the pool still fills
+// before slots run out on anything typical, and close enough to reality that
+// the reported total means something: a 128 MB pool advertises 512 MB, which is
+// roughly what it can hold if the data compresses about as well as everything
+// measured so far. Data that compresses BETTER than 4x will run out of slots
+// first, and that is a real limit rather than a hidden one -- it shows up as
+// SwapFree reaching zero, which is exactly where a user would look.
+#define SWAP_RAM_ONLY_ADDRESSABLE_RATIO 4
+
 static void swap_start_ram_only(unsigned pool_mb) {
-    uint64_t addressable = (uint64_t) pool_mb * 8 * 1024 * 1024;
+    uint64_t addressable = (uint64_t) pool_mb *
+        SWAP_RAM_ONLY_ADDRESSABLE_RATIO * 1024 * 1024;
     int err = swap_enable_ram_only(addressable);
     if (err < 0) {
         printk("zram: could not create a %u MB file-less area (%d)\n", pool_mb, err);
