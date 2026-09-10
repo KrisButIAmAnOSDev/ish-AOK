@@ -9,6 +9,7 @@
 
 #include "kernel/calls.h"
 #include "kernel/fs.h"
+#include "kernel/checkpoint.h"
 #include "kernel/native.h"
 #include "kernel/native_io.h"
 #include "kernel/signal.h"
@@ -323,8 +324,15 @@ static const struct native_program native_programs[] = {
     { "bash", native_bash_main },
 #endif
 #ifdef ISH_NATIVE_ZSH
-    { "zsh", native_zsh_main },
-    { "zsh-multio", native_zsh_multio_main },
+    // zsh is the one native program that can describe itself completely: its
+    // fork-by-relaunch already turns a live shell into a state script, and a
+    // checkpoint wants exactly that (deps/zsh/Src/aok_fork.c, kernel/
+    // zsh_glue.c). AOK_ZSH_STATE_FD is the channel its re-launched children
+    // already read a state from, so a restored one needs nothing new taught
+    // to it.
+    { "zsh", native_zsh_main, native_zsh_ckpt_dump, "AOK_ZSH_STATE_FD" },
+    { "zsh-multio", native_zsh_multio_main, native_zsh_ckpt_dump,
+      "AOK_ZSH_STATE_FD" },
 #endif
 #ifdef ISH_NATIVE_DASH
     { "dash", native_dash_main },
@@ -338,6 +346,10 @@ size_t native_program_count(void) {
         if (native_programs[i].main != NULL)
             n++;
     return n;
+}
+
+const struct native_program *native_program_running(struct task *task) {
+    return task != NULL ? task->native_running : NULL;
 }
 
 const struct native_program *native_program_at(size_t index) {
@@ -515,8 +527,14 @@ void native_exec_run_pending(void) {
     // run's.
     nlibc_invocation_token_assign();
 
+    // Which program this is, for as long as it runs. kernel/checkpoint.c asks
+    // through native_program_running() so it can find the ckpt_dump for a task
+    // it has frozen, rather than matching argv[0] back against the table.
+    current->native_running = prog;
+
     int status = prog->main(argc, argv, envp);
 
+    current->native_running = NULL;
     current->native_argv = NULL;
     current->native_argc = 0;
     native_free_vector(argv);
@@ -740,6 +758,17 @@ void native_checkpoint(void) {
     // its tracer and the tracer's wait4 hung forever. Parking WHILE holding a
     // stdio lock is fine -- the owner is alive and will release it on SIGCONT.
     group_stop_wait();
+
+    // The checkpoint freezer's parking place for a native program. It never
+    // reaches task_run_current's loop -- that loop is for translated code --
+    // so this is where the machine stops for it, and where it is asked to
+    // describe itself. See kernel/checkpoint.c.
+    checkpoint_native_park();
+    // And the request half: `echo suspend > /proc/ish/checkpoint` from a
+    // native shell is deferred like any other, and this is the only place that
+    // shell comes back through -- task_run_current's loop, where an emulated
+    // task's deferred checkpoint is taken, is not on its path at all.
+    checkpoint_run_pending();
 
     // Signals the program installed a handler for. Those are kept blocked in
     // the kernel -- it cannot jump host code -- so receive_signals above skips

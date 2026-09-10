@@ -57,12 +57,45 @@ struct native_program {
     // argv[0] is the name the caller invoked, as on any multicall binary.
     // envp is NULL-terminated. The return value becomes the exit status.
     int (*main)(int argc, char *const argv[], char *const envp[]);
+
+    // ---- describing itself to a checkpoint (kernel/checkpoint.c) ----------
+    //
+    // A native program is a C function on a HOST thread. There is no
+    // serialising that stack, so a checkpoint cannot photograph one the way it
+    // photographs an emulated task -- and the project's rule is that a native
+    // program either knows how to DUMP ITS OWN STATE or the checkpoint refuses
+    // while it is running. This pair is the knowing half.
+    //
+    // ckpt_dump returns a malloc'd blob the same program can be re-launched
+    // with, or NULL if it cannot describe itself right now (which is a
+    // refusal, not a silent loss). It runs on the PROGRAM'S OWN THREAD, from
+    // its parking place in native_checkpoint, because that is the only thread
+    // its state exists on.
+    //
+    // ckpt_state_var names the environment variable through which a restored
+    // instance is told the descriptor its state arrives on. The restore
+    // creates a pipe, writes the blob, and dispatches -- which for a shell is
+    // exactly the channel its fork-by-relaunch child already uses, so nothing
+    // new has to be taught to the program itself.
+    //
+    // Both NULL means "cannot describe itself"; the checkpoint says so, by
+    // name.
+    char *(*ckpt_dump)(void);
+    const char *ckpt_state_var;
 };
 
 // NULL when no native program of that name is compiled into this build. Exec
 // then falls through to the ordinary path and runs the /AOK/native stub, which
 // reports the situation loudly rather than failing with ENOEXEC.
+// zsh's self-description, for the table's ckpt_dump slot. In kernel/zsh_glue.c.
+char *native_zsh_ckpt_dump(void);
+
 const struct native_program *native_program_lookup(const char *name);
+
+// The native program this task is RUNNING, or NULL. Set when the program is
+// dispatched and cleared when it ends; kernel/checkpoint.c asks so it can find
+// the ckpt_dump above without re-deriving the program from argv[0].
+const struct native_program *native_program_running(struct task *task);
 
 // Enumerating what this build actually has, so /AOK/native (fs/aok.c) is served
 // FROM the registry rather than from a second list beside it. Adding a native

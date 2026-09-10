@@ -64,6 +64,7 @@ static inline void task_io_counters_add(struct task_io_counters *dst,
 }
 struct futex; // opaque; defined in kernel/futex.c (see futex_restart_futex below)
 struct native_exec_pending; // opaque; defined in kernel/native.c
+struct native_program;   // kernel/native.h
 
 struct task {
     enum guest_abi abi;
@@ -110,6 +111,13 @@ struct task {
     // storage because a native program's THREADS share one task, and the
     // thread that installs a handler is not always the one that delivers it.
     void *native_sigtable;
+    // The native program entry this task is running, or NULL. Read by
+    // kernel/checkpoint.c to find its ckpt_dump; see struct native_program.
+    const struct native_program *native_running;
+    // What that program said about itself when the checkpoint froze it,
+    // produced on its own thread and consumed by the writer on another. Owned
+    // by the task until the writer takes it.
+    char *ckpt_native_state;
 
     // Signals a native program has a handler for that the SHIM is blocking on
     // its behalf, and which the program itself has not asked to block.

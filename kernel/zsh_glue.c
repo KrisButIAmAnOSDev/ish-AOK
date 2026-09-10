@@ -401,3 +401,70 @@ int native_zsh_multio_main(int argc, char *const argv[], char *const envp[]) {
     // never asked about.
     return 0;
 }
+
+/*
+ * iSH-AOK: zsh, describing itself to a checkpoint.
+ *
+ * A native program is a C function running on a host thread, so a checkpoint
+ * cannot photograph it the way it photographs an emulated task -- there is no
+ * serialising a host C stack. The rule (docs/roadmap.md, and struct
+ * native_program in kernel/native.h) is that a native program either knows how
+ * to dump its own state or the checkpoint refuses while it is running.
+ *
+ * zsh knows how, and has for a different reason: fork-by-relaunch already
+ * turns a live shell into a script that rebuilds it -- parameters, functions,
+ * aliases, options, traps, keymaps, zstyles, the lot (deps/zsh/Src/aok_fork.c).
+ * A checkpoint wants exactly those bytes, and a restored shell reads them
+ * through AOK_ZSH_STATE_FD, which is the same channel a re-launched child
+ * already uses. So this is a plumbing function and nothing more.
+ *
+ * A TEMP FILE rather than a pipe, and that is not a preference: aok_write_state
+ * writes straight down the descriptor, a full state is comfortably larger than
+ * a pipe buffer, and there is nobody at the other end to drain it -- this
+ * thread IS the shell. A pipe would deadlock the checkpoint against the shell
+ * it is trying to save.
+ *
+ * Runs on the shell's own thread, called from its parking place in
+ * native_checkpoint(). Everything it reads is __thread and exists nowhere else.
+ */
+// Declared here rather than by including zsh's headers: zsh.mdh pulls in the
+// whole shell's namespace, and this file is deliberately outside it (see the
+// note at the top about what the glue may and may not see).
+void aok_write_state(int fd, int flags);
+
+char *native_zsh_ckpt_dump(void) {
+    FILE *f = tmpfile();
+    if (f == NULL)
+        return NULL;
+    int fd = fileno(f);
+    if (fd < 0) {
+        fclose(f);
+        return NULL;
+    }
+    aok_write_state(fd, 0);
+
+    long size = lseek(fd, 0, SEEK_END);
+    if (size < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *out = malloc((size_t) size + 1);
+    if (out == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    ssize_t got = 0;
+    while (got < size) {
+        ssize_t n = read(fd, out + got, (size_t) (size - got));
+        if (n <= 0)
+            break;
+        got += n;
+    }
+    fclose(f);
+    if (got != size) {
+        free(out);
+        return NULL;
+    }
+    out[size] = '\0';
+    return out;
+}

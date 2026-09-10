@@ -75,6 +75,7 @@
 #include "kernel/resource.h"
 #include "kernel/signal.h"
 #include "kernel/init.h"
+#include "kernel/native.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
@@ -166,6 +167,13 @@ struct ckpt_task {
     int32_t exit_signal, pdeath_signal, nice, sched_policy;
     uint64_t robust_list;
     uint32_t did_exec;
+    // A NATIVE task. There is no address space to photograph and no register
+    // file that means anything -- it is a C function on a host thread -- so
+    // what travels is the program's name, the argv it was given, and the state
+    // it produced about itself. n_maps is 0 and no cpu_state follows; the
+    // three blobs below do, in this order, each NUL-terminated.
+    uint32_t native;
+    uint32_t native_name_len, native_argv_len, native_state_len, native_env_len;
     uint32_t uid, gid, euid, egid, suid, sgid, fsuid, fsgid;
     uint32_t umask;
     char comm[16];
@@ -312,6 +320,30 @@ void checkpoint_park_if_frozen(void) {
     pthread_mutex_unlock(&ckpt_park_lock);
 }
 
+void checkpoint_native_park(void) {
+    if (atomic_load_explicit(&ckpt_freeze_active, memory_order_relaxed) == 0)
+        return;
+    if (current == NULL ||
+            !atomic_load_explicit(&current->ckpt_freeze_wanted, memory_order_acquire))
+        return;
+
+    // DESCRIBE YOURSELF FIRST, on this thread, because this is the only thread
+    // the program's state exists on -- everything a native shell holds is
+    // __thread (tools/dash-tls-rewrite.py and its bash/zsh predecessors). The
+    // writer runs on the checkpointing task's thread and could not reach any
+    // of it.
+    //
+    // A program with no ckpt_dump leaves this NULL, and ckpt_check_scope has
+    // already refused on its behalf -- so reaching here with nothing is the
+    // freeze that was allowed to start, not a silent loss.
+    const struct native_program *prog = native_program_running(current);
+    if (prog != NULL && prog->ckpt_dump != NULL &&
+            current->ckpt_native_state == NULL)
+        current->ckpt_native_state = prog->ckpt_dump();
+
+    checkpoint_park_if_frozen();
+}
+
 // Ask every task but this one to reach a boundary and stop there.
 //
 // Returns 0 with every task parked, or _EBUSY with `blame` naming the one that
@@ -438,9 +470,15 @@ static int ckpt_check_scope(void) {
         // this is the refusing half, and it names the program so the limit is
         // reportable rather than mysterious.
         if (t->native_exec != NULL || t->native_cmdline != NULL) {
-            ckpt_refuse("pid %d is a native program (%s); a native program is "
-                        "a C function on a host thread and its stack cannot "
-                        "be serialised", t->pid, t->comm[0] ? t->comm : "?");
+            const struct native_program *prog = native_program_running(t);
+            if (prog != NULL && prog->ckpt_dump != NULL)
+                continue;   // it can describe itself; see checkpoint_native_park
+            ckpt_refuse("pid %d is running the native program %s, which cannot "
+                        "describe its own state -- a native program is a C "
+                        "function on a host thread and its stack cannot be "
+                        "serialised", t->pid,
+                        prog != NULL ? prog->name :
+                        (t->comm[0] ? t->comm : "?"));
             err = _EOPNOTSUPP;
             break;
         }
@@ -693,11 +731,28 @@ static int ckpt_emit_map(void *vctx, page_t start, pages_t pages, unsigned flags
 // -- be the ordinary one rather than a second copy that takes an explicit
 // task. Safe because every other task is frozen; unsafe the moment that stops
 // being true.
+// One task, written in full: its record, its register file, its signal
+// dispositions and limits, its address space, its descriptors.
+//
+// `current` is REPOINTED at the task for the duration. That is an established
+// move in this tree (kernel/init.c does it in three places) and it is what
+// lets every helper below -- generic_getpath, mem_ptr, the filesystem's lseek
+// -- be the ordinary one rather than a second copy that takes an explicit
+// task. Safe because every other task is frozen; unsafe the moment that stops
+// being true.
+//
+// Three shapes, sharing the descriptor half: an ordinary task, a NATIVE task
+// (no address space to photograph, a self-description instead), and a zombie
+// (a status and nothing else).
 static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         uint32_t *stdio_is_tty, uint64_t *pages_out, struct ckpt_fd_ids *ids) {
     struct task *saved_current = current;
     current = task;
     int ret = 0;
+
+    const struct native_program *prog = native_program_running(task);
+    struct ckpt_saved_fd *saved = NULL;
+    unsigned nfds = 0;
 
     if (task->zombie) {
         // Nothing but the status its parent has not collected. No address
@@ -722,19 +777,26 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         return w->err;
     }
 
-    struct mem *mem = task->mem;
-    struct mm *mm = task->mm;
+    // ---- the descriptors, gathered for either shape ----------------------
+    //
+    // Gathered ONCE, with a reference held, and the table lock dropped before
+    // anything is asked of them. Two reasons, and the second was found the
+    // hard way:
+    //
+    //  - Classifying twice (a pre-flight pass and then the write) meant
+    //    describing a table that could have changed in between.
+    //  - Asking a descriptor where it is positioned runs the filesystem's
+    //    lseek, and on /proc/ish/checkpoint that regenerates the file --
+    //    which walks every task's fd table, including this one. Holding
+    //    files->lock across it deadlocked the guest against itself.
     struct fdtable *files = task->files;
-    struct ckpt_saved_fd *saved = NULL;
-    unsigned nfds = 0;
-
     lock(&files->lock, 0);
     unsigned cap = files->size;
     saved = calloc(cap != 0 ? cap : 1, sizeof(*saved));
     if (saved == NULL) {
         unlock(&files->lock);
-        ret = _ENOMEM;
-        goto out;
+        current = saved_current;
+        return _ENOMEM;
     }
     for (unsigned i = 0; i < files->size; i++) {
         struct fd *fd = files->files[i];
@@ -775,10 +837,6 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
             *stdio_is_tty = 1;
     }
 
-    read_lock(&mem->lock);
-    struct ckpt_count_ctx counts = {0};
-    ckpt_for_each_map(mem, ckpt_count_map, &counts);
-
     char cwd[MAX_PATH + 1] = "/", root[MAX_PATH + 1] = "/";
     lock(&task->fs->lock, 0);
     if (task->fs->pwd != NULL)
@@ -790,17 +848,9 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
 
     struct ckpt_task rec = {
         .pid = task->pid,
-        .zombie = task->zombie ? 1 : 0,
-        .exit_code = task->exit_code,
-        .exit_signal = task->exit_signal,
-        .pdeath_signal = task->pdeath_signal,
-        .nice = task->nice,
-        .sched_policy = task->sched_policy,
-        .robust_list = task->robust_list,
-        .did_exec = task->did_exec ? 1 : 0,
         .ppid = task->parent != NULL ? task->parent->pid : 0,
         .pgid = task->group->pgid, .sid = task->group->sid,
-        .n_maps = counts.maps, .n_fds = nfds,
+        .n_fds = nfds,
         .abi = (uint32_t) task->abi,
         .uid = task->uid, .gid = task->gid,
         .euid = task->euid, .egid = task->egid,
@@ -810,44 +860,113 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         .blocked = task->blocked, .pending = task->pending,
         .altstack = task->altstack, .altstack_size = task->altstack_size,
         .clear_tid = task->clear_tid,
-        .brk = mm->brk, .start_brk = mm->start_brk,
-        .vdso = mm->vdso, .stack_start = mm->stack_start,
-        .argv_start = mm->argv_start, .argv_end = mm->argv_end,
-        .env_start = mm->env_start, .env_end = mm->env_end,
-        .auxv_start = mm->auxv_start, .auxv_end = mm->auxv_end,
+        .exit_signal = task->exit_signal,
+        .pdeath_signal = task->pdeath_signal,
+        .nice = task->nice,
+        .sched_policy = task->sched_policy,
+        .robust_list = task->robust_list,
+        .did_exec = task->did_exec ? 1 : 0,
         .n_sigactions = NUM_SIGS,
         .cwd_len = (uint32_t) strlen(cwd),
         .root_len = (uint32_t) strlen(root),
-        .page_limit = mem->page_limit,
-        .mmap_floor = mem->mmap_floor,
-        .mmap_ceiling = mem->mmap_ceiling,
-        .stack_top = mem->stack_top,
-        .stack_limit_pages = mem->stack_limit_pages,
     };
     memcpy(rec.comm, task->comm, sizeof(rec.comm));
-    CKPT_TRACE("save pid %d (ppid %d pgid %d sid %d) %s: %u maps, %u fds, "
-               "%llu pages\n", rec.pid, rec.ppid, rec.pgid, rec.sid, rec.comm,
-               rec.n_maps, rec.n_fds, (unsigned long long) counts.pages);
+
+    struct mem *mem = NULL;
+    struct ckpt_count_ctx counts = {0};
+    const char *native_state = NULL;
+    const char *native_argv = NULL;
+    char *native_env = NULL;
+    size_t native_env_len = 0;
+
+    if (prog != NULL) {
+        // A NATIVE task: no address space worth photographing and no register
+        // file that means anything. What travels is the program's name, the
+        // argv it was given, and the state it produced about itself when the
+        // freeze parked it (checkpoint_native_park runs on its own thread,
+        // which is the only place its state exists).
+        native_state = task->ckpt_native_state != NULL ? task->ckpt_native_state : "";
+        native_argv = task->native_cmdline != NULL ? task->native_cmdline : "";
+        rec.native = 1;
+        rec.native_name_len = (uint32_t) strlen(prog->name);
+        rec.native_argv_len = (uint32_t) (task->native_cmdline != NULL
+                ? task->native_cmdline_len : 0);
+        rec.native_state_len = (uint32_t) strlen(native_state);
+        // The environment, as one NUL-separated block. A shell's exported
+        // parameters come back with the state script, but the program reads
+        // `environ` before it sources anything -- and a restored program with
+        // no PATH at all would not find the first thing it was asked to run.
+        for (char **e = task->native_env; e != NULL && *e != NULL; e++)
+            native_env_len += strlen(*e) + 1;
+        if (native_env_len != 0) {
+            native_env = malloc(native_env_len);
+            if (native_env == NULL) { ret = _ENOMEM; goto out; }
+            size_t at = 0;
+            for (char **e = task->native_env; *e != NULL; e++) {
+                size_t n = strlen(*e) + 1;
+                memcpy(native_env + at, *e, n);
+                at += n;
+            }
+        }
+        rec.native_env_len = (uint32_t) native_env_len;
+        CKPT_TRACE("save pid %d (ppid %d) NATIVE %s: %u fds, %u bytes of state\n",
+                   rec.pid, rec.ppid, prog->name, rec.n_fds,
+                   rec.native_state_len);
+        // The tail, because a state that does not finish is the failure this
+        // has to distinguish from one that is simply wrong: the last line is
+        // the program's own sentinel.
+        CKPT_TRACE("  state ends: %s\n", rec.native_state_len > 90
+                   ? native_state + rec.native_state_len - 90 : native_state);
+    } else {
+        struct mm *mm = task->mm;
+        mem = task->mem;
+        read_lock(&mem->lock);
+        ckpt_for_each_map(mem, ckpt_count_map, &counts);
+        rec.n_maps = counts.maps;
+        rec.brk = mm->brk; rec.start_brk = mm->start_brk;
+        rec.vdso = mm->vdso; rec.stack_start = mm->stack_start;
+        rec.argv_start = mm->argv_start; rec.argv_end = mm->argv_end;
+        rec.env_start = mm->env_start; rec.env_end = mm->env_end;
+        rec.auxv_start = mm->auxv_start; rec.auxv_end = mm->auxv_end;
+        rec.page_limit = mem->page_limit;
+        rec.mmap_floor = mem->mmap_floor;
+        rec.mmap_ceiling = mem->mmap_ceiling;
+        rec.stack_top = mem->stack_top;
+        rec.stack_limit_pages = mem->stack_limit_pages;
+        CKPT_TRACE("save pid %d (ppid %d pgid %d sid %d) %s: %u maps, %u fds, "
+                   "%llu pages\n", rec.pid, rec.ppid, rec.pgid, rec.sid,
+                   rec.comm, rec.n_maps, rec.n_fds,
+                   (unsigned long long) counts.pages);
+    }
+
     wr(w, &rec, sizeof(rec));
     wr(w, cwd, rec.cwd_len);
     wr(w, root, rec.root_len);
 
-    // The register file, as bytes. See ckpt_fingerprint for why that is safe
-    // and what stops it from being unsafe.
-    wr(w, &task->cpu, sizeof(struct cpu_state));
+    if (prog != NULL) {
+        wr(w, prog->name, rec.native_name_len);
+        wr(w, native_argv, rec.native_argv_len);
+        wr(w, native_state, rec.native_state_len);
+        wr(w, native_env, rec.native_env_len);
+    } else {
+        // The register file, as bytes. See ckpt_fingerprint for why that is
+        // safe and what stops it from being unsafe.
+        wr(w, &task->cpu, sizeof(struct cpu_state));
 
-    lock(&task->sighand->lock, 0);
-    wr(w, task->sighand->action, sizeof(struct sigaction_) * NUM_SIGS);
-    unlock(&task->sighand->lock);
+        lock(&task->sighand->lock, 0);
+        wr(w, task->sighand->action, sizeof(struct sigaction_) * NUM_SIGS);
+        unlock(&task->sighand->lock);
 
-    lock(&task->group->lock, 0);
-    wr(w, task->group->limits, sizeof(task->group->limits));
-    unlock(&task->group->lock);
+        lock(&task->group->lock, 0);
+        wr(w, task->group->limits, sizeof(task->group->limits));
+        unlock(&task->group->lock);
 
-    struct ckpt_emit_ctx emit = { .w = w, .mem = mem };
-    ckpt_for_each_map(mem, ckpt_emit_map, &emit);
-    read_unlock(&mem->lock);
-    *pages_out += counts.pages;
+        struct ckpt_emit_ctx emit = { .w = w, .mem = mem };
+        ckpt_for_each_map(mem, ckpt_emit_map, &emit);
+        read_unlock(&mem->lock);
+        mem = NULL;
+        *pages_out += counts.pages;
+    }
 
     for (unsigned i = 0; i < nfds && w->err == 0; i++) {
         struct ckpt_saved_fd *s = &saved[i];
@@ -877,6 +996,9 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
     ret = w->err;
 
 out:
+    free(native_env);
+    if (mem != NULL)
+        read_unlock(&mem->lock);
     if (saved != NULL) {
         for (unsigned i = 0; i < nfds; i++) {
             fd_close(saved[i].fd);
@@ -1029,6 +1151,11 @@ int checkpoint_save(const char *host_path) {
 // What the restore has built so far, shared by every task in the image.
 struct ckpt_restore_state {
     struct fd *stdio[3];
+    // The native program the task being restored right now is, if it is one.
+    // Read by the caller once ckpt_restore_task returns, so it can dispatch
+    // the program rather than start a guest thread.
+    char *native_name, *native_argv, *native_state, *native_env;
+    uint32_t native_argv_len, native_env_len;
     // id -> the struct fd built for it. A CKPT_FD_REF installs this one again
     // rather than making a second object, which is what keeps a forked child's
     // file offset the same object as its parent's.
@@ -1100,9 +1227,42 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         const struct ckpt_task *rec, bool stdio_is_tty,
         struct ckpt_restore_state *st) {
     int err;
+    struct fdtable *files;
     char cwd[MAX_PATH + 1] = {0}, root[MAX_PATH + 1] = {0};
     if ((err = rd(f, cwd, rec->cwd_len)) < 0) return err;
     if ((err = rd(f, root, rec->root_len)) < 0) return err;
+
+    // A NATIVE task: the program's name, the argv it had, and the state it
+    // produced about itself. No register file and no address space follow --
+    // it is not being photographed, it is being told to come back and rebuild
+    // itself, which is the only thing a C function on a host thread can do.
+    char *native_name = NULL, *native_argv = NULL, *native_state = NULL;
+    char *native_env = NULL;
+    if (rec->native) {
+        native_name = calloc(rec->native_name_len + 1, 1);
+        native_argv = calloc(rec->native_argv_len + 1, 1);
+        native_state = calloc(rec->native_state_len + 1, 1);
+        native_env = calloc(rec->native_env_len + 1, 1);
+        if (native_name == NULL || native_argv == NULL ||
+                native_state == NULL || native_env == NULL)
+            err = _ENOMEM;
+        else if ((err = rd(f, native_name, rec->native_name_len)) >= 0 &&
+                 (err = rd(f, native_argv, rec->native_argv_len)) >= 0 &&
+                 (err = rd(f, native_state, rec->native_state_len)) >= 0)
+            err = rd(f, native_env, rec->native_env_len);
+        if (err < 0) {
+            free(native_name); free(native_argv);
+            free(native_state); free(native_env);
+            return err;
+        }
+        st->native_name = native_name;
+        st->native_argv = native_argv;
+        st->native_argv_len = rec->native_argv_len;
+        st->native_state = native_state;
+        st->native_env = native_env;
+        st->native_env_len = rec->native_env_len;
+        goto descriptors;
+    }
 
     struct cpu_state cpu;
     if ((err = rd(f, &cpu, sizeof(cpu))) < 0) return err;
@@ -1174,9 +1334,10 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
     mm->env_start = rec->env_start; mm->env_end = rec->env_end;
     mm->auxv_start = rec->auxv_start; mm->auxv_end = rec->auxv_end;
 
+descriptors:
     // The descriptors. Everything the fresh task opened for itself goes
     // first: the image is the complete truth about what this process had open.
-    struct fdtable *files = current->files;
+    files = current->files;
     lock(&files->lock, 0);
     for (unsigned i = 0; i < files->size; i++) {
         if (files->files[i] != NULL) {
@@ -1340,6 +1501,9 @@ fds_done:
         return err;
 
     // Credentials, identity and the rest of the task.
+    if (rec->native)
+        goto identity;
+identity:
     current->uid = rec->uid; current->gid = rec->gid;
     current->euid = rec->euid; current->egid = rec->egid;
     current->suid = rec->suid; current->sgid = rec->sgid;
@@ -1357,9 +1521,11 @@ fds_done:
     current->robust_list = rec->robust_list;
     current->did_exec = rec->did_exec != 0;
 
-    lock(&current->sighand->lock, 0);
-    memcpy(current->sighand->action, actions, sizeof(actions));
-    unlock(&current->sighand->lock);
+    if (!rec->native) {
+        lock(&current->sighand->lock, 0);
+        memcpy(current->sighand->action, actions, sizeof(actions));
+        unlock(&current->sighand->lock);
+    }
     lock(&current->fs->lock, 0);
     current->fs->umask = rec->umask;
     unlock(&current->fs->lock);
@@ -1368,6 +1534,9 @@ fds_done:
         if (!IS_ERR(pwd))
             fs_chdir(current->fs, pwd);
     }
+
+    if (rec->native)
+        return 0;   // no register file: it is a function call, not an image
 
     // The register file last, so nothing above can have run guest code with a
     // half-restored one. The two pointers in struct cpu_state name host
@@ -1389,6 +1558,112 @@ fds_done:
     current->cpu.poked_ptr = &current->cpu._poked;
     (void) h;
     return 0;
+}
+
+// Hand a restored native program back its state and arrange for it to run.
+//
+// A native program is not photographed and not resumed mid-instruction: it is
+// RE-LAUNCHED and told to rebuild itself, which is the only thing a C function
+// on a host thread can do. The channel is the one its fork-by-relaunch child
+// already reads a state from (struct native_program's ckpt_state_var), so
+// nothing new has to be taught to the program.
+//
+// A PIPE, and the state is written before the program is dispatched. It fits:
+// a shell's state is tens of kilobytes and a pipe buffer is 64, and if it did
+// not, the write would block against a reader that has not started -- so an
+// oversized state is refused here rather than deadlocking the restore.
+static int ckpt_dispatch_native(struct task *task, struct ckpt_restore_state *st) {
+    const struct native_program *prog = native_program_lookup(st->native_name);
+    if (prog == NULL) {
+        ckpt_refuse("this build has no native program called %s", st->native_name);
+        return _ENOENT;
+    }
+
+    // argv and envp out of their NUL-separated blocks.
+    unsigned argc = 0;
+    for (uint32_t i = 0; i < st->native_argv_len; i++)
+        if (st->native_argv[i] == '\0')
+            argc++;
+    unsigned envc = 0;
+    for (uint32_t i = 0; i < st->native_env_len; i++)
+        if (st->native_env[i] == '\0')
+            envc++;
+
+    char **argv = calloc(argc + 1, sizeof(*argv));
+    char **envp = calloc(envc + 2, sizeof(*envp));
+    if (argv == NULL || envp == NULL) {
+        free(argv); free(envp);
+        return _ENOMEM;
+    }
+    unsigned n = 0;
+    for (uint32_t i = 0; i < st->native_argv_len && n < argc; ) {
+        argv[n++] = st->native_argv + i;
+        i += strlen(st->native_argv + i) + 1;
+    }
+    if (argc == 0)
+        argv[argc = 0] = NULL;
+    unsigned m = 0;
+    for (uint32_t i = 0; i < st->native_env_len && m < envc; ) {
+        envp[m++] = st->native_env + i;
+        i += strlen(st->native_env + i) + 1;
+    }
+
+    char fdvar[64] = "";
+    struct fd *state_rd = NULL, *state_wr = NULL;
+    if (prog->ckpt_state_var != NULL && st->native_state[0] != '\0') {
+        size_t len = strlen(st->native_state);
+        // A GUEST pipe, not a host one. The program reads its state through
+        // the shim, which routes every descriptor through the guest's own
+        // table -- so a raw host descriptor number means nothing to it. That
+        // is what made a restored zsh source an empty state and report that it
+        // "did not finish": it was reading whatever the guest happened to have
+        // at that number, which was nothing.
+        int err = pipe_create_pair(&state_rd, &state_wr, adhoc_next_inode());
+        if (err < 0) {
+            free(argv); free(envp);
+            return err;
+        }
+        ssize_t put = write(state_wr->real_fd, st->native_state, len);
+        fd_close(state_wr);
+        if (put != (ssize_t) len) {
+            fd_close(state_rd);
+            free(argv); free(envp);
+            ckpt_refuse("%s's saved state is %zu bytes, more than a pipe will "
+                        "hold before the program starts reading it",
+                        prog->name, len);
+            return _E2BIG;
+        }
+        // At a number nothing in the image used. The image's descriptors are
+        // already installed, so the first free slot above them is free for
+        // good -- and the program unsets the variable naming it at startup, so
+        // nothing it runs inherits either.
+        struct fdtable *files = task->files;
+        fd_t at = 0;
+        lock(&files->lock, 0);
+        for (at = 3; (unsigned) at < files->size && files->files[at] != NULL; at++)
+            ;
+        unlock(&files->lock);
+        if ((err = fdtable_install_at(files, at, state_rd, false)) < 0) {
+            free(argv); free(envp);
+            return err;
+        }
+        snprintf(fdvar, sizeof(fdvar), "%s=%d", prog->ckpt_state_var, (int) at);
+        envp[m++] = fdvar;
+        CKPT_TRACE("  native %s: %zu bytes of state on guest fd %d\n",
+                   prog->name, len, (int) at);
+    }
+    envp[m] = NULL;
+
+    // Recorded rather than run: task_run_current calls native_exec_run_pending
+    // on the way in, which is exactly how a native program starts on a fresh
+    // boot. The copies it makes are its own, so the blocks above may go.
+    struct task *saved = current;
+    current = task;
+    int err = native_exec_set_pending(prog, (int) argc, argv, envp);
+    current = saved;
+    free(argv);
+    free(envp);
+    return err;
 }
 
 // Build a task to restore INTO: a fresh process, at the pid the image names,
@@ -1519,10 +1794,16 @@ int checkpoint_restore(const char *host_path) {
         CKPT_TRACE("load pid %u (ppid %u pgid %u sid %u) %s: %u maps, %u fds\n",
                    rec.pid, rec.ppid, rec.pgid, rec.sid, rec.comm,
                    rec.n_maps, rec.n_fds);
+        st.native_name = st.native_argv = st.native_state = st.native_env = NULL;
         struct task *saved = current;
         current = task;
         err = ckpt_restore_task(f, &h, &rec, h.stdio_is_tty != 0, &st);
         current = saved;
+        if (err == 0 && rec.native)
+            err = ckpt_dispatch_native(task, &st);
+        free(st.native_name); free(st.native_argv);
+        free(st.native_state); free(st.native_env);
+        st.native_name = st.native_argv = st.native_state = st.native_env = NULL;
         if (err < 0)
             goto out;
     }
@@ -1623,6 +1904,16 @@ void checkpoint_run_pending(void) {
     if (!want)
         return;
 
+    // If the task that asked is ITSELF a native program, it describes itself
+    // here. The freezer only asks the others -- this one is not frozen, it is
+    // the one doing the freezing -- and its state, like theirs, exists only on
+    // its own thread. Reached from native_checkpoint(), which is the only
+    // place a native program comes back through.
+    const struct native_program *self = native_program_running(current);
+    if (self != NULL && self->ckpt_dump != NULL &&
+            current->ckpt_native_state == NULL)
+        current->ckpt_native_state = self->ckpt_dump();
+
     int err = checkpoint_save(path);
     if (err < 0) {
         lock(&ckpt_lock, 0);
@@ -1631,8 +1922,15 @@ void checkpoint_run_pending(void) {
                    ckpt_status.last_refusal[0] ? ckpt_status.last_refusal
                                                : "(no reason recorded)");
         unlock(&ckpt_lock);
+        free(current->ckpt_native_state);
+        current->ckpt_native_state = NULL;
         return;
     }
+    // Consumed, whichever way it went: it describes a moment that has passed,
+    // and leaving it would have the next checkpoint write a stale state.
+    free(current->ckpt_native_state);
+    current->ckpt_native_state = NULL;
+
     if (!halt_after)
         return;
 

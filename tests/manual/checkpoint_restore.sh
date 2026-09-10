@@ -193,6 +193,48 @@ case $pipe_back in
     *) echo "FAIL: the bytes in the pipe did not survive"; echo "  got: $pipe_back"; exit 1;;
 esac
 
+# ---- a NATIVE program -----------------------------------------------------
+#
+# The one that matters most, because AOK's login shell is native zsh. A native
+# program is a C function on a host thread: there is no serialising that stack,
+# so it is not photographed, it is asked to DESCRIBE ITSELF and re-launched
+# from the description. zsh already knows how -- its fork-by-relaunch turns a
+# live shell into a script that rebuilds it -- and a checkpoint wants exactly
+# those bytes.
+#
+# The consequence, and it is a real one: a restored native program RE-RUNS its
+# command line rather than continuing mid-command. For an interactive shell,
+# which is what this is for, that is a prompt with your session still in it.
+# The test uses that deliberately -- the same command line, run twice, taking
+# the other branch the second time because its state came back.
+rm -f "$IMG"
+NPROG='print "launch: MARK is [$MARK]"
+if [[ -z $MARK ]]; then
+  MARK=set-before-suspend
+  myfunc() { print FUNC-SURVIVED }
+  alias myalias="print ALIAS-SURVIVED"
+  exec 9> /proc/ish/checkpoint; print -u9 suspend; exec 9>&-
+else
+  print "second life: MARK=[$MARK]"
+  myfunc
+  myalias
+fi'
+nat_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" \
+    /AOK/native/zsh -c "$NPROG" 2>&1)
+echo "$nat_out" | sed 's/^/  native  | /'
+[ -s "$IMG" ] || { echo "FAIL: no image for the native shell"; exit 1; }
+case $nat_out in
+    *"second life"*) echo "FAIL: the suspending native shell kept running"; exit 1;;
+esac
+
+nat_back=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c 'x' 2>&1)
+echo "$nat_back" | sed 's/^/  native  | /'
+case $nat_back in
+    *"second life: MARK=[set-before-suspend]"*"FUNC-SURVIVED"*"ALIAS-SURVIVED"*) ;;
+    *) echo "FAIL: the native shell's state did not survive"
+       echo "  got: $nat_back"; exit 1;;
+esac
+
 # ---- and the refusals ------------------------------------------------------
 #
 # A capability boundary that never fires is not a boundary, it is a comment.
@@ -208,8 +250,12 @@ refuse() {   # refuse <what> <shell> <program> <expected substring>
 }
 READ_REFUSAL='while read -r l; do case $l in last_refusal*) echo "$l";; esac; done < /proc/ish/checkpoint'
 
-refuse "a native program on the stack" /AOK/native/dash \
+# dash is native too, and unlike zsh it has no way to emit its shell functions
+# as text -- jobs.c's commandtext() is display-only and drops CTLESC. So it
+# cannot describe itself, and the checkpoint says which program and why rather
+# than writing an image that would come back missing things.
+refuse "a native program that cannot describe itself" /AOK/native/dash \
     "echo save $IMG > /proc/ish/checkpoint 2>/dev/null; $READ_REFUSAL" \
-    "is a native program"
+    "cannot describe its own state"
 
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"

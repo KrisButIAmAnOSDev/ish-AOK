@@ -62,6 +62,12 @@ void checkpoint_run_pending(void);
 bool checkpoint_freeze_pending(void);
 // Called at the top of task_run_current's loop, with no lock held.
 void checkpoint_park_if_frozen(void);
+// The same, for a NATIVE program, from its parking place in
+// native_checkpoint(). It never reaches task_run_current's loop -- it is a C
+// function on a host thread -- so this is where it stops, and where it is
+// asked to describe itself, because its state exists on this thread and
+// nowhere else.
+void checkpoint_native_park(void);
 
 void checkpoint_set_session(const char *host_path);
 const char *checkpoint_session(void);
