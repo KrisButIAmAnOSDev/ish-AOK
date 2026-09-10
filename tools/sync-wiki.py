@@ -75,11 +75,29 @@ def load_manifest():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split()
-            if len(parts) != 2:
-                sys.exit("wiki-pages.manifest: expected '<source> <Page>', got: %s" % line)
-            pages.append((parts[0], parts[1]))
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                sys.exit("wiki-pages.manifest: expected '<source> <Page> <Title>', "
+                         "got: %s" % line)
+            pages.append((parts[0], parts[1], parts[2].strip()))
     return pages
+
+
+def describe(source):
+    """The half of the doc's own H1 after the colon, or "".
+
+    Kept out of the manifest on purpose: taken from the doc, it cannot drift
+    from the doc. Most H1s are "Title: what it is"; the ones that are not
+    simply get no description."""
+    try:
+        with open(os.path.join(DOCS, source)) as f:
+            for line in f:
+                if line.startswith("# "):
+                    head = line[2:].strip()
+                    return head.split(":", 1)[1].strip() if ":" in head else ""
+    except OSError:
+        pass
+    return ""
 
 
 def render(source, text, by_source):
@@ -110,10 +128,12 @@ def main():
                     help="commit and push (default is to report and change nothing)")
     ap.add_argument("--adopt", action="store_true",
                     help="record the wiki's current text as the baseline, changing nothing")
+    ap.add_argument("--init-home", action="store_true",
+                    help="insert the index markers into Home.md (one time; needs --push)")
     args = ap.parse_args()
 
     pages = load_manifest()
-    by_source = {src: page for src, page in pages}
+    by_source = {src: page for src, page, _ in pages}
     state = {}
     if os.path.exists(STATE):
         with open(STATE) as f:
@@ -125,7 +145,7 @@ def main():
         run(["git", "clone", "--quiet", WIKI_URL, wiki])
 
         created, updated, diverged, untouched = [], [], [], []
-        for source, page in pages:
+        for source, page, _title in pages:
             src_path = os.path.join(DOCS, source)
             if not os.path.exists(src_path):
                 sys.exit("%s is in the manifest but not in opt/AOK/docs" % source)
@@ -154,7 +174,9 @@ def main():
             with open(home_path) as f:
                 home = f.read()
             index = "\n".join(
-                "- [%s](%s)" % (page.replace("-", " "), page) for _, page in pages)
+                "- [%s](%s)%s" % (title, page,
+                                  (" - " + describe(source)) if describe(source) else "")
+                for source, page, title in pages)
             block = "%s\n%s\n%s" % (INDEX_BEGIN, index, INDEX_END)
             if INDEX_BEGIN in home and INDEX_END in home:
                 new_home = re.sub(
@@ -164,10 +186,25 @@ def main():
                     with open(home_path, "w") as f:
                         f.write(new_home)
                 home_note = "index block updated" if new_home != home else "index block current"
+            elif args.init_home:
+                # One-time: wrap the existing "## Pages" list, or append a
+                # section if there is none. Everything else on the page --
+                # including the hand-written Developer Instructions -- is left
+                # exactly as it is.
+                m = re.search(r"^## Pages\s*\n(?:^[-*] .*\n|^\s*\n(?=[-*] ))*", home, re.M)
+                if m:
+                    new_home = home[:m.start()] + "## Pages\n\n" + block + "\n" + home[m.end():]
+                else:
+                    new_home = home.rstrip("\n") + "\n\n## Pages\n\n" + block + "\n"
+                if args.push:
+                    with open(home_path, "w") as f:
+                        f.write(new_home)
+                home_note = "index markers inserted around the page list"
             else:
                 home_note = ("NO index markers -- Home.md left completely alone. Add\n"
                              "      %s\n      %s\n"
-                             "   where the page list should go, and it will be maintained."
+                             "   where the page list should go, and it will be maintained,\n"
+                             "   or run --init-home --push to insert them once."
                              % (INDEX_BEGIN, INDEX_END))
 
         print("wiki: %s" % WIKI_URL)

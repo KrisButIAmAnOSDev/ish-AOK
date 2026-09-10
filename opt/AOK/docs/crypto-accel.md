@@ -3,25 +3,30 @@
 Emulating a cipher instruction by instruction is slow. iSH-AOK can run one
 host-native instead: the guest asks the emulator to do the work through a
 private syscall, and the emulator runs it at full host speed. On an A10X iPad
-that takes ChaCha20 from about 8.8 MB/s to about 19 MB/s.
+that takes ChaCha20 from about 8.8 MB/s to about 19 MB/s, which is the cipher
+ssh and scp use.
 
 **Check you are on an optimized build first.** At -O0 the host cipher runs
 7-17x slower and the accelerator loses to plain emulation; `uname -v` reports
 " unoptimized" when that is the case. On a normal build it is a solid win, 1.15x
 to 1.86x on real transfers depending on the device and cipher.
 
-Nothing uses it automatically. Two pieces have to be in place:
+**Nothing uses it automatically.** Two separate pieces have to be in place, and
+the second one is the one people miss:
 
 1. **The toggle**, in iSH-AOK Settings, called *Crypto Accel (ssh,
    arm64/riscv64)*. This controls the syscall itself. Off by default.
 2. **The OpenSSL provider**, a small shared library installed *inside your root
    filesystem*, which is what actually routes OpenSSL's ciphers to the syscall.
 
-The second one is the part people miss. The toggle on its own accelerates
-nothing, because nothing in the guest is asking. If you have the toggle on and
-see no change, you almost certainly have not installed the provider.
+The toggle alone accelerates nothing, because with no provider installed
+nothing in the guest is asking. If the toggle is on and you see no difference,
+this is almost certainly why.
 
 ## Install
+
+Since iSH-AOK 547 the provider and its installer ship in the app, at
+`/AOK/tools/crypto`:
 
 ```sh
 sudo sh /AOK/tools/crypto/install-crypto-accel.sh
