@@ -5505,6 +5505,53 @@ int nlibc_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
     return 0;
 }
 
+// ------------------------------------------------- BSD sigsetmask/sigblock
+//
+// 4.2BSD's signal mask as an int, one bit per signal at (sig - 1). Everything
+// they do goes through nlibc_sigprocmask, so the program's own mask
+// (native_prog_blocked) and the shim's forced blocking stay in step -- which
+// is the entire reason these exist rather than being left to the host. See the
+// note in native_libc.h for what an unrouted sigsetmask did to dash's `wait`.
+//
+// Signals above 31 have no bit and are left alone: that is BSD's own
+// limitation, not a shortcut, and a caller wanting more must use sigprocmask.
+static void nlibc_intmask_to_sigset(int mask, sigset_t *set) {
+    sigemptyset(set);
+    for (int sig = 1; sig < 32; sig++)
+        if (mask & (1 << (sig - 1)))
+            sigaddset(set, sig);
+}
+
+static int nlibc_sigset_to_intmask(const sigset_t *set) {
+    int mask = 0;
+    for (int sig = 1; sig < 32; sig++)
+        if (sigismember(set, sig) == 1)
+            mask |= 1 << (sig - 1);
+    return mask;
+}
+
+static int nlibc_sigmask_change(int how, int mask) {
+    sigset_t set, old;
+    nlibc_intmask_to_sigset(mask, &set);
+    sigemptyset(&old);
+    if (nlibc_sigprocmask(how, &set, &old) < 0)
+        return -1;
+    return nlibc_sigset_to_intmask(&old);
+}
+
+int nlibc_sigsetmask(int mask) {
+    return nlibc_sigmask_change(SIG_SETMASK, mask);
+}
+
+int nlibc_sigblock(int mask) {
+    return nlibc_sigmask_change(SIG_BLOCK, mask);
+}
+
+int nlibc_siggetmask(void) {
+    // SIG_BLOCK of nothing: the mask is unchanged and the old one comes back.
+    return nlibc_sigmask_change(SIG_BLOCK, 0);
+}
+
 int nlibc_sigpending(sigset_t *set) {
     NATIVE_FRAME;
     if (set == NULL)

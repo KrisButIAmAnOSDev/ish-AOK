@@ -367,6 +367,9 @@ INTERNAL = {
     "__snprintf_chk", "__sprintf_chk", "__vsnprintf_chk",
     "__strcat_chk", "__strcpy_chk", "__strncpy_chk",
     "__strlcat_chk", "__strlcpy_chk",
+    # stpcpy/stpncpy's, which arrived with dash -- same wrappers, same
+    # reasoning; they were simply not in any archive on this list before.
+    "__stpcpy_chk", "__stpncpy_chk",
     "__darwin_check_fd_set_overflow",
     # errno. Darwin expands errno to (*__error()), which returns a pointer to
     # the CALLING THREAD's copy -- and a native program runs on its guest
@@ -522,7 +525,8 @@ HOST_THREAD_RUNTIME = {
 }
 
 DEFAULT_TARGETS = ("build/libsmallclue.a", "build/libnextvi.a",
-                   "build/libbash.a", "build/libzsh.a", "build/libopenssh.a",
+                   "build/libbash.a", "build/libzsh.a", "build/libdash.a",
+                   "build/libopenssh.a",
                    "build/libopenssh_scp.a", "build/libopenssh_stubs.a",
                    "build/libopenssh_smult_curve25519_ref.a",
                    # AOK's own single-file native programs. Each is built into

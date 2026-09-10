@@ -260,6 +260,27 @@ char *nlibc_crypt(const char *key, const char *salt);
 int nlibc_sigaction(int sig, const struct sigaction *act, struct sigaction *oact);
 void (*nlibc_signal(int sig, void (*handler)(int)))(int);
 int nlibc_sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+/* BSD sigsetmask/sigblock/siggetmask -- 4.2BSD's signal mask, as an int with
+ * one bit per signal, still shipped by every libc and still used. dash's
+ * sigclearmask() is `sigsetmask(0)` whenever configure finds it, which is
+ * always here.
+ *
+ * These are not a convenience. An unrouted sigsetmask reaches the HOST, where
+ * it changes the calling thread's mask and touches neither the guest task's
+ * mask nor native_prog_blocked -- so the shim goes on believing the program
+ * has everything blocked. The visible failure was exact and awful: dash's
+ * `wait` builtin worked once per shell and then blocked forever, because
+ * nlibc_sigsuspend computes what may wake it from native_prog_blocked, and
+ * after the first wait that set said "everything". A foreground command was
+ * unaffected -- it uses a blocking wait3 and never goes near this -- so it
+ * looked like a bug in `wait` rather than in the mask.
+ *
+ * The int mask holds signals 1..31 as bit (sig - 1), in HOST numbering, which
+ * is what a native program sees (nlibc_signal_to_guest translates on the way
+ * down). */
+int nlibc_sigsetmask(int mask);
+int nlibc_sigblock(int mask);
+int nlibc_siggetmask(void);
 int nlibc_sigpending(sigset_t *set);
 int nlibc_sigwait(const sigset_t *set, int *sig);
 /* Runs whatever handlers are pending. Called from native_checkpoint. */
@@ -993,6 +1014,9 @@ char *nlibc_strchrnul(const char *s, int c);
 #define sigaction(a, b, c)       nlibc_sigaction((a), (b), (c))
 #define signal                   nlibc_signal
 #define sigprocmask              nlibc_sigprocmask
+#define sigsetmask               nlibc_sigsetmask
+#define sigblock                 nlibc_sigblock
+#define siggetmask               nlibc_siggetmask
 #define sigpending               nlibc_sigpending
 #define sigwait                  nlibc_sigwait
 #define setsid                   nlibc_setsid

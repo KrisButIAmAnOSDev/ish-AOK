@@ -128,6 +128,13 @@ ALLOW = {
     # every character the parser looks at, written never -- they only lack
     # `const` because mksyntax does not emit it.
     "basesyntax", "dqsyntax", "sqsyntax", "arisyntax", "is_type",
+    # aok_fork.c: the ONE crossing point. Everything else in dash is
+    # __thread precisely so a parent and the child it re-launched cannot see
+    # each other's state; this table is how the parent hands the child
+    # anything at all, so it has to be shared, and it is the only thing that
+    # is. Guarded by aok_fork_lock, which is in the list for the same reason a
+    # mutex always is -- a per-thread mutex protects nothing.
+    "aok_fork_lock", "aok_fork_reqs", "aok_fork_next_token",
 
     # ---- OpenSSH (build/libopenssh*.a) ----
     # ssh, scp, sftp and ssh-keygen are native programs too, so one run's
