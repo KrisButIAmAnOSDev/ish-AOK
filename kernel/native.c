@@ -250,6 +250,13 @@ int native_bash_main(int argc, char *const argv[], char *const envp[]);
 // zsh (kernel/zsh_glue.c), on the same terms as bash: the define and the glue
 // file are both decided by meson's `have_zsh`, so the table and the archive
 // cannot disagree. Off by default -- see meson_options.txt.
+#ifdef ISH_NATIVE_DASH
+// dash, kernel/dash_glue.c. Registered under BOTH names deliberately: `dash` is
+// what it is, and `sh` is what scripts ask for. They are the same entry point
+// -- dash does not change behaviour by argv[0] the way bash does -- so this is
+// two table rows rather than two programs.
+int native_dash_main(int argc, char *const argv[], char *const envp[]);
+#endif
 #ifdef ISH_NATIVE_ZSH
 int native_zsh_main(int argc, char *const argv[], char *const envp[]);
 // zsh's MULTIOS byte pump, also kernel/zsh_glue.c. A program of its own rather
@@ -318,6 +325,10 @@ static const struct native_program native_programs[] = {
 #ifdef ISH_NATIVE_ZSH
     { "zsh", native_zsh_main },
     { "zsh-multio", native_zsh_multio_main },
+#endif
+#ifdef ISH_NATIVE_DASH
+    { "dash", native_dash_main },
+    { "sh", native_dash_main },
 #endif
 };
 

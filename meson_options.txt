@@ -70,3 +70,10 @@ option('native_bash', type: 'feature', value: 'auto',
 # `enabled' rather than `auto'.
 option('native_zsh', type: 'feature', value: 'enabled',
        description: 'Compile zsh in as a native program (on by default; disable to leave zsh out)')
+
+# dash is the POSIX /bin/sh, not an interactive shell, and it is on by default
+# for the same reason zsh is: it is permissively licensed (BSD-3-Clause, with
+# the one GPL generator removed -- see README.md) so there is no licensing
+# reason to leave it out, and scripts want a small fast sh.
+option('native_dash', type: 'feature', value: 'enabled',
+       description: 'Compile dash in as a native program, reachable as dash and sh')
