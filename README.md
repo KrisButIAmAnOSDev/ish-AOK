@@ -235,6 +235,15 @@ build.
 
 ## Native bash and licensing
 
+> **Native bash is being removed in build 556.** bash is GPLv3 and an App Store
+> submission cannot contain it, so the shell that stays is zsh — which is
+> permissive, and whose native implementation is the more complete of the two
+> anyway. Native bash will not gain checkpoint support, and `/proc/ish/checkpoint`
+> refuses while it is on a task stack rather than waiting for a quiet point.
+> Login shells naming `/AOK/native/bash` are converted to the guest's own bash
+> automatically by `native-links.sh`, so nobody is locked out by the upgrade.
+> See [docs/shell_transition_plan.md](docs/shell_transition_plan.md).
+
 bash is compiled into the app as a native program. The win is interpretation,
 not forking: an arithmetic loop runs roughly 16x faster than under the emulated
 shell, while subshells and command substitutions land near parity, because a
@@ -283,6 +292,32 @@ them.
 
 Nothing else in the binary is third-party GPL: SmallCLUE is MIT, OpenSSH and
 libarchive are BSD, and liblzma is public domain.
+
+**dash is the one that needs a footnote, and it is deliberate rather than an
+oversight.** dash is BSD-3-Clause — except `src/mksignames.c`, which is GPL-2+,
+and whose *output* is linked into the binary. Debian's own copyright file flags
+exactly that:
+
+```
+Files: src/mksignames.c
+Comment: This file is not directly linked with dash.  However, its output is.
+License: GPL-2+
+```
+
+**iSH-AOK does not build that file.** It is a build-time generator whose entire
+output is a table of signal names and numbers, derivable from the platform's own
+`signal.h`; AOK generates the table itself and never compiles `mksignames.c`.
+Anyone tempted to restore it for convenience should read this paragraph first —
+it would put GPL-derived content back into the binary for a table that takes
+thirty lines to produce.
+
+**GPL-2+ is not a softer position than GPLv3 here**, which is worth stating
+because the instinct is to assume it is. Both App Store removals above were
+GPLv2, and the FSF's stated analysis applies to all GPL versions. The `+` means
+"or later" and gives the recipient a choice of versions; it does not soften the
+conflict with the store's Usage Rules.
+
+This is an engineering judgement about what to link, not legal advice.
 
 ## Native zsh
 

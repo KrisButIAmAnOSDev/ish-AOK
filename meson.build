@@ -112,6 +112,32 @@ summary({'native zsh': have_zsh ? 'yes -- permissive (zsh LICENCE), no GPL compi
                                 : 'no'},
         section: 'Licensing')
 
+# dash, and the one thing about it that has to be checked rather than trusted.
+#
+# dash is BSD-3-Clause except src/mksignames.c, which is GPL-2+ and whose
+# OUTPUT is linked -- Debian's own copyright file says so in as many words. The
+# vendored tree (deps/dash, emkey1/dash) has that file REMOVED and replaced by
+# src/aok_mksignames.c under dash's own licence.
+#
+# THE GUARD BELOW IS THE POINT. Removing a file from a fork is not durable on
+# its own: a merge from Debian restores it silently, the build picks it up
+# through the same HELPERS rule, and the binary quietly carries GPL-derived
+# content again with nothing in the log to say so. Configure fails instead.
+dash_dir = 'deps/dash'
+dash_present = fs_early.exists(dash_dir / 'src/aok_mksignames.c')
+if fs_early.exists(dash_dir / 'src/mksignames.c')
+    error('deps/dash/src/mksignames.c is present.\n' +
+          '  That file is GPL-2+ (it is bash\'s) and its generated output is\n' +
+          '  LINKED into the binary, which is exactly what iSH-AOK removed it to\n' +
+          '  avoid -- see README.md, "Native bash and licensing".\n' +
+          '  It has almost certainly come back through a merge from Debian.\n' +
+          '  Remove it again; src/aok_mksignames.c replaces it.')
+endif
+summary({'native dash': dash_present
+            ? 'tree present -- permissive (BSD-3-Clause), GPL generator removed'
+            : 'no'},
+        section: 'Licensing')
+
 # Resolved here (rather than next to the gadget source lists below) because
 # it also drives a project-wide define, and add_project_arguments must run
 # before any target is declared. The arm64-GUEST gadgets

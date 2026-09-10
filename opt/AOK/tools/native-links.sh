@@ -525,13 +525,99 @@ resolve_native_shell() {
         bash) NATIVE_SHELL=$NATIVE_BASH ;;
         zsh)  NATIVE_SHELL=$NATIVE_ZSH ;;
         /*)   NATIVE_SHELL=$SHELL_WANT ;;
-        "")   if [ -x "$NATIVE_BASH" ]; then NATIVE_SHELL=$NATIVE_BASH
-              else NATIVE_SHELL=$NATIVE_ZSH; fi ;;
+        # zsh first now, and deliberately. This used to prefer bash whenever it
+        # was present, which would keep handing new installs the shell that is
+        # being removed in 556. bash remains reachable with --shell bash for as
+        # long as it exists.
+        "")   if [ -x "$NATIVE_ZSH" ]; then NATIVE_SHELL=$NATIVE_ZSH
+              else NATIVE_SHELL=$NATIVE_BASH; fi ;;
         *)    echo "$0: --shell wants bash, zsh or an absolute path" >&2; exit 1 ;;
     esac
 }
 
+# ---- native bash is going away, and a login shell that does not exist locks
+# ---- the account out -------------------------------------------------------
+#
+# bash is GPLv3, so an App Store build cannot contain it; native bash is removed
+# in 556 (docs/shell_transition_plan.md). Anyone whose login shell is
+# /AOK/native/bash would find, on that upgrade, that their shell is simply gone
+# -- which is not a degraded session, it is no session.
+#
+# So any passwd entry naming a native bash is converted to the GUEST's own bash,
+# which is a different binary at a different path and is not going anywhere.
+#
+# BY PATH AND FOR EVERY ENTRY, not just uid 1000. set_uid1000_shell exists
+# because that is the account this script normally manages, but whoever set a
+# native shell could have set it for any account, and the one that locks out is
+# whichever one they log in as.
+guest_bash_path() {
+    for _c in /bin/bash /usr/bin/bash /usr/local/bin/bash; do
+        if [ -x "$_c" ]; then printf '%s' "$_c"; return 0; fi
+    done
+    # No guest bash installed. /bin/sh is the one shell that always exists and
+    # always runs, and a working shell the user did not choose beats a missing
+    # one they did.
+    printf '%s' /bin/sh
+}
+
+is_native_bash() {
+    # Both spellings: the path this script writes, and the linked one someone
+    # may have set by hand.
+    case "$1" in
+        "$NATIVE_BASH"|"$TARGET_DIR/bash") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+convert_native_bash_shells() {
+    _to=$(guest_bash_path)
+    _hits=0
+    _new=
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *:*:*:*:*:*:*)
+                oldifs=$IFS; IFS=:
+                # shellcheck disable=SC2086
+                set -f; set -- $line; set +f
+                IFS=$oldifs
+                if [ "$#" -ge 7 ] && is_native_bash "$7"; then
+                    if [ "$DRY_RUN" -eq 1 ]; then
+                        echo "  would convert $1's shell: $7 -> $_to"
+                    else
+                        echo "  converted $1's shell: $7 -> $_to"
+                    fi
+                    line="$1:$2:$3:$4:$5:$6:$_to"
+                    _hits=$((_hits + 1))
+                fi
+                ;;
+        esac
+        _new="$_new$line
+"
+    done < /etc/passwd
+
+    [ "$_hits" -gt 0 ] || return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -n "$_new" ] || { echo "$0: refusing to write an empty /etc/passwd" >&2; return 1; }
+    printf '%s' "$_new" > /etc/passwd.aok-new || return 1
+    # Same discipline as set_uid1000_shell: a line-count change means something
+    # went wrong, and a mangled passwd is the failure that locks everyone out.
+    n_old=0; while IFS= read -r _l; do n_old=$((n_old + 1)); done < /etc/passwd
+    n_new=0; while IFS= read -r _l; do n_new=$((n_new + 1)); done < /etc/passwd.aok-new
+    if [ "$n_old" != "$n_new" ]; then
+        echo "$0: /etc/passwd rewrite changed the line count ($n_old -> $n_new); not applying" >&2
+        rm -f /etc/passwd.aok-new
+        return 1
+    fi
+    cp /etc/passwd /etc/passwd.aok-bak 2>/dev/null || :
+    printf '%s' "$_new" > /etc/passwd || return 1
+    rm -f /etc/passwd.aok-new
+    return 0
+}
+
 apply_shell() {
+    # Before anything else this function does: an entry pointing at a native
+    # bash is a lockout waiting for the 556 upgrade, whatever else is asked for.
+    convert_native_bash_shells
     resolve_native_shell
     user=$(uid1000_field 1) || { echo "  no UID 1000 user; leaving shells alone"; return 0; }
     cur=$(uid1000_field 7)
