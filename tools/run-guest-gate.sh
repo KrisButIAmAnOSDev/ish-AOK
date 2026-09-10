@@ -104,6 +104,31 @@ leg_run() {
     echo $? > "$LOGDIR/$1.rc"
 }
 
+# A run of just the tests that need the emulator started a particular way.
+#
+# Eight tests used to skip in EVERY gate run, and all eight for the same reason:
+# the feature each covers is opt-in, and the gate started the emulator without
+# it. That is not a skip to tolerate -- it is the gate quietly declining to test
+# swap, compressed memory, the crypto and pixman accelerators, the memory guard
+# and cross-device rename, while reporting a clean sweep. A skip is an untested
+# claim wearing a pass's clothes.
+#
+# They cannot share one environment. swap_roundtrip needs a swap FILE and
+# zram_idle_reclaim needs there to be none, and both knobs are read once when
+# the emulator boots -- so a per-test env inside the runner could not work even
+# in principle. Each configuration is its own short run of only the tests it
+# makes runnable.
+# NOTE the variable names. POSIX sh functions have no locals, so `name=$1` here
+# would clobber the `name` its caller is still using -- which it did, turning
+# config-zram into config-config-zram and reading a log that does not exist.
+leg_run_config() {
+    _cfg_log=$1; _cfg_root=$2; _cfg_only=$3; shift 3
+    env "$@" "$ISH" -f "$_cfg_root" /bin/sh -c \
+        "/AOK/tests/setup-regressions.sh --run --only $_cfg_only 2>&1" \
+        > "$LOGDIR/$_cfg_log.log" 2>&1
+    echo $? > "$LOGDIR/$_cfg_log.rc"
+}
+
 # Score a finished leg from its log. Separated from leg_run so it is identical
 # whether the leg ran alone or alongside four others.
 leg_report() {
@@ -115,7 +140,11 @@ leg_report() {
     p=$(grep -cE '^[a-z0-9_]+: PASS$' "$log")
     f=$(grep -cE '^[a-z0-9_]+: FAIL' "$log")
     s=$(grep -cE ': SKIP' "$log")
-    if [ "$p" -eq 0 ] && [ "$f" -eq 0 ]; then
+    # A leg with no passes AND no failures never really ran -- but only if it
+    # had no SKIPS either. A pass whose one test skipped did run; calling that
+    # a build failure both misnames it and counts one problem twice, since the
+    # no-skips check below already reports it.
+    if [ "$p" -eq 0 ] && [ "$f" -eq 0 ] && [ "$s" -eq 0 ]; then
         echo "  $name: NOTHING RAN (rc=$rc) -- almost certainly a build failure:"
         grep -E 'error:' "$log" | head -3
         f=1
@@ -234,6 +263,52 @@ run_leg devuan-amd64 "$REPO/build/devuan-amd64-test"
 
 fi
 
+# ---- configuration passes ---------------------------------------------------
+#
+# Run on one root only: every feature here is kernel-level and architecture
+# independent, so a second architecture would re-run the same code paths for no
+# extra coverage and a lot of extra minutes. The glibc root is the one chosen,
+# for the same reason the unprivileged leg uses it.
+#
+# The memory budget is pinned rather than inherited. On a Mac the CLI's budget
+# is whatever the host has, which makes "is the guard engaged" and "is there
+# room to go cold" depend on what else is running; the compression tests need a
+# known headroom to sit in, and mem_guard_small_growth needs the guard armed at
+# all.
+config_root=$REPO/build/devuan-arm64-test
+[ -d "$config_root" ] || config_root=$REPO/build/alpine-arm64-test
+config_mnt2=$REPO/build/alpine-i386-test
+
+run_config() {
+    _rc_name=$1; _rc_only=$2; shift 2
+    printf '########## config: %s ##########\n' "$_rc_name"
+    leg_run_config "config-$_rc_name" "$config_root" "$_rc_only" "$@"
+    leg_report "config-$_rc_name"
+}
+
+if [ -d "$config_root" ] && { [ -z "$ONLY" ] || [ "$ONLY" = config ]; }; then
+    # zram: a pool and NO file, so nothing can reach flash.
+    run_config zram zswap_roundtrip,zswap_fork_cow,zram_idle_reclaim \
+        ISH_GUEST_SWAP_MB=0 ISH_GUEST_ZSWAP_MB=128 \
+        ISH_GUEST_MEM_BUDGET_MB=1200 ISH_GUEST_MEM_HEADROOM_MB=100
+    # zswap: the compressed tier in front of a real swap file.
+    run_config zswap swap_roundtrip,zswap_roundtrip,zswap_fork_cow \
+        ISH_GUEST_SWAP_MB=256 ISH_GUEST_ZSWAP_MB=128 \
+        ISH_GUEST_MEM_BUDGET_MB=1200 ISH_GUEST_MEM_HEADROOM_MB=100
+    # The growth guard only exists when there is a budget to be near the end of.
+    run_config memguard mem_guard_small_growth \
+        ISH_GUEST_MEM_BUDGET_MB=512 ISH_GUEST_MEM_HEADROOM_MB=256
+    # A genuine second fakefs mount, so rename across devices is really across.
+    if [ -d "$config_mnt2" ]; then
+        run_config crossdev mount_cross_dev ISH_FAKE_MNT2="$config_mnt2"
+    else
+        echo "  config-crossdev: NOT RUN (no second root at $config_mnt2)"
+        fail_total=$((fail_total + 1))
+    fi
+    run_config crypto aes_gcm_accel ISH_CRYPTO_ACCEL=1
+    run_config pixman pixman_accel ISH_PIX_ACCEL=1
+fi
+
 # The unprivileged leg, on the glibc root: it is the one whose /tmp and user
 # tooling match a real device session, which is where this class was found.
 if [ "$UNPRIV" -eq 1 ] && [ -z "$ONLY" ]; then
@@ -292,6 +367,69 @@ if [ "$RUN_E2E" -eq 1 ] && [ -z "$ONLY" ]; then
         fail_total=$((fail_total + 1))
     fi
     legs_run=$((legs_run + 1))
+fi
+
+# ---- no test may end the run un-run -----------------------------------------
+#
+# A skip is an untested claim wearing a pass's clothes, so the gate counts one
+# as a failure.
+#
+# THE RULE IS NOT "PASSED SOMEWHERE", and the first version was, which is worth
+# recording because it looked right and had a hole. Judged that way, bcd_adjust
+# slipped through: it skipped on both amd64 legs with "BCD adjusts are invalid
+# in 64-bit mode" and passed on i386, so "passed somewhere" was satisfied while
+# the test had never run on amd64 at all. Coverage on one architecture is not
+# coverage on another.
+#
+# So a skip in an ARCHITECTURE leg is excused only by a pass in a CONFIGURATION
+# pass -- those exist precisely to enable a feature the base run leaves off, and
+# they run the same code on the same guest. A skip excused by a different
+# architecture is not excused.
+#
+# The unprivileged and device legs are deliberately reduced environments whose
+# whole point is that some tests cannot run, so their skips are not counted
+# here; the arch legs already cover those tests with privilege.
+#
+# The remedy for a name appearing below is one of two, never a third: give it an
+# environment in the configuration passes, or take it off the list for the
+# architecture where it cannot run. A test that must not run is not a test.
+if [ -z "$ONLY" ] || [ "$ONLY" = config ]; then
+    : > "$LOGDIR/.skipped"
+    for name in $LEG_NAMES; do
+        [ -f "$LOGDIR/$name.log" ] || continue
+        grep -hoE '^[a-z0-9_]+: SKIP' "$LOGDIR/$name.log" | cut -d: -f1 >> "$LOGDIR/.skipped"
+    done
+    sort -u -o "$LOGDIR/.skipped" "$LOGDIR/.skipped"
+    : > "$LOGDIR/.covered"
+    for log in "$LOGDIR"/config-*.log; do
+        [ -f "$log" ] || continue
+        grep -hoE '^[a-z0-9_]+: PASS' "$log" | cut -d: -f1 >> "$LOGDIR/.covered"
+    done
+    sort -u -o "$LOGDIR/.covered" "$LOGDIR/.covered"
+    never_ran=$(comm -23 "$LOGDIR/.skipped" "$LOGDIR/.covered")
+    if [ -n "$never_ran" ]; then
+        echo
+        echo "TESTS THAT NEVER RAN -- a skip is not a pass:"
+        for t in $never_ran; do
+            echo "  $t"
+            grep -hoE "^$t: SKIP.*" "$LOGDIR"/*.log | head -1 | sed 's/^/      /'
+            fail_total=$((fail_total + 1))
+        done
+        echo "  Either give it an environment in the configuration passes, or"
+        echo "  drop it from the list for the arch where it cannot run --"
+        echo "  a test that must not run is not a test."
+    fi
+fi
+
+if [ -n "$ONLY" ] && [ "$ONLY" != config ]; then
+    # Say so rather than let a partial run read as a clean one. The
+    # configuration passes do not run under --only <leg>, so the tests they
+    # exist to enable would all be skipping, and failing the run for that would
+    # punish the user for asking a narrower question.
+    echo
+    echo "note: --only $ONLY, so the configuration passes did not run and the"
+    echo "      \"no test may be skipped\" check was not applied. Run the full"
+    echo "      gate before believing a clean result."
 fi
 
 echo
