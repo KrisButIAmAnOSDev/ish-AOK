@@ -40,6 +40,19 @@ int checkpoint_restore(const char *host_path);
 // booting. A checkpoint is a copy and the guest carries on; a suspend is a
 // departure.
 int checkpoint_request(const char *host_path, bool and_halt);
+
+// Take a checkpoint from a thread that is NOT a guest task -- the app's
+// backgrounding path, which runs on the UI thread and has to know the image is
+// on disk before iOS freezes it.
+//
+// Synchronous, unlike checkpoint_request: there is nothing to defer to,
+// because the caller is not a task that will come back round a loop, and
+// nothing useful to return to if the save has not happened. Every guest task
+// is frozen, including the ones the deferred path would have left running.
+//
+// Returns 0, or a guest _E* code with /proc/ish/checkpoint's last_refusal
+// naming the cause.
+int checkpoint_save_external(const char *host_path);
 void checkpoint_run_pending(void);
 
 // The session file the entry point was given, if any: restored at startup and

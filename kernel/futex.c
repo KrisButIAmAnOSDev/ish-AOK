@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include <pthread.h>
 #include "futex.h"
 #include "kernel/time.h"
@@ -243,6 +244,11 @@ static int futex_load(guest_addr_t addr, dword_t *out) {
 static bool futex_wait_has_pending_signal(void) {
     if (current == NULL)
         return false;
+    // A CHECKPOINT FREEZE too: not a signal, and this function exists to
+    // ignore bare pokes, so it has to be asked about on its own. See the same
+    // addition in fs/poll.c and kernel/exit.c.
+    if (checkpoint_freeze_pending())
+        return true;
     // Consume any interrupt marker left by a host-side SIGUSR1 poke (mem
     // quiesce while a sibling thread mmaps a stack, for example). A poke is
     // not a guest signal — Linux never returns EINTR from futex without a

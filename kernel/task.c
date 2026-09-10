@@ -474,6 +474,17 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
         task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
         task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
     }
+    // Every task's poke flag is its OWN, from the moment it exists.
+    //
+    // poked_ptr points into its own cpu_state (&cpu->_poked), and each engine's
+    // entry sets it -- but `*task = *parent` above copies the parent's whole
+    // cpu_state, POINTER INCLUDED, so until the child first entered the
+    // emulator its "stop executing" flag was its parent's. A task whose image
+    // is a native program never enters the emulator at all, so its flag stayed
+    // NULL and poking it dereferenced NULL: an app that vanished rather than a
+    // guest that reported anything.
+    task->cpu.poked_ptr = &task->cpu._poked;
+    task->cpu._poked = false;
     task->cpu_time_banked = false; // per-task, not inherited via the parent copy
     task->host_thread_started = false; // ditto; task_start sets it
     task->exit_rusage_counted = false; // ditto; do_exit sets it

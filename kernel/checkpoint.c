@@ -90,10 +90,12 @@
 // Generous on purpose. Every wait in the guest is broken by the poke, so a
 // task normally parks in microseconds; the cases that take longer are a task
 // inside a host syscall that the SIGUSR1 has to interrupt, and one running a
-// long stretch of guest code between checkpoints. Two seconds is long enough
-// that neither is a flake and short enough that a genuinely stuck task is
-// reported rather than waited for.
-#define CKPT_FREEZE_TIMEOUT_MS 2000
+// long stretch of guest code between checkpoints. Five seconds is long enough
+// that neither is a flake on a busy machine -- two was not, and the
+// first thing it failed under was this project's own test suite running
+// beside it -- and short enough that a genuinely stuck task is reported
+// rather than waited for.
+#define CKPT_FREEZE_TIMEOUT_MS 5000
 
 // Kinds of descriptor this version knows how to bring back. Anything else is a
 // refusal naming the fd number and the filesystem it came from, because "the
@@ -320,7 +322,26 @@ void checkpoint_park_if_frozen(void) {
     pthread_mutex_unlock(&ckpt_park_lock);
 }
 
+// Set while this thread is inside a program's ckpt_dump.
+//
+// The dump is the program describing itself, and describing itself means
+// making syscalls -- zsh's emitters write to a descriptor. Every syscall a
+// native program makes goes through native_checkpoint(), which comes straight
+// back here, which would call the dump again: the guard below is what stops
+// that from being an infinite recursion off the end of the thread's stack,
+// which took the whole app down rather than the shell.
+//
+// __thread rather than a task field, because it is a property of THIS call
+// stack and nothing else can see it.
+static __thread bool ckpt_dumping;
+
 void checkpoint_native_park(void) {
+    // Already describing itself: neither dump again nor park. Parking here
+    // would stop the program halfway through producing the very state the
+    // freeze is waiting for.
+    if (ckpt_dumping)
+        return;
+
     if (atomic_load_explicit(&ckpt_freeze_active, memory_order_relaxed) == 0)
         return;
     if (current == NULL ||
@@ -338,8 +359,14 @@ void checkpoint_native_park(void) {
     // freeze that was allowed to start, not a silent loss.
     const struct native_program *prog = native_program_running(current);
     if (prog != NULL && prog->ckpt_dump != NULL &&
-            current->ckpt_native_state == NULL)
+            current->ckpt_native_state == NULL) {
+        ckpt_dumping = true;
         current->ckpt_native_state = prog->ckpt_dump();
+        ckpt_dumping = false;
+        CKPT_TRACE("native park: pid %d described itself in %zu bytes\n",
+                   current->pid, current->ckpt_native_state != NULL
+                   ? strlen(current->ckpt_native_state) : 0);
+    }
 
     checkpoint_park_if_frozen();
 }
@@ -461,6 +488,11 @@ static int ckpt_check_scope(void) {
         return _EAGAIN;
     }
     int err = 0;
+    if (snap.count == 0) {
+        task_snapshot_release(&snap);
+        ckpt_refuse("there is no guest running");
+        return _ESRCH;
+    }
     for (unsigned i = 0; i < snap.count; i++) {
         struct task *t = snap.tasks[i];
         // A native program is a C function on a HOST thread -- there is no
@@ -1043,6 +1075,12 @@ static void ckpt_order_tasks(struct task **tasks, unsigned count) {
     }
 }
 
+// The externally-triggered form. Same body; the difference is only that there
+// is no `current` to leave running, so every task is frozen.
+int checkpoint_save_external(const char *host_path) {
+    return checkpoint_save(host_path);
+}
+
 int checkpoint_save(const char *host_path) {
     int err = ckpt_check_scope();
     if (err < 0)
@@ -1089,7 +1127,9 @@ int checkpoint_save(const char *host_path) {
 
     struct ckpt_header h = {
         .version = CKPT_VERSION,
-        .abi = (uint32_t) current->abi,
+        // The first task's, not `current`'s: an external caller (the app's
+        // backgrounding path) is not a guest task at all.
+        .abi = (uint32_t) snap.tasks[0]->abi,
         .cpu_state_size = (uint32_t) sizeof(struct cpu_state),
         .page_size = PAGE_SIZE,
         .build_fingerprint = ckpt_fingerprint(),
@@ -1911,8 +1951,11 @@ void checkpoint_run_pending(void) {
     // place a native program comes back through.
     const struct native_program *self = native_program_running(current);
     if (self != NULL && self->ckpt_dump != NULL &&
-            current->ckpt_native_state == NULL)
+            current->ckpt_native_state == NULL) {
+        ckpt_dumping = true;
         current->ckpt_native_state = self->ckpt_dump();
+        ckpt_dumping = false;
+    }
 
     int err = checkpoint_save(path);
     if (err < 0) {

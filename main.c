@@ -16,6 +16,7 @@
 #include "kernel/fs.h"
 #include "kernel/task.h"
 #include "kernel/swap.h"
+#include "kernel/checkpoint.h"
 #include "xX_main_Xx.h"
 #include "platform/platform.h"
 
@@ -136,6 +137,32 @@ static char *build_initial_envp(void) {
 // are still held — _exit avoids atexit handlers that might re-enter those locks,
 // and lets the OS reclaim every lingering guest pthread cleanly instead of the
 // pthread_kill(SIGKILL) sweep that would otherwise kill us with signal 9.
+// See ISH_CHECKPOINT_AFTER below. A host thread, deliberately: the point is to
+// exercise the path the app uses, which is not a guest task either.
+double cli_checkpoint_delay;
+const char *cli_checkpoint_path;
+static void *cli_checkpoint_after(void *unused) {
+    (void) unused;
+    while (cli_checkpoint_path == NULL)
+        usleep(1000);
+    usleep((useconds_t) (cli_checkpoint_delay * 1000000));
+    int err = checkpoint_save_external(cli_checkpoint_path);
+    // To a file beside the image, not to stderr: by the time this runs the
+    // guest may have closed the host's standard streams on its way out, and a
+    // diagnostic that vanishes is worse than none.
+    char log[PATH_MAX];
+    snprintf(log, sizeof(log), "%s.log", cli_checkpoint_path);
+    FILE *lf = fopen(log, "w");
+    if (lf != NULL) {
+        struct checkpoint_status ck;
+        checkpoint_get_status(&ck);
+        fprintf(lf, "%s (%d) %s\n", err == 0 ? "written" : "refused", err,
+                ck.last_refusal);
+        fclose(lf);
+    }
+    return NULL;
+}
+
 static noreturn void cli_halt(int status) {
     if (getenv("ISH_QUIESCE_STATS") != NULL) {
         extern void quiesce_stats_dump(const char *tag);
@@ -412,6 +439,33 @@ int main(int argc, char *const argv[]) {
         if (pa != NULL && strcmp(pa, "0") != 0 && strcasecmp(pa, "false") != 0 &&
                 strcasecmp(pa, "no") != 0 && strcasecmp(pa, "off") != 0)
             doEnablePixAccel = true;
+    }
+    // ISH_CHECKPOINT_AFTER=<seconds>:<path> -- take a checkpoint from a thread
+    // that is NOT a guest task, after the guest has been running a while.
+    //
+    // This is the APP's path, exercised where it can be tested: the app
+    // backgrounds on its UI thread and has to know the image is on disk before
+    // iOS freezes it, which is a different entry point from the guest writing
+    // to /proc/ish/checkpoint. Without this the only way to reach
+    // checkpoint_save_external would be to run the app.
+    {
+        const char *spec = getenv("ISH_CHECKPOINT_AFTER");
+        if (spec != NULL && *spec != '\0') {
+            static char at[PATH_MAX];
+            static double delay;
+            const char *colon = strchr(spec, ':');
+            if (colon != NULL) {
+                delay = atof(spec);
+                snprintf(at, sizeof(at), "%s", colon + 1);
+                pthread_t th;
+                pthread_create(&th, NULL, cli_checkpoint_after, NULL);
+                pthread_detach(th);
+                extern double cli_checkpoint_delay;
+                extern const char *cli_checkpoint_path;
+                cli_checkpoint_delay = delay;
+                cli_checkpoint_path = at;
+            }
+        }
     }
     halt_hook = cli_halt;
     // hle_stats_dump runs from cli_halt, after guest teardown has closed the

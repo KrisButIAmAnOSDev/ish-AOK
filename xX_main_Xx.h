@@ -8,6 +8,7 @@
 #include "fs/real.h"
 #include "fs/sock.h"
 #include "kernel/swap.h"
+#include <stdatomic.h>
 #include "kernel/checkpoint.h"
 #ifdef __APPLE__
 #include <sys/resource.h>
@@ -83,6 +84,14 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
 
     become_first_process();
     current->thread = pthread_self();
+    // And say so. init does not go through task_start -- the thread that will
+    // run it is the one already running -- so the flag task_start sets stayed
+    // false for the one task that is always there. Anything keying off it read
+    // init as "no host thread yet": kernel/resource.c skipped its CPU time,
+    // and kernel/checkpoint.c's freezer would not poke it, so a checkpoint
+    // taken from outside the guest timed out on pid 1 every time.
+    atomic_store_explicit(&current->host_thread_started, true,
+                          memory_order_release);
     // Simulated swap, if and only if the user asked for it. Off by default, so
     // on every ordinary launch this reads one environment variable, finds
     // nothing, and returns -- no file, no allocation, no thread. Here rather
@@ -126,6 +135,12 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
             restore_path = session;
     }
     if (restore_path != NULL && restore_path[0] != '\0') {
+        // BEFORE the restore, not after it: a restored process can have a
+        // terminal open, and re-opening one goes through tty_device_open,
+        // which asserts on a major with no driver registered. The ordinary
+        // boot path registers it after do_execve because nothing before that
+        // point opens a tty; a restore opens several.
+        tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
         int rerr = checkpoint_restore(restore_path);
         if (rerr < 0) {
             fprintf(stderr, "ISH_RESTORE %s: %d\n", restore_path, rerr);

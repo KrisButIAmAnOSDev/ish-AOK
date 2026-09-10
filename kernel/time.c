@@ -8,6 +8,7 @@
 #include <sys/time.h>
 #include <string.h>
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/errno.h"
 #include "kernel/resource.h"
 #include "kernel/time.h"
@@ -340,7 +341,18 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
         // delivered while we were between slices, and on the first pass it may
         // predate the sleep entirely.
         struct timespec left = timespec_subtract(deadline, timespec_now(CLOCK_MONOTONIC));
-        if (task_wake_signal_pending()) {
+        // A CHECKPOINT FREEZE breaks the sleep as well as a signal does, and
+        // it has to be asked about separately: a freeze is not a signal, and
+        // this loop is the one blocking path in the kernel that does not go
+        // through wait_for (which consumes wait_interrupted for it).
+        //
+        // Without this a sleeping task never reached a syscall boundary and
+        // the freeze timed out on it -- `sleep 6` was enough. It hid behind
+        // timing for a while: a checkpoint taken the instant after `sleep &`
+        // catches the process still doing its dynamic loading, at a syscall
+        // boundary every few microseconds, and only one taken a second later
+        // finds it actually asleep.
+        if (task_wake_signal_pending() || checkpoint_freeze_pending()) {
             if (timespec_positive(left))
                 *rem = left;
             errno = EINTR;

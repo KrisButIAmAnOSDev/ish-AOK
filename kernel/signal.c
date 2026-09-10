@@ -681,13 +681,27 @@ static bool signal_wake_task(struct task *task, struct sighand *sighand, int sig
 void task_wake_for_freeze(struct task *task) {
     if (task == NULL || task == current)
         return;
+    // A task with no live host thread must not be poked. pthread_kill on a
+    // pthread_t whose thread has exited is UNDEFINED, not a no-op -- and a
+    // freezer walks a snapshot, which holds the struct task alive but says
+    // nothing about the thread behind it. A `sleep` that finished between the
+    // snapshot and the wake took the whole app down here, silently and
+    // instantly, which read as "the wake never returned".
+    //
+    // host_thread_started is the flag task_start sets once the thread really
+    // exists; zombie and exiting cover the other end of its life.
+    if (!atomic_load_explicit(&task->host_thread_started, memory_order_acquire) ||
+            task->zombie || task->exiting ||
+            atomic_load_explicit(&task->exit_finished, memory_order_acquire))
+        return;
     __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
-    if (task->thread != 0)
-        pthread_kill(task->thread, SIGUSR1);
+    pthread_kill(task->thread, SIGUSR1);
     cpu_poke(&task->cpu);
-    lock(&task->sighand->wake_lock, 0);
-    wake_waiting_task(task);
-    unlock(&task->sighand->wake_lock);
+    if (task->sighand != NULL) {
+        lock(&task->sighand->wake_lock, 0);
+        wake_waiting_task(task);
+        unlock(&task->sighand->wake_lock);
+    }
 }
 
 static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {

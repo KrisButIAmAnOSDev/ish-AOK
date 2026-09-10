@@ -3532,5 +3532,17 @@ void jit_cleanup_jetsam_after_interrupt(struct cpu_state *cpu) {
 }
 
 void cpu_poke(struct cpu_state *cpu) {
-    __atomic_store_n(cpu->poked_ptr, true, __ATOMIC_SEQ_CST);
+    // A task that has never entered the emulator has no poke flag: poked_ptr
+    // is set by each engine's entry, and a task whose image is a NATIVE
+    // program never reaches one. Poking it dereferenced NULL and took the
+    // whole app down with a SIGSEGV -- which read as "the guest exited",
+    // because from outside that is exactly what it looks like.
+    //
+    // task_create_ now points every task's flag at its own field, so this
+    // should not be reachable; it stays because the cost is a branch and the
+    // failure it prevents is the app disappearing.
+    bool *poked = cpu->poked_ptr;
+    if (poked == NULL)
+        return;   // nothing is executing guest code to interrupt
+    __atomic_store_n(poked, true, __ATOMIC_SEQ_CST);
 }

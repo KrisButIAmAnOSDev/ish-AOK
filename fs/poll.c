@@ -1,3 +1,4 @@
+#include "kernel/checkpoint.h"
 #include "kernel/task.h"
 #include "kernel/signal.h"
 #include <sys/stat.h>
@@ -762,7 +763,15 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         bool needs_periodic_host_rescan = poll_needs_periodic_host_rescan(poll_);
 
         lock(&current->sighand->lock,0);
-        bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
+        // A CHECKPOINT FREEZE ends the wait as a signal does. It is not a
+        // signal, so it has to be asked about separately -- these three tests
+        // exist to IGNORE bare pokes (a TLB shootdown), which is right for
+        // those and wrong for a freeze: the freeze needs the syscall to return
+        // so the dispatcher can rewind over it and the task can park. The
+        // EINTR never reaches the guest; syscall_result_should_restart turns
+        // it into a restart while the freeze is on.
+        bool signal_pending = checkpoint_freeze_pending() ||
+            !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
         unlock(&current->sighand->lock);
         if (signal_pending) {
             // ERESTARTNOHAND: a running handler still gives the guest its
@@ -795,7 +804,15 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 err = -1;
             } else {
                 lock(&current->sighand->lock, 0);
-                bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
+                // A CHECKPOINT FREEZE ends the wait as a signal does. It is not a
+        // signal, so it has to be asked about separately -- these three tests
+        // exist to IGNORE bare pokes (a TLB shootdown), which is right for
+        // those and wrong for a freeze: the freeze needs the syscall to return
+        // so the dispatcher can rewind over it and the task can park. The
+        // EINTR never reaches the guest; syscall_result_should_restart turns
+        // it into a restart while the freeze is on.
+        bool signal_pending = checkpoint_freeze_pending() ||
+            !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
                 unlock(&current->sighand->lock);
                 if (signal_pending) {
                     sigunwind_end();
@@ -916,7 +933,15 @@ poll_wait_done:
             // invalidation) can land here without any guest signal pending.
             // Only treat this as EINTR if a real guest signal is waiting.
             lock(&current->sighand->lock, 0);
-            bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
+            // A CHECKPOINT FREEZE ends the wait as a signal does. It is not a
+        // signal, so it has to be asked about separately -- these three tests
+        // exist to IGNORE bare pokes (a TLB shootdown), which is right for
+        // those and wrong for a freeze: the freeze needs the syscall to return
+        // so the dispatcher can rewind over it and the task can park. The
+        // EINTR never reaches the guest; syscall_result_should_restart turns
+        // it into a restart while the freeze is on.
+        bool signal_pending = checkpoint_freeze_pending() ||
+            !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
             unlock(&current->sighand->lock);
             if (!signal_pending)
                 continue;

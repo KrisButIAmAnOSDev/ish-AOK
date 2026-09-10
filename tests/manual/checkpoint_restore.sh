@@ -235,6 +235,39 @@ case $nat_back in
        echo "  got: $nat_back"; exit 1;;
 esac
 
+# ---- taken from OUTSIDE the guest ------------------------------------------
+#
+# The app's path. Backgrounding happens on the UI thread, which is not a guest
+# task and has nothing to defer to -- so the checkpoint is synchronous and
+# every task is frozen, including the ones the guest-triggered path leaves
+# running. ISH_CHECKPOINT_AFTER exercises it from the CLI, where it can be
+# tested at all.
+#
+# Both shapes, because they froze differently: an emulated guest asleep in
+# nanosleep, and a NATIVE shell waiting on a child.
+for shell in $SH /AOK/native/zsh; do
+    rm -f "$IMG" "$IMG.log"
+    ext_out=$(ISH_CHECKPOINT_AFTER=1.5:"$IMG" "$ISH" -f "$ROOT" $shell -c '
+echo running
+/bin/sleep 5
+echo finished' 2>&1)
+    echo "$ext_out" | while IFS= read -r l; do echo "  outside | $shell: $l"; done
+    log=$(cat "$IMG.log" 2>/dev/null)
+    case $log in
+        written*) ;;
+        *) echo "FAIL: external checkpoint of $shell: $log"; exit 1;;
+    esac
+    # The guest must be UNHARMED: a checkpoint is a copy, and one that stops
+    # the thing it is copying is a crash with extra steps.
+    case $ext_out in
+        *finished*) ;;
+        *) echo "FAIL: $shell did not survive being checkpointed"; exit 1;;
+    esac
+    [ -s "$IMG" ] || { echo "FAIL: external checkpoint wrote no image"; exit 1; }
+    echo "  outside | image $(wc -c < "$IMG") bytes, guest unharmed"
+done
+rm -f "$IMG.log"
+
 # ---- and the refusals ------------------------------------------------------
 #
 # A capability boundary that never fires is not a boundary, it is a comment.

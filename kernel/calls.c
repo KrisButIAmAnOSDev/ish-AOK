@@ -2231,7 +2231,16 @@ static bool syscall_result_is_errno(dword_t result) {
     return signed_result < 0 && signed_result >= -4095;
 }
 
-static bool syscall_result_should_restart(dword_t result) {
+// Takes a POINTER because the freeze case has to rewrite what the caller hands
+// on. `_EINTR` is what the wait actually returned; `_ERESTART` is what has to
+// reach the dispatcher, because a NATIVE caller has no program counter to
+// rewind and re-issues the call from the value alone
+// (kernel/native_syscall.c). Handing it the unconverted EINTR meant a native
+// shell blocked in wait() saw its command interrupted by the checkpoint rather
+// than resumed after it -- and the shell then exited, taking the guest with
+// it, before the image was finished.
+static bool syscall_result_should_restart(dword_t *resultp) {
+    dword_t result = *resultp;
     sdword_t r = (sdword_t) result;
     // A CHECKPOINT FREEZE restarts everything, including the calls signal(7)
     // never restarts.
@@ -2253,6 +2262,7 @@ static bool syscall_result_should_restart(dword_t result) {
     if (r == _EINTR && checkpoint_freeze_pending()) {
         if (current != NULL)
             current->restart_nohand_pending = false;
+        *resultp = (dword_t) _ERESTART;
         return true;
     }
     if (r != _ERESTART && r != _ERESTART_NOHAND) {
@@ -2915,7 +2925,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     default:
         return false; // not handled here: fall through to the legacy-marshalled table
     }
-    if (syscall_result_should_restart(result)) {
+    if (syscall_result_should_restart(&result)) {
         // A native caller has no PC to rewind: it gets the restart code back
         // and re-issues the call itself (kernel/native_syscall.c).
         if (native_syscall_active) {
@@ -2966,7 +2976,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     case 0:
     {
         dword_t result = sys_read_guest((fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3019,7 +3029,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_poll_guest(
                     raw_args[0], (dword_t) raw_args[1], (int_t) raw_args[2]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3079,7 +3089,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_select_amd64_guest(
                     (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3355,7 +3365,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_futex_amd64_guest(
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3],
                 raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3445,7 +3455,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_epoll_wait_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3528,7 +3538,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_pselect_amd64_guest(
                     (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3538,7 +3548,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_ppoll_amd64_guest(
                     raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3565,7 +3575,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_epoll_pwait_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3],
                     raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3740,7 +3750,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_wait4_guest(
                 (pid_t_) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, 61, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3764,7 +3774,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_futex_time64_guest(
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3],
                 raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3853,7 +3863,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_epoll_pwait2_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4],
                     (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -5145,7 +5155,7 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     amd64_enomem_syscall_trace(syscall_num, raw_args, trace_result);
     amd64_tracked_proc_trace_exit(syscall_num, raw_args, trace_result);
     amd64_tty2_shell_syscall_trace_exit(syscall_num, trace_result);
-    if (syscall_result_should_restart(result)) {
+    if (syscall_result_should_restart(&result)) {
         if (current->ptrace.traced && current->ptrace.stop_at_syscall) {
             dispatch->syscall_result(cpu, result);
             if (current->ptrace.syscall_stopped)

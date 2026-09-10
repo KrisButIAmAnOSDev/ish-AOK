@@ -3,6 +3,7 @@
 #include <string.h>
 #include "emu/cpu.h"
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/resource.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
@@ -1000,6 +1001,19 @@ static bool wait_interrupted_by_signal(void) {
     if (current == NULL)
         return false;
     __atomic_exchange_n(&current->wait_interrupted, false, __ATOMIC_ACQ_REL);
+    // A CHECKPOINT FREEZE ends this wait too, and it is not a signal -- so it
+    // has to be asked about here rather than found among the pending ones.
+    // This function exists to IGNORE bare pokes, which is exactly right for a
+    // TLB shootdown and exactly wrong for a freeze: the freeze needs the
+    // syscall to return so the dispatcher can rewind the program counter over
+    // it and the task can park. Without this a shell blocked in wait() never
+    // reached a boundary and froze nothing.
+    //
+    // The EINTR it produces never reaches the guest: syscall_result_should_
+    // restart turns it into a restart while the freeze is on, so the wait
+    // re-enters on the far side of the checkpoint.
+    if (checkpoint_freeze_pending())
+        return true;
     lock(&current->sighand->lock, 0);
     // See kernel/signal.h: a shim-held signal must end this wait too.
     bool pending = !!((current->pending | current->sighand->pending) &
