@@ -89,6 +89,17 @@ extern NSString *const kThemeBackgroundColor;
 // Read once per launch. Changing either takes effect at the next launch; a
 // running pager is deliberately not resizable in place.
 @property BOOL shouldEnableSwap;
+
+// Suspend to disk (kernel/checkpoint.c). When the app is backgrounded it
+// writes the whole guest -- every process, its memory, its descriptors, and
+// whatever a native shell says about itself -- to one file, and the next
+// launch resumes from it instead of booting.
+//
+// OFF by default, on the same reasoning swap is: it spends the user's storage
+// and, if a session cannot be described, it can lose one. A checkpoint that
+// refuses says so in /proc/ish/checkpoint and the app boots normally, so the
+// worst case is the behaviour you get with this off.
+@property BOOL shouldSuspendToDisk;
 // 0 means "the user has not chosen a size", which is the registered default
 // and keeps swap off. Clamped to 0...ISHSwapMaxSizeMB on the way in AND on the
 // way out: the iOS Settings pane (app/Settings.bundle/Root.plist) writes this

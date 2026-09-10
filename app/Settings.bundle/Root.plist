@@ -78,6 +78,26 @@ The sizes offered here do not know how much room this device actually has. If th
 		</dict>
 		<dict>
 			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+			<key>Title</key>
+			<string>Suspend to Disk</string>
+			<key>FooterText</key>
+			<string>Save the whole session when iSH-AOK goes to the background, and bring it back on the next launch. iOS ends this app routinely -- memory pressure, or a swipe away -- and without this that always loses the session.
+
+Off by default, because it spends storage and is not free of limits. A session running something iSH-AOK cannot describe is not saved: it says so, and the next launch starts normally. "cat /proc/ish/checkpoint" in the guest reports what the last attempt did and, if it refused, why.</string>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+			<key>Title</key>
+			<string>Suspend to Disk</string>
+			<key>Key</key>
+			<string>Suspend To Disk</string>
+			<key>DefaultValue</key>
+			<false/>
+		</dict>
+		<dict>
+			<key>Type</key>
 			<string>PSMultiValueSpecifier</string>
 			<key>Title</key>
 			<string>Swap Size</string>

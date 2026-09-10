@@ -33,6 +33,7 @@ static NSString *const kPreferenceEnableCryptoAccelKey = @"Enable Crypto Accel";
 static NSString *const kPreferenceEnablePixAccelKey = @"Enable Pixman Accel";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
 static NSString *const kPreferenceEnableSwapKey = @"Enable Swap";
+static NSString *const kPreferenceSuspendToDiskKey = @"Suspend To Disk";
 static NSString *const kPreferenceSwapSizeMBKey = @"Swap Size MB";
 static NSString *const kPreferenceEnableCompressedMemoryKey = @"Enable Compressed Memory";
 static NSString *const kPreferenceCompressedMemorySizeMBKey = @"Compressed Memory Size MB";
@@ -242,6 +243,7 @@ void amd64_jit_preference_set(bool enabled) {
             // /proc/ish/defaults and in the iOS Settings pane with an honest
             // value instead of an empty one.
             kPreferenceEnableSwapKey: @(NO),
+            kPreferenceSuspendToDiskKey: @(NO),
             kPreferenceSwapSizeMBKey: @(0),
             kPreferenceEnableCompressedMemoryKey: @(NO),
             // 128 MB, not 0. Swap's size registers as 0 ("no size chosen")
@@ -384,6 +386,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceEnablePixAccelKey: property(shouldEnablePixAccel),
 	        kPreferenceEnableExtraLockingKey: property(shouldEnableExtraLocking),
             kPreferenceEnableSwapKey: property(shouldEnableSwap),
+            kPreferenceSuspendToDiskKey: property(shouldSuspendToDisk),
             kPreferenceSwapSizeMBKey: property(swapSizeMB),
             kPreferenceEnableCompressedMemoryKey: property(shouldEnableCompressedMemory),
             kPreferenceCompressedMemorySizeMBKey: property(compressedMemorySizeMB),
@@ -947,6 +950,23 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 - (BOOL)validateShouldEnableSwap:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: shouldSuspendToDisk
+//
+// Suspend to disk, kernel/checkpoint.c. OFF is the shipping state and the
+// registered default, for the same reason swap's is: a feature that spends the
+// user's storage and can lose their session is one they opt into.
+- (BOOL)shouldSuspendToDisk {
+    return [_defaults boolForKey:kPreferenceSuspendToDiskKey];
+}
+
+- (void)setShouldSuspendToDisk:(BOOL)shouldSuspendToDisk {
+    [_defaults setBool:shouldSuspendToDisk forKey:kPreferenceSuspendToDiskKey];
+}
+
+- (BOOL)validateShouldSuspendToDisk:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSNumber.class];
 }
 

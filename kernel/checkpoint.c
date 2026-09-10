@@ -150,6 +150,13 @@ struct ckpt_header {
     // image has to carry is which of the two setups to run, exactly as the
     // entry point chooses it at boot.
     uint32_t stdio_is_tty;
+    // WHICH console, and which device it has to be. The CLI's is /dev/tty1
+    // (4:1) and the app's is /dev/console (5:1) -- a session that came back on
+    // the other one would be talking to a terminal nobody is looking at.
+    // create_stdio checks the major/minor and falls back to an adhoc node if
+    // they do not match, so both halves travel.
+    char console[64];
+    uint32_t console_major, console_minor;
     uint32_t reserved;
 };
 
@@ -623,15 +630,18 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
             ? fd->ops->name : "unknown";
 
     path[0] = '\0';
-    if (fd->ops != NULL && fd->ops->name != NULL &&
-            strcmp(fd->ops->name, "devpts") == 0)
+    // A terminal comes back by being RE-OPENED rather than restored --
+    // sockrestart's model, and the only honest one for a terminal belonging to
+    // a process that no longer exists. Its PATH travels so it is re-opened as
+    // the same one: the CLI's console is /dev/tty1 and the app's is
+    // /dev/console, and a session that came back on the wrong one would be
+    // talking to a terminal nobody is looking at.
+    if ((fd->ops != NULL && fd->ops->name != NULL &&
+                strcmp(fd->ops->name, "devpts") == 0) || fd->tty != NULL) {
+        if (generic_getpath(fd, path) < 0 || path[0] != '/')
+            path[0] = '\0';
         return CKPT_FD_TTY;
-    // The console the entry point wired up at boot. It is a tty by mode,
-    // whatever family opened it, and it comes back by being RE-OPENED rather
-    // than restored -- sockrestart's model, and the only honest one for a
-    // terminal belonging to a process that no longer exists.
-    if (fd->tty != NULL)
-        return CKPT_FD_TTY;
+    }
     // The standard streams as the entry point handed them over. On the CLI
     // with output piped these are host descriptors wrapped in a struct fd
     // (kernel/init.c's open_fd_from_actual_fd) -- a pipe or a socket whose
@@ -777,7 +787,7 @@ static int ckpt_emit_map(void *vctx, page_t start, pages_t pages, unsigned flags
 // (no address space to photograph, a self-description instead), and a zombie
 // (a status and nothing else).
 static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
-        uint32_t *stdio_is_tty, uint64_t *pages_out, struct ckpt_fd_ids *ids) {
+        struct ckpt_header *h, uint64_t *pages_out, struct ckpt_fd_ids *ids) {
     struct task *saved_current = current;
     current = task;
     int ret = 0;
@@ -865,8 +875,14 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
                 goto out;
             s->offset = s->pipe_len;
         }
-        if (s->num <= 2 && s->kind == CKPT_FD_TTY)
-            *stdio_is_tty = 1;
+        if (s->num <= 2 && s->kind == CKPT_FD_TTY) {
+            h->stdio_is_tty = 1;
+            if (h->console[0] == '\0' && s->path[0] == '/') {
+                snprintf(h->console, sizeof(h->console), "%s", s->path);
+                h->console_major = dev_major(s->fd->stat.rdev);
+                h->console_minor = dev_minor(s->fd->stat.rdev);
+            }
+        }
     }
 
     char cwd[MAX_PATH + 1] = "/", root[MAX_PATH + 1] = "/";
@@ -1147,7 +1163,7 @@ int checkpoint_save(const char *host_path) {
     // described once and referenced from the other.
     struct ckpt_fd_ids ids = {0};
     for (unsigned i = 0; i < snap.count && err == 0; i++)
-        err = ckpt_save_task(&w, snap.tasks[i], &h.stdio_is_tty, &pages, &ids);
+        err = ckpt_save_task(&w, snap.tasks[i], &h, &pages, &ids);
     unsigned nfds_total = ids.count;
     free(ids.fds);
     task_snapshot_release(&snap);
@@ -1196,6 +1212,10 @@ struct ckpt_restore_state {
     // the program rather than start a guest thread.
     char *native_name, *native_argv, *native_state, *native_env;
     uint32_t native_argv_len, native_env_len;
+    // The console the checkpointed guest was on, and the device it expects to
+    // find there. create_stdio verifies the major/minor and falls back to an
+    // adhoc node if they do not match, so both halves travel.
+
     // id -> the struct fd built for it. A CKPT_FD_REF installs this one again
     // rather than making a second object, which is what keeps a forked child's
     // file offset the same object as its parent's.
@@ -1400,7 +1420,9 @@ descriptors:
     // does this.
     if (st->stdio[0] == NULL) {
         if (stdio_is_tty)
-            create_stdio("/dev/tty1", TTY_CONSOLE_MAJOR, 1);
+            create_stdio(h->console[0] != '\0' ? h->console : "/dev/tty1",
+                         h->console[0] != '\0' ? (int) h->console_major : TTY_CONSOLE_MAJOR,
+                         h->console[0] != '\0' ? (int) h->console_minor : 1);
         else
             create_piped_stdio();
         lock(&files->lock, 0);
@@ -1596,7 +1618,6 @@ identity:
     // pokes aimed at its parent and never by its own, so it ran on past every
     // wake and its parent's wait() never returned.
     current->cpu.poked_ptr = &current->cpu._poked;
-    (void) h;
     return 0;
 }
 

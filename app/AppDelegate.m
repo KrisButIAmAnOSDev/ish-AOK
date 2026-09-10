@@ -40,6 +40,7 @@
 #import "NSObject+SaneKVO.h"
 #import "Roots.h"
 #import "TerminalViewController.h"
+#include "kernel/checkpoint.h"
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
 #import "WorkspaceViewController.h"
@@ -2423,6 +2424,18 @@ static UIViewController *CreateRootSelectionViewController(void) {
     return navigationController;
 }
 
+// Where a suspended session lives: one file in the app group container, beside
+// the roots rather than inside one. Beside, because it describes the guest and
+// not the filesystem -- a root that is exported, copied or deleted should not
+// take a session with it, and a session that no longer matches its root is
+// refused on the way in rather than half-applied.
+static NSString *ISHSuspendImagePath(void) {
+    NSURL *container = ContainerURL();
+    if (container == nil)
+        return nil;
+    return [container URLByAppendingPathComponent:@"suspend.img"].path;
+}
+
 static TerminalViewController *CreateTerminalViewController(void) {
     UIViewController *viewController = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];
     return [viewController isKindOfClass:TerminalViewController.class] ? (TerminalViewController *) viewController : nil;
@@ -2576,6 +2589,40 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [ISHDiagnosticsStore recordLaunchStage:@"boot.first_process.ready"];
 
     FsInitialize();
+
+    // ---- suspend to disk: resume, if there is a session to resume -----------
+    //
+    // Before the device nodes and before the boot command, because a restored
+    // guest brings its own descriptors and its own first program: everything
+    // below this point is what a FRESH boot needs, and a resume needs none of
+    // it. The image is consumed by being restored -- leaving it would resume
+    // the same moment again on the launch after this one, hiding a session the
+    // user had since suspended over the top of it.
+    //
+    // A failure here is not a boot failure. The image may be from another
+    // build (kernel/checkpoint.c refuses one by fingerprint rather than
+    // reinterpreting it), or describe something this build cannot rebuild. The
+    // right answer to all of that is the behaviour the user gets with this
+    // switch off: boot normally.
+    NSString *sessionImage = ISHSuspendImagePath();
+    if (UserPreferences.shared.shouldSuspendToDisk && sessionImage != nil) {
+        checkpoint_set_session(sessionImage.fileSystemRepresentation);
+        if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
+            int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
+            [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
+            if (rerr >= 0) {
+                os_log(ISHSuspendLog(), "resumed a suspended session");
+                [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
+                                               details:@{@"root": defaultRoot}];
+                return 0;
+            }
+            os_log_error(ISHSuspendLog(),
+                         "could not resume the suspended session (%{public}d); booting",
+                         rerr);
+            [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume_failed"
+                                           details:@{@"err": @(rerr)}];
+        }
+    }
 
     // Repair or recreate the core device nodes the app owns. This keeps older
     // roots working when a device major/minor changes in a later app build.
@@ -3819,6 +3866,44 @@ void ISHSuspendGuardEnterBackground(void) {
     // for a signal that may arrive too late, or not at all.
     unsigned savedListeners = sockrestart_on_suspend();
     os_log(ISHSuspendLog(), "listening sockets recorded for restore: %{public}u", savedListeners);
+
+    // ---- suspend to disk ---------------------------------------------------
+    //
+    // HERE, beside the listener save, and for the same reason it is here: this
+    // runs the moment the app is backgrounded, while everything still works.
+    // The background-task expiration handler below is the closest thing iOS
+    // gives to "about to be suspended", and sockrestart learned the hard way
+    // that it can be too late -- iOS may already have taken things away.
+    //
+    // Synchronous, and that is the point: checkpoint_save_external freezes
+    // every guest task, writes the image and thaws, all before this method
+    // returns, so the file is on disk before iOS is free to freeze us. The
+    // guest is unharmed either way -- a checkpoint is a copy -- and if it
+    // refuses (a native program that cannot describe itself, a descriptor with
+    // no restore rule) it says so and the next launch simply boots.
+    if (UserPreferences.shared.shouldSuspendToDisk) {
+        NSString *image = ISHSuspendImagePath();
+        if (image != nil) {
+            int cerr = checkpoint_save_external(image.fileSystemRepresentation);
+            struct checkpoint_status ck;
+            checkpoint_get_status(&ck);
+            if (cerr == 0) {
+                os_log(ISHSuspendLog(),
+                       "session written: %{public}lu tasks, %{public}lu pages",
+                       ck.tasks, ck.pages);
+                [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspended"
+                                              details:@{@"tasks": @(ck.tasks),
+                                                        @"pages": @(ck.pages)}];
+            } else {
+                os_log_error(ISHSuspendLog(),
+                             "session not written (%{public}d): %{public}s",
+                             cerr, ck.last_refusal);
+                [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspendRefused"
+                                              details:@{@"err": @(cerr),
+                                                        @"why": @(ck.last_refusal)}];
+            }
+        }
+    }
     [ISHDiagnosticsStore recordBreadcrumb:@"application.sockrestartSaved"
                                   details:@{@"listeners": @(savedListeners)}];
     suspendGuardTask = [application beginBackgroundTaskWithName:@"fakefs-quiesce" expirationHandler:^{
