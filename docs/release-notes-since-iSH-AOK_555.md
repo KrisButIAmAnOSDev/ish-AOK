@@ -19,6 +19,13 @@ a native shell is *asked to describe itself* rather than photographed — there 
 no serialising a host C stack, so the rule is that a native program either knows
 how to dump its own state or the checkpoint refuses while it is running.
 
+You come back to the terminal you were looking at, not to a new shell beside
+your old one. A terminal cannot be restored — the one you had belonged to an app
+process that no longer exists — so the resume makes a fresh one for each session
+in the image and re-attaches that session to it: same controlling terminal, same
+foreground job, same line settings, same hostname, same job table. In the app,
+the window you resume into is the session you suspended.
+
 **It is off by default**, in Settings, for the same reason swap is: it spends
 your storage, and a session it cannot describe is one it will not save. When
 that happens it says so — `cat /proc/ish/checkpoint` in the guest reports what

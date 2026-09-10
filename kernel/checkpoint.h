@@ -139,7 +139,7 @@ struct checkpoint_status {
     int last_err;             // guest _E* code of the last save, 0 if fine
     char last_path[256];
     char last_refusal[256];   // why the last save refused, if it did
-    unsigned long long bytes; // size of the last file written
+    unsigned long long bytes; // guest memory in the last image, in bytes
     unsigned long pages;      // guest pages in it
     unsigned long fds;        // descriptors in it
     unsigned long tasks;      // processes in it

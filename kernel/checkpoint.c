@@ -2235,6 +2235,7 @@ int checkpoint_restore(const char *host_path) {
     ckpt_status.generation++;
     snprintf(ckpt_status.last_path, sizeof(ckpt_status.last_path), "%s", host_path);
     ckpt_status.pages = (unsigned long) h.total_pages;
+    ckpt_status.bytes = (unsigned long long) h.total_pages * PAGE_SIZE;
     ckpt_status.tasks = h.n_tasks;
     unlock(&ckpt_lock);
     err = 0;

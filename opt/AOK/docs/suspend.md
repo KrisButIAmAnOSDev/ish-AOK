@@ -48,9 +48,15 @@ knows how. It is **re-launched** from that description rather than resumed
 mid-instruction, which for an interactive shell means a prompt with your session
 still in it.
 
-Terminals and the standard streams are re-attached rather than restored: the
-terminal you had belonged to a process that no longer exists, so what comes back
-is the one you are looking at now.
+The terminal comes back too, and it is the one you are looking at. A terminal
+cannot be restored -- the one you had belonged to an app process that no longer
+exists -- so a fresh one is made and the session is re-attached to it, with the
+same session, the same foreground job and the same line settings. In the app
+that means the window you resume into is your session, not a new shell beside
+it. Your hostname, your background jobs and your job table are all still there.
+
+The system consoles are re-attached the same way, each to its own: a getty on
+`tty3` comes back on `tty3`, not alongside everything else on the console.
 
 ## What it will not save, and how it tells you
 
