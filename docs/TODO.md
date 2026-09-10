@@ -429,6 +429,112 @@ the swap-file one should be allowed to be small rather than implying a large
 area. Not yet wired -- `ISH_GUEST_ZSWAP_MB` is a launch variable, so the tier is
 reachable from the CLI and Xcode and not from an installed app.
 
+### 555: zram was lazy, because it inherited a swap file's caution
+
+**"It reached equilibrium and stopped" was recorded above as the fourth thing
+the feature got right. For a swap FILE it is. For RAM-only it was the bug.**
+
+Measured on the ip5 device on 2026-09-10, with compressed memory on, swap off,
+and the pool cap raised to its maximum from Settings:
+
+```
+kswapd   running, 864 passes, 0 bytes reclaimed
+pool     0 KB of a 494 MB cap        headroom 931 MB    ceiling 1450 MB
+write_window  0 of 4294967296 bytes used in the last 24h
+```
+
+**864 background passes, a half-gigabyte pool the user had deliberately asked
+for, and not one frame ever compressed.** The watermark was
+`available < floor * 2` = 482 MB, and the app sat at 931 MB.
+
+Every gate around eviction was designed for a file: reclaim writes to the user's
+flash, that is metered against a 24-hour budget, and flash wears out. Waiting
+until the app is nearly dead is right when each eviction costs a write. **In
+RAM-only mode none of that is true.** `swap_write_frame` takes the `ram_only`
+branch and returns `_ENOSPC` before it reaches a file descriptor -- which is
+what `write_window 0 of 4 GiB` after 864 passes actually says.
+
+**A watermark was the wrong SHAPE, not merely the wrong number.** Two attempts
+at one failed the same way, and both are worth recording because the second
+looked convincing:
+
+1. *Half the budget.* On the device that moves the trigger from 482 MB to
+   725 MB of headroom -- and the device was at 931 MB, so it still did nothing.
+2. *Half the budget with hysteresis*, a low/high pair so a run continues once
+   started. That fixed a real defect on the way past -- a bare threshold does
+   not shed memory, it hovers: measured with a 400 MB hog against an 800 MB
+   budget, headroom sat at **401 MB against a 400 MB mark** for a minute with
+   kswapd taking 24 passes and reclaiming 0 bytes. But it still begins with
+   "wait until enough is gone".
+
+Any threshold against remaining headroom encodes waiting, and there is nothing
+to wait for. **So RAM-only reclaim has no watermark at all: it runs while the
+pool has room and stops when it is full.** The cap is a size the user chose;
+filling it with cold frames is what choosing it asked for.
+
+What keeps that honest is not a headroom test but three things that already
+existed, plus one that did not:
+
+- the **aging clock**, which offers only frames that have read cold across
+  several sweeps, so hot memory is never a candidate;
+- the **thrash guard**, which pauses reclaim outright when evicted pages come
+  straight back, whatever the headroom says;
+- the **pool-full check**, because at capacity every further eviction
+  compresses, is declined for want of room, and leaves the frame resident --
+  CPU spent, nothing moved;
+- a **housekeeping cadence**, which is the new one and was not optional.
+
+**Why the cadence was needed.** A sweep is not free even when it reclaims
+nothing: it takes a task snapshot and an address-space barrier per mm, and that
+barrier is paid by the guest's own threads -- the same mechanism that makes
+mallocng's mmap/munmap churn expensive. An empty-sweep backoff was tried first
+and does not help, because the common case is not "nothing cold" but "a trickle
+of newly-cold memory": measured, **60 passes in 30 s for 12 frames**, with every
+productive pass resetting the backoff. So unpressured reclaim now sweeps on one
+pass in four, and under real pressure on every pass. Measured after:
+
+```
+over 30 s unpressured: passes=60 sweeps=6
+```
+
+**The cost of being wrong is small, and was measured** on that device against
+MariaDB's live 684 MB (175,209 pages):
+
+```
+lz4    compress   2.46 us/page   decompress   9.70 us/page
+```
+
+A 16 KiB frame costs ~10 us to compress, so the whole 494 MB pool is well under
+a second of CPU, once -- roughly 0.4 J against a ~7 Wh battery. A frame faulted
+back costs ~39 us: 0.4% of one core at 100 frames/s, 3.9% at 1,000. Compressing
+is close to free; picking hot frames is what would cost, and the clock and the
+thrash guard are what prevent that.
+
+`/proc/ish/swap` now reports **sweeps as well as passes**, because with a
+cadence those are different numbers and the gap between them is the policy.
+
+**`zswap_fork_cow` had to change, and the reason generalises.** It asserted that
+a forced sweep with a fork outstanding did not move the `stores` counter. That
+became unfalsifiable the moment reclaim stopped waiting for pressure: kswapd now
+runs continuously, so `stores` moves for reasons unrelated to the region under
+test, and it failed on a kernel whose COW handling was correct (stores
+545 -> 549, invariant intact). **A global counter cannot attribute a store to a
+particular frame.** It now does what its first version did and what the counter
+was only ever a proxy for: the child writes through the sharing and the parent's
+view must be untouched. Immune to background reclaim, and it fails for exactly
+one reason.
+
+`tests/manual/zram_idle_reclaim.c` locks the new behaviour in, and asserts it
+**where there is no pressure** -- it refuses to run unless headroom is well
+above the old file-backed mark, and fails if nothing is stored while it stays
+there. Testing under pressure would have passed before the fix and after it.
+Measured: `stores 288 -> 545 after 11 s, with headroom never below 982 MB
+against a 400 MB file-backed mark`.
+
+**Still open:** the pool cap default is a flat 128 MB, and the maximum is
+physical RAM / 4 -- which is why a device asking for 512 MB gets 494. The
+maximum scales; the default does not, and the clamp is silent.
+
 ### Phase 0, the measurements the above rests on
 
 Follows the entry above -- the host's own compression buys AOK nothing, so only

@@ -997,6 +997,10 @@ static bool swap_kswapd_started;                  // swap_config_lock
 static _Atomic bool swap_kswapd_stop;
 static _Atomic bool swap_kswapd_alive;
 static _Atomic uint64_t swap_stat_kswapd_passes;
+// Wake-ups and actual sweeps are different numbers now that unpressured reclaim
+// runs on a housekeeping cadence, and the gap between them IS the policy. Both
+// are reported so it can be seen rather than inferred.
+static _Atomic uint64_t swap_stat_kswapd_sweeps;
 static _Atomic uint64_t swap_stat_kswapd_bytes;
 static _Atomic uint64_t swap_stat_thrash_backoffs;
 static _Atomic uint64_t swap_stat_ledger_backoffs;
@@ -1004,11 +1008,48 @@ static _Atomic bool swap_thrashing;
 
 // Should background reclaim be running right now?
 //
-// The watermark is DELIBERATELY ABOVE the one that refuses allocations. The
-// guard fires when the app is within host_mem_headroom_floor() of its ceiling,
-// and by then the guest is already being told no; a background reclaimer that
-// waited for the same point would be no earlier than direct reclaim and would
-// have no reason to exist. Two floors gives a band to work in.
+// FILE-BACKED: the watermark is DELIBERATELY ABOVE the one that refuses
+// allocations. The guard fires when the app is within host_mem_headroom_floor()
+// of its ceiling, and by then the guest is already being told no; a background
+// reclaimer that waited for the same point would be no earlier than direct
+// reclaim and would have no reason to exist. Two floors gives a band to work in.
+//
+// RAM-ONLY (zram) HAS NO WATERMARK AT ALL, and that is the point rather than an
+// oversight.
+//
+// Every gate around eviction was built for a swap FILE: reclaim writes to the
+// user's flash, which is metered against a 24-hour budget and wears out, so
+// waiting until the app is nearly dead is the right trade. In RAM-only mode
+// none of that is true. swap_write_frame takes the ram_only branch and returns
+// _ENOSPC before it ever reaches a file descriptor, so nothing is written and
+// the write window is never touched -- measured on a device: 864 kswapd passes,
+// 0 bytes reclaimed, `write_window 0 of 4294967296 bytes used`, with a 494 MB
+// pool completely empty and 931 MB of headroom to spare.
+//
+// A watermark was the wrong SHAPE here, not merely the wrong number, and two
+// tries at one failed the same way. Any threshold expressed against remaining
+// headroom says "wait until enough is gone", and there is nothing to wait for:
+// the host's own compressor does not wait, and this has no flash to protect.
+// The first attempt (half the budget) still left the device above the line; the
+// second added hysteresis and only made the hovering less frequent.
+//
+// So RAM-only reclaim runs whenever the POOL HAS ROOM and stops when it is
+// full. The cap is a size the user chose in Settings, and filling it with cold
+// frames is what choosing it asked for. What keeps that honest is not a
+// headroom test but three mechanisms that already exist:
+//
+//   * the aging clock, which offers only frames that have read cold across
+//     several sweeps, so hot memory is never a candidate;
+//   * the thrash guard, which pauses reclaim outright when evicted pages come
+//     straight back, whatever the headroom says;
+//   * the empty-sweep backoff in the kswapd loop, so a guest with nothing cold
+//     costs one sweep every ten seconds rather than two a second.
+//
+// The cost of being wrong is small, and was measured on that device: lz4 runs
+// at 2.46 us per 4 KiB page, so a 16 KiB frame costs ~10 us to compress and the
+// whole 494 MB pool well under a second of CPU, once. A frame faulted back
+// costs a decompress, ~39 us. Compressing is close to free; choosing hot frames
+// is what would cost, and the clock and the thrash guard are what prevent it.
 static bool swap_kswapd_should_reclaim(void) {
     uint64_t floor = host_mem_headroom_floor();
     if (floor == 0)
@@ -1016,6 +1057,41 @@ static bool swap_kswapd_should_reclaim(void) {
     struct mem_budget budget = get_mem_budget();
     if (!budget.known || !budget.available_known)
         return false;                  // a reading nobody could take is not pressure
+
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (!ram_only)
+        return budget.available < floor * 2;
+
+    // A full pool ends it. In RAM-only mode the pool is the only destination,
+    // so once it is at capacity every further eviction compresses the frame,
+    // is declined for want of room, and leaves it resident -- the CPU is spent
+    // and nothing moves. Cheap to check, and essential now that there is no
+    // watermark keeping kswapd asleep.
+    //
+    // Read outside swap_lock: zswap has its own lock, and the pool figures are
+    // a hint either way -- a pass that races a free simply tries again in
+    // 500 ms.
+    struct zswap_stats z;
+    zswap_get_stats(&z);
+    if (z.enabled && z.max_bytes > 0 && z.pool_bytes >= z.max_bytes)
+        return false;
+    return true;
+}
+
+// True when the app is close enough to its ceiling that reclaim is a rescue
+// rather than housekeeping. The idle backoff must never apply here: a guest
+// that is genuinely running out cannot afford to wait ten seconds for the next
+// sweep, and in that state a pass that reclaims nothing means there was nothing
+// to reclaim, not that there is no hurry.
+static bool swap_kswapd_under_pressure(void) {
+    uint64_t floor = host_mem_headroom_floor();
+    if (floor == 0)
+        return false;
+    struct mem_budget budget = get_mem_budget();
+    if (!budget.known || !budget.available_known)
+        return false;
     return budget.available < floor * 2;
 }
 
@@ -1042,6 +1118,43 @@ static bool swap_kswapd_should_reclaim(void) {
 // moved on gets reclaimed again promptly.
 #define SWAP_THRASH_COOLDOWN_PASSES 20
 static unsigned swap_thrash_cooldown;   // kswapd thread only
+
+// The empty-sweep backoff, which is what makes "no watermark" affordable.
+//
+// RAM-only reclaim no longer waits for pressure, so kswapd can find itself
+// sweeping a guest that simply has nothing cold. A sweep is not free even when
+// it evicts nothing: it takes a task snapshot and an address-space barrier per
+// mm, and those cost the guest's own threads. Twice a second, forever, for no
+// result, would be a real tax.
+//
+// So a pass that reclaims nothing doubles a skip count, up to ten seconds, and
+// any pass that reclaims something clears it. A guest with cold memory is swept
+// at the full rate; a guest without is sampled occasionally to find out whether
+// that has changed. Never applied under real pressure -- see
+// swap_kswapd_under_pressure.
+#define SWAP_IDLE_BACKOFF_MAX_PASSES 20
+static unsigned swap_idle_skip;         // kswapd thread only
+static unsigned swap_idle_backoff;      // kswapd thread only
+
+// Housekeeping cadence: how many 500 ms passes to skip between sweeps when
+// there is no pressure.
+//
+// The backoff above only helps when reclaim finds NOTHING, and that is not the
+// common case -- a guest usually has a trickle of newly-cold memory, so a
+// productive pass every few seconds resets the counter and the sweep rate stays
+// pinned at two a second. Measured: 60 passes in 30 s for 12 frames.
+//
+// A sweep is not free even when it is productive. It takes a task snapshot and
+// an address-space barrier per mm, and that barrier is paid by the guest's own
+// threads -- the same mechanism that makes mallocng's mmap/munmap churn
+// expensive (see mem_quiesce). Filling a pool is housekeeping, not a rescue, so
+// it runs at a quarter of the rate: 4 MB per slice every two seconds still
+// fills a 494 MB pool in a few minutes, which is far faster than the memory
+// goes cold in the first place.
+//
+// Under real pressure this does not apply and every pass sweeps.
+#define SWAP_HOUSEKEEPING_SKIP_PASSES 3
+static unsigned swap_housekeeping_skip; // kswapd thread only
 
 // The latch now carries its own deadline (emu/memory.c), so nothing here has to
 // clear it. This is only the transition LOGGER: it tells the user once when
@@ -1136,6 +1249,20 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
         pthread_mutex_unlock(&swap_quiesce_lock);
         if (gated)
             continue;
+        bool pressured = swap_kswapd_under_pressure();
+        if (!pressured) {
+            if (swap_idle_skip > 0) {
+                swap_idle_skip--;
+                continue;
+            }
+            if (swap_housekeeping_skip > 0) {
+                swap_housekeeping_skip--;
+                continue;
+            }
+            swap_housekeeping_skip = SWAP_HOUSEKEEPING_SKIP_PASSES;
+        } else {
+            swap_housekeeping_skip = 0;
+        }
         if (!swap_kswapd_should_reclaim())
             continue;
 
@@ -1171,6 +1298,7 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
         // until the sweep of its OLD address space finishes, at most one slice,
         // and that slice's writes go to an address space nothing will fault
         // back in. Rare and bounded; the alternative was the crash above.
+        atomic_fetch_add_explicit(&swap_stat_kswapd_sweeps, 1, memory_order_relaxed);
         struct task_snapshot snapshot = {0};
         if (task_snapshot_collect(&snapshot, false) != 0)
             continue;
@@ -1210,6 +1338,17 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
         task_snapshot_release(&snapshot);
         if (got != 0)
             atomic_fetch_add_explicit(&swap_stat_kswapd_bytes, got, memory_order_relaxed);
+        // Back off from a sweep that found nothing, so an idle guest is cheap;
+        // reset the moment one finds something, so a busy one is not slowed.
+        if (got == 0 && !pressured) {
+            swap_idle_backoff = swap_idle_backoff ? swap_idle_backoff * 2 : 1;
+            if (swap_idle_backoff > SWAP_IDLE_BACKOFF_MAX_PASSES)
+                swap_idle_backoff = SWAP_IDLE_BACKOFF_MAX_PASSES;
+            swap_idle_skip = swap_idle_backoff;
+        } else if (got != 0) {
+            swap_idle_backoff = 0;
+            swap_idle_skip = 0;
+        }
     }
     atomic_store_explicit(&swap_kswapd_alive, false, memory_order_release);
     return NULL;
@@ -1432,6 +1571,7 @@ void swap_get_stats(struct swap_stats *out) {
     out->kswapd_running = atomic_load_explicit(&swap_kswapd_alive, memory_order_relaxed);
     out->thrashing = atomic_load_explicit(&swap_thrashing, memory_order_relaxed);
     out->kswapd_passes = atomic_load_explicit(&swap_stat_kswapd_passes, memory_order_relaxed);
+    out->kswapd_sweeps = atomic_load_explicit(&swap_stat_kswapd_sweeps, memory_order_relaxed);
     out->kswapd_reclaimed_bytes = atomic_load_explicit(&swap_stat_kswapd_bytes, memory_order_relaxed);
     out->thrash_backoffs = atomic_load_explicit(&swap_stat_thrash_backoffs, memory_order_relaxed);
     out->release_ineffective = swap_release_ineffective();
@@ -1484,7 +1624,7 @@ size_t swap_status_text(char *buf, size_t size) {
         "quiesced         %s  (suspension gate: no new eviction I/O)\n"
         "write_window     %llu of %llu bytes used in the last 24h\n"
         "budget_refusals  %llu  (evictions refused, the window is spent)\n"
-        "kswapd           %s, %llu passes, %llu bytes reclaimed\n"
+        "kswapd           %s, %llu passes, %llu sweeps, %llu bytes reclaimed\n"
         "thrashing        %s  (%llu backoffs)\n"
         "release_works    %s  (%llu sweeps moved no footprint, %llu backoffs)\n"
         "direct_reclaim   %llu  (bytes freed for an allocation that would have failed)\n"
@@ -1512,6 +1652,7 @@ size_t swap_status_text(char *buf, size_t size) {
         (unsigned long long) s.budget_refusals,
         s.kswapd_running ? "running" : "stopped",
         (unsigned long long) s.kswapd_passes,
+        (unsigned long long) s.kswapd_sweeps,
         (unsigned long long) s.kswapd_reclaimed_bytes,
         s.thrashing ? "yes" : "no",
         (unsigned long long) s.thrash_backoffs,

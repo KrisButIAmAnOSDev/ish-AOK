@@ -20,17 +20,22 @@
 // by failing honestly: after a fork it reported "nothing was stored compressed
 // in 4 sweeps", because nothing was eligible.
 //
-// So this now asserts the SAFETY PROPERTY rather than chasing the bug:
+// So this asserts the SAFETY PROPERTY in two halves:
 //
-//   1. With a fork outstanding, a forced eviction sweep must store NOTHING.
-//      That is the invariant the whole fork/COW question rests on.
+//   1. With a fork outstanding, the child writes through its half of the
+//      sharing and the PARENT's view must be untouched. If a COW frame reached
+//      the tier and came back shared, the child's marks appear in the parent.
 //   2. Once the sharing is gone -- the child has exited and the parent has
 //      written through the region to collapse the COW chain -- the same frames
 //      become evictable and must still round-trip byte-for-byte.
 //
-// If anyone later relaxes that eligibility check to evict shared frames without
-// teaching the tier about sharing, (1) is what catches it, and it catches it as
-// a test failure rather than as wrong data in someone's shell.
+// (1) was briefly written as "a forced sweep must not move the `stores`
+// counter", which was simpler and became WRONG in 555: RAM-only reclaim stopped
+// waiting for pressure, so kswapd runs continuously and that counter moves for
+// reasons unrelated to this region. It failed on a correct kernel (stores
+// 545 -> 549, invariant intact). A global counter cannot attribute a store to a
+// particular frame, so the test checks the corruption it was always a proxy
+// for -- which is also what the first version of this file did.
 //
 // The pattern is compressible (64-byte runs, so lz4 has something to work with
 // and frames actually enter the pool) and position-dependent (the run value
@@ -192,18 +197,40 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (child == 0) {
-        // Hold the sharing open, verify our own view, and get out of the way.
+        // Wait until the parent has tried to evict the shared frames, then
+        // write through our half of the sharing. If a COW frame reached the
+        // compressed tier and came back shared, these writes land in the
+        // PARENT's view too, which is the corruption this is here to catch.
         char c;
         close(to_child[1]);
         if (read(to_child[0], &c, 1) != 1) _exit(3);
-        size_t first = 0;
-        _exit(verify(shared, region, 0, &first) == 0 ? 0 : 4);
+        for (size_t block = 0; block * RUN_BYTES < region; block++) {
+            if (block % CHILD_STRIDE != 0)
+                continue;
+            memset(shared + block * RUN_BYTES, CHILD_MARK, RUN_BYTES);
+        }
+        _exit(0);
     }
     close(to_child[0]);
 
     // ---- (1) the invariant: a COW frame must never be evicted -------------
+    //
+    // ASSERTED AS CORRUPTION, NOT AS A COUNTER, and the difference matters.
+    //
+    // This used to require that `stores` did not move during the sweep. That
+    // became unfalsifiable in 555, when RAM-only reclaim stopped waiting for
+    // pressure: kswapd now runs continuously, so `stores` moves for reasons
+    // that have nothing to do with this test's region, and the assertion began
+    // failing on a kernel whose COW handling was perfectly correct (measured:
+    // stores 545 -> 549 with the invariant intact). A global counter cannot
+    // attribute a store to a particular frame.
+    //
+    // So the test does what its first version did and what the counter was only
+    // ever a proxy for: it lets the child write through the sharing and checks
+    // the parent's own view is untouched. That is immune to background reclaim,
+    // and it fails for exactly one reason -- a frame reachable from two address
+    // spaces was evicted and shared back.
     int evict_err = evict_self(SWEEPS, base_stores, NULL);
-    unsigned long long shared_stores = zswap_field("stores", &ok);
     if (evict_err == EPERM) {
         printf("zswap_fork_cow: SKIP (/proc/ish/swap_evict is EPERM: the "
                "forced-eviction control is a CLI/Xcode-only gate)\n");
@@ -212,22 +239,8 @@ int main(int argc, char **argv) {
         waitpid(child, NULL, 0);
         return 0;
     }
-    if (shared_stores > base_stores) {
-        printf("zswap_fork_cow: FAIL (a frame shared with a forked child was "
-               "stored compressed: stores %llu -> %llu. swap_frame_eligible is "
-               "supposed to refuse P_COW outright, and the compressed tier has "
-               "no handling for a frame reachable from two address spaces)\n",
-               base_stores, shared_stores);
-        char go = 'g';
-        if (write(to_child[1], &go, 1) != 1) { }
-        waitpid(child, NULL, 0);
-        return 1;
-    }
-    test_log_if(0, "with a fork outstanding, %d sweeps stored nothing "
-                "(stores stayed %llu) -- COW frames refused, as they must be\n",
-                SWEEPS, base_stores);
 
-    // Release the child and let the sharing end.
+    // Release the child so it writes its mark, and wait for it to finish.
     char go = 'g';
     if (write(to_child[1], &go, 1) != 1) {
         printf("zswap_fork_cow: SKIP (could not signal the child)\n");
@@ -237,10 +250,26 @@ int main(int argc, char **argv) {
     int status = 0;
     waitpid(child, &status, 0);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        printf("zswap_fork_cow: FAIL (the child read the shared region back "
-               "wrong: exit %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        printf("zswap_fork_cow: FAIL (the child could not write its half: "
+               "exit %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         return 1;
     }
+
+    // The parent must see NONE of the child's marks: mine_marked = 0.
+    size_t bad_first = 0;
+    size_t leaked = verify(shared, region, 0, &bad_first);
+    if (leaked != 0) {
+        printf("zswap_fork_cow: FAIL (%zu bytes of the child's writes are "
+               "visible in the PARENT's view, first at offset %zu -- a frame "
+               "shared with a forked child was evicted and came back shared. "
+               "swap_frame_eligible is supposed to refuse P_COW outright, and "
+               "the compressed tier has no handling for a frame reachable from "
+               "two address spaces)\n", leaked, bad_first);
+        return 1;
+    }
+    test_log_if(0, "the child wrote every %dth block through the sharing and "
+                "the parent's view is untouched -- COW frames were not evicted "
+                "and shared\n", CHILD_STRIDE);
 
     // ---- (2) sharing gone: the same frames must round-trip ----------------
     // Write through the region to collapse the COW chain. The flag persists
