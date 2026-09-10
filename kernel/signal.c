@@ -1356,6 +1356,7 @@ static int signalfd_close(struct fd *fd) {
 }
 
 static struct fd_ops signalfd_ops = {
+    .name = "signalfd",
     .anon_inode_class = "signalfd",
     .read = signalfd_read,
     .poll = signalfd_poll,

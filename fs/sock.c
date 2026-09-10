@@ -9135,6 +9135,7 @@ static int sock_close(struct fd *fd) {
 }
 
 const struct fd_ops socket_fdops = {
+    .name = "socket",
     .read = sock_read,
     .write = sock_write,
     .close = sock_close,

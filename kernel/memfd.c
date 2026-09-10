@@ -274,6 +274,7 @@ static int memfd_getpath(struct fd *fd, char *buf) {
 }
 
 static struct fd_ops memfd_ops = {
+    .name = "memfd",
     .read = memfd_read,
     .write = memfd_write,
     .pread = memfd_pread,

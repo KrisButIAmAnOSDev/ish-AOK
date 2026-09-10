@@ -318,5 +318,6 @@ const struct fs_ops devptsfs = {
 };
 
 static const struct fd_ops devpts_fdops = {
+    .name = "devpts",
     .readdir = devpts_readdir,
 };

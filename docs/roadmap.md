@@ -250,19 +250,31 @@ sharing to lose. Guest pages compress well -- 2-4x is typical for anonymous
 memory -- so it is close to pure win, and it should be optional the way swap's
 size is.
 
-**The stronger case is the pager itself, which today compresses nothing.**
-`kernel/swap.c` writes raw frames. Real systems do not: iOS and macOS compress
-memory before swapping, and Linux has zram/zswap. Compressing before the write
-means proportionally FEWER BYTES REACH FLASH, which is the concern users
-actually raise about enabling swap -- it stretches the 4 GiB/24h write budget by
-the compression ratio and reduces wear by the same factor. That argues for doing
-it in the pager *before* the checkpoint, because swap writes the same memory
-repeatedly while a checkpoint writes it once.
+**The pager already compresses -- this argument was made and then acted on, and
+what it produced is now a prerequisite rather than a sequel.** Built in 555:
+`kernel/zpool.c` and `kernel/zswap.c`, in two modes, with a Settings switch.
+zswap puts the pool in front of the swap file so only what does not compress
+reaches flash; zram has no file at all. The measurement this section asked for
+was taken: lz4 at 2.46 us per 4 KiB page on an A9, 2.2-2.8x on real workloads,
+2.11x with slab fragmentation counted, and decompress two orders of magnitude
+under a flash read.
 
-Not scheduled here yet, and deliberately: it wants a measurement first -- ratio
-and CPU cost on real guest pages, against the eviction latency budget the thrash
-guard already assumes. The precedent to follow is the JIT code-cache study: a
-number and a gate before any estimate.
+**What that changes for a checkpoint is the shape of the work, not just the
+timing.** A checkpoint no longer needs its own compressor: the tier already
+takes a guest frame, compresses it, and hands it back byte-identical, and
+`zswap_store`/`zswap_load` are the same pair a checkpoint writer would have had
+to invent. It also already answers the questions a first attempt gets wrong --
+what to do with an incompressible frame (decline, leave it resident), and what
+happens if the pool is dropped while a slot still names an object in it (refuse
+the teardown loudly rather than hand back plausible garbage).
+
+**And it settled one design question for suspend by accident.** RAM-only reclaim
+turned out to need no watermark at all -- it fills the pool with cold frames
+whenever there is room, because with no file there is no flash cost to ration
+(555). A suspend is the same operation with the ceiling removed: evict
+everything rather than everything cold. The eviction path a checkpoint needs is
+therefore not just present but exercised continuously, on every device with
+compressed memory switched on.
 
 **Next step is phase 0, and phase 0 is a gate, not a feature.** Two things, in
 order. First, an inventory: walk a real booted guest and enumerate everything

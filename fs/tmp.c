@@ -1927,6 +1927,7 @@ static int tmpfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t page
 }
 
 const struct fd_ops tmpfs_fdops = {
+    .name = "tmpfs",
     .read = tmpfs_read,
     .write = tmpfs_write,
     .pread = tmpfs_pread,

@@ -293,6 +293,7 @@ static int proc_poll(struct fd *fd) {
 }
 
 const struct fd_ops procfs_fdops = {
+    .name = "procfs",
     .pread = proc_pread,
     .pwrite = proc_pwrite,
     .lseek = proc_seek,

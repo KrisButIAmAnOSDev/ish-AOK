@@ -62,6 +62,7 @@ static int pidfd_poll(struct fd *fd) {
 }
 
 static struct fd_ops pidfd_ops = {
+    .name = "pidfd",
     .anon_inode_class = "[pidfd]",
     .poll = pidfd_poll,
     .close = pidfd_close,

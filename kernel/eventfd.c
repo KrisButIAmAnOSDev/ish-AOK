@@ -92,6 +92,7 @@ static int eventfd_poll(struct fd *fd) {
 }
 
 static struct fd_ops eventfd_ops = {
+    .name = "eventfd",
     .anon_inode_class = "eventfd",
     .read = eventfd_read,
     .write = eventfd_write,

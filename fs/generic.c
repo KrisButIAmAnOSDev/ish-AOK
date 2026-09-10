@@ -303,6 +303,7 @@ static int opath_link_close(struct fd *fd) {
 }
 
 static const struct fd_ops opath_link_ops = {
+    .name = "opath_link",
     .close = opath_link_close,
 };
 

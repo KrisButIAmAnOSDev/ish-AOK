@@ -450,6 +450,18 @@ struct fd_ops {
     // (eventfd, eventpoll, signalfd, timerfd, inotify). NULL when the type is
     // taken from stat.mode instead (sockets -> socket:, pipes -> pipe:).
     const char *anon_inode_class;
+
+    // Which family this is, for anything that has to reason about descriptors
+    // by KIND rather than by behaviour. Set by every fd_ops in the tree.
+    //
+    // Added for the checkpoint inventory (/proc/ish/checkpoint), which has to
+    // answer "what is actually open in a real session, and could it be brought
+    // back" -- and the honest answer differs per family, from "re-open the path
+    // and seek" to "cannot be restored, only rebuilt". Most fd_ops are static
+    // to their own file, so a reader outside cannot compare pointers to
+    // identify one; guessing from stat.mode conflates families that share a
+    // mode. A name is the smallest thing that makes the question answerable.
+    const char *name;
 };
 
 struct fdtable {

@@ -1303,6 +1303,7 @@ static int aokfs_close(struct fd *fd) {
 }
 
 static const struct fd_ops aokfs_fdops = {
+    .name = "aokfs",
     .read = aokfs_read,
     .write = aokfs_write,
     .pread = aokfs_pread,

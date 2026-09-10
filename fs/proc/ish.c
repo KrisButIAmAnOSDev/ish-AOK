@@ -313,6 +313,244 @@ static void proc_ish_show_memcomp_algo(struct proc_data *buf, const char *name,
 // sized from Settings, the way swap is. What this exists for is proving it
 // actually did something -- a swap test that passes with the tier enabled
 // proves nothing unless the counters moved.
+// ---- checkpoint inventory ---------------------------------------------------
+//
+// Phase 0 of suspend-to-disk (docs/roadmap.md) is a GATE, not a feature, and
+// this is the measurement it gates on. The question that decides whether a
+// checkpoint is worth building is not "is a pty hard" -- it is how many of the
+// descriptors in a NORMAL session are the easy kind. That is an empirical
+// question about a running guest, so it is answered by reading a running guest
+// rather than by reasoning about fd_ops.
+//
+// Nothing here checkpoints anything. It reports what a checkpoint would have to
+// carry and what it would have to refuse, so the plan can be judged against a
+// real session -- including a real session on a device, which is the only place
+// the interesting fd mix exists.
+enum ckpt_verdict {
+    CKPT_REOPEN,    // a path and an offset are enough
+    CKPT_MEMORY,    // contents live in guest memory; serialised with it
+    CKPT_RESTATE,   // rebuildable from state this fd already holds
+    CKPT_REBUILD,   // cannot be restored, only rebuilt -- see sockrestart
+    CKPT_LOSSY,     // survivable, but something in flight is lost
+    CKPT_UNKNOWN,
+};
+
+static const char *ckpt_verdict_text(enum ckpt_verdict v) {
+    switch (v) {
+        case CKPT_REOPEN:  return "re-open the path, seek to the offset";
+        case CKPT_MEMORY:  return "contents are guest memory, saved with it";
+        case CKPT_RESTATE: return "rebuild from the state it already holds";
+        case CKPT_REBUILD: return "CANNOT be restored, only rebuilt";
+        case CKPT_LOSSY:   return "restorable, but data in flight is lost";
+        default:           return "not yet classified";
+    }
+}
+
+// One row per fd_ops family, plus the pseudo-families that share one.
+static enum ckpt_verdict ckpt_verdict_for(const char *family) {
+    if (family == NULL)
+        return CKPT_UNKNOWN;
+    // Paths are stable across a restart -- fakefs paths especially -- so the
+    // common case really is the easy one.
+    if (strcmp(family, "realfs") == 0 || strcmp(family, "aokfs") == 0 ||
+        strcmp(family, "procfs") == 0 || strcmp(family, "fscontext") == 0 ||
+        strcmp(family, "opath_link") == 0)
+        return CKPT_REOPEN;
+    if (strcmp(family, "tmpfs") == 0 || strcmp(family, "memfd") == 0)
+        return CKPT_MEMORY;
+    if (strcmp(family, "eventfd") == 0 || strcmp(family, "signalfd") == 0 ||
+        strcmp(family, "timerfd") == 0 || strcmp(family, "epoll") == 0 ||
+        strcmp(family, "inotify") == 0)
+        return CKPT_RESTATE;
+    // A pty and a socket are the same shape of problem, and sockrestart is
+    // already the answer for one of them: do not restore it, record enough to
+    // rebuild it, because iOS destroys the original either way.
+    if (strcmp(family, "devpts") == 0 || strcmp(family, "socket") == 0)
+        return CKPT_REBUILD;
+    // fuse's server is a guest process, so it comes back only if that process
+    // does -- which is a checkpoint ordering problem, not a serialisation one.
+    if (strcmp(family, "fuse") == 0)
+        return CKPT_REBUILD;
+    if (strcmp(family, "pidfd") == 0)
+        return CKPT_RESTATE;
+    return CKPT_UNKNOWN;
+}
+
+#define CKPT_MAX_FAMILIES 24
+struct ckpt_family {
+    const char *name;
+    unsigned count;
+};
+
+static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct ckpt_family fams[CKPT_MAX_FAMILIES];
+    unsigned fam_count = 0;
+    unsigned tasks = 0, fds_total = 0, unnamed = 0;
+    unsigned native_on_stack = 0, native_can_dump = 0, native_cannot = 0;
+    // The names are worth more than the count: which native program is on a
+    // stack decides whether the checkpoint is deferred or refused outright.
+    char native_names[8][16];
+    unsigned native_named = 0;
+    unsigned pipes = 0, ttys = 0;
+
+    struct task_snapshot snapshot = {0};
+    if (task_snapshot_collect(&snapshot, true) < 0) {
+        proc_printf(buf, "checkpoint: could not take a task snapshot\n");
+        return 0;
+    }
+
+    for (unsigned i = 0; i < snapshot.count; i++) {
+        struct task *task = snapshot.tasks[i];
+        // trylock and skip, for the reason collect_mem_page_stats documents at
+        // length: a task we cannot lock immediately is mid-exit, and blocking
+        // here against do_exit's backoff loop is a genuine deadlock.
+        if (trylock(&task->general_lock) != 0)
+            continue;
+        struct fdtable *files = task->files;
+        if (files != NULL)
+            fdtable_retain(files);
+        // A native program is on this task's stack for exactly the lifetime of
+        // its call, and native_argv is published for exactly that window
+        // (kernel/native.c). This is the checkpoint's stated capability
+        // boundary: there is no serialising a host C stack, so a checkpoint
+        // refuses while one is running.
+        if (task->native_argv != NULL) {
+            native_on_stack++;
+            // zsh already knows how to describe itself and re-launch
+            // (deps/zsh/Src/aok_fork.c), which is the same capability a
+            // checkpoint needs. bash does NOT and will not: it is GPLv3, so an
+            // App Store build cannot contain it, and it is being removed in 556
+            // (docs/shell_transition_plan.md). Teaching it to dump state would
+            // be work thrown away, so a native bash is a hard refusal rather
+            // than a wait-for-a-quiet-point.
+            if (strcmp(task->comm, "zsh") == 0)
+                native_can_dump++;
+            else
+                native_cannot++;
+            if (native_named < 8) {
+                strncpy(native_names[native_named], task->comm,
+                        sizeof(native_names[0]) - 1);
+                native_names[native_named][sizeof(native_names[0]) - 1] = '\0';
+                native_named++;
+            }
+        }
+        unlock(&task->general_lock);
+        if (files == NULL)
+            continue;
+        tasks++;
+
+        lock(&files->lock, 0);
+        for (unsigned f = 0; f < files->size; f++) {
+            struct fd *fd = files->files[f];
+            if (fd == NULL)
+                continue;
+            fds_total++;
+            // MODE BEFORE FAMILY, and the order is the whole correctness of
+            // this. A pipe is created with adhoc_fd_create(&realfs_fdops)
+            // (fs/pipe.c) and so reports the realfs family -- classifying by
+            // family first counted every pipe as "re-open the path and seek",
+            // which is exactly wrong twice over: a pipe has no path, and the
+            // bytes sitting in it are lost. Measured before the fix: a probe
+            // holding one byte in a pipe reported 89% of descriptors easy, and
+            // the pipe was one of the ones counted easy.
+            const char *family;
+            if (S_ISFIFO(fd->type)) {
+                pipes++;
+                family = "pipe/fifo";
+            } else if (S_ISSOCK(fd->type)) {
+                family = "socket";
+            } else if (S_ISCHR(fd->type)) {
+                ttys++;
+                family = "chardev";
+            } else if (fd->ops != NULL && fd->ops->name != NULL) {
+                family = fd->ops->name;
+            } else {
+                unnamed++;
+                family = "(unnamed fd_ops)";
+            }
+            unsigned k = 0;
+            for (; k < fam_count; k++)
+                if (strcmp(fams[k].name, family) == 0)
+                    break;
+            if (k == fam_count) {
+                if (fam_count >= CKPT_MAX_FAMILIES)
+                    continue;
+                fams[fam_count].name = family;
+                fams[fam_count].count = 0;
+                fam_count++;
+            }
+            fams[k].count++;
+        }
+        unlock(&files->lock);
+        fdtable_release(files);
+    }
+    task_snapshot_release(&snapshot);
+
+    proc_printf(buf, "what a checkpoint of this guest would have to carry\n");
+    proc_printf(buf, "(phase 0 of suspend-to-disk: a measurement, not a feature)\n\n");
+    proc_printf(buf, "processes with an fd table   %u\n", tasks);
+    proc_printf(buf, "open descriptors             %u\n\n", fds_total);
+
+    unsigned easy = 0;
+    proc_printf(buf, "by family:\n");
+    for (unsigned k = 0; k < fam_count; k++) {
+        enum ckpt_verdict v = ckpt_verdict_for(fams[k].name);
+        // pipe/fifo and chardev are named by mode, not by fd_ops.
+        if (strcmp(fams[k].name, "pipe/fifo") == 0)
+            v = CKPT_LOSSY;
+        else if (strcmp(fams[k].name, "chardev") == 0)
+            v = CKPT_REBUILD;
+        if (v == CKPT_REOPEN || v == CKPT_MEMORY || v == CKPT_RESTATE)
+            easy += fams[k].count;
+        proc_printf(buf, "  %-18s %5u   %s\n",
+                    fams[k].name, fams[k].count, ckpt_verdict_text(v));
+    }
+    if (unnamed > 0)
+        proc_printf(buf, "  (%u fd(s) whose fd_ops carries no name -- a family was "
+                    "added without one)\n", unnamed);
+
+    proc_printf(buf, "\nthe number phase 0 exists to produce:\n");
+    if (fds_total > 0) {
+        proc_printf(buf, "  %u of %u descriptors (%u%%) need only a path, their own "
+                    "state, or memory that is being saved anyway\n",
+                    easy, fds_total, easy * 100 / fds_total);
+        proc_printf(buf, "  Treat that as an UPPER BOUND: an unlinked file still counts\n"
+                    "  as re-openable here, and it is not -- there is no path left to\n"
+                    "  re-open. Distinguishing one needs an fstat per descriptor, which\n"
+                    "  this read does not do.\n");
+    } else {
+        proc_printf(buf, "  no descriptors open\n");
+    }
+
+    proc_printf(buf, "\nwhat would refuse a checkpoint right now:\n");
+    proc_printf(buf, "  native programs on a task stack   %u\n", native_on_stack);
+    if (native_on_stack == 0) {
+        proc_printf(buf, "  nothing -- every task is running guest code, whose whole\n"
+                    "  state is AOK's own and can simply be written out\n");
+        return 0;
+    }
+    for (unsigned k = 0; k < native_named; k++)
+        proc_printf(buf, "    %s\n", native_names[k]);
+    proc_printf(buf,
+        "\n  A native program is host code on a host C stack, so there is no\n"
+        "  guest PC to resume from -- stopping the scheduler does not reach it.\n"
+        "  The rule is that a native program either describes its own state and\n"
+        "  re-launches, or the checkpoint refuses while it is running.\n");
+    if (native_can_dump > 0)
+        proc_printf(buf,
+            "\n  %u can describe itself (zsh: deps/zsh/Src/aok_fork.c). At a prompt\n"
+            "  that is a quiet point -- the C stack holds only \"waiting for input\"\n"
+            "  and everything else is already dumpable. Mid-command it is not.\n",
+            native_can_dump);
+    if (native_cannot > 0)
+        proc_printf(buf,
+            "\n  %u cannot, and will not be taught to. bash is GPLv3, so an App\n"
+            "  Store build cannot contain it; it is being removed in 556\n"
+            "  (docs/shell_transition_plan.md). This is a refusal, not a wait.\n",
+            native_cannot);
+    return 0;
+}
+
 static int proc_ish_show_zswap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct zswap_stats z;
     zswap_get_stats(&z);
@@ -1522,6 +1760,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
     {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
     {"mem_compress", S_IFREG | 0644, .show = proc_ish_show_mem_compress, .update = proc_ish_update_mem_compress},
+    {"checkpoint", .show = proc_ish_show_checkpoint},
     {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},

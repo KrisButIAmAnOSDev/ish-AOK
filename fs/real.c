@@ -1364,6 +1364,7 @@ const struct fs_ops realfs = {
 };
 
 const struct fd_ops realfs_fdops = {
+    .name = "realfs",
     .read = realfs_read,
     .write = realfs_write,
     .pread = realfs_pread,

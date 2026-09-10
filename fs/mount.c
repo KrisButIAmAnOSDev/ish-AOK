@@ -953,6 +953,7 @@ static int fscontext_close(struct fd *fd) {
 }
 
 static struct fd_ops fscontext_ops = {
+    .name = "fscontext",
     .anon_inode_class = "[fscontext]",
     .close = fscontext_close,
 };

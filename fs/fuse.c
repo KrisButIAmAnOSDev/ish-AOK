@@ -1956,6 +1956,7 @@ static int fusefs_getpath(struct fd *fd, char *buf) {
 int fuse_fd_msync_writeback(struct fd *fd);
 
 static const struct fd_ops fusefs_fd_ops = {
+    .name = "fuse",
     .read = fusefs_fd_read,
     .write = fusefs_fd_write,
     .pread = fusefs_fd_pread,
