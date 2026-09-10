@@ -1,0 +1,40 @@
+# Which /AOK/docs page becomes which GitHub wiki page.
+#
+# tools/sync-wiki.py publishes opt/AOK/docs/<source> to the ish-AOK wiki as
+# <Page>.md, and rewrites the docs' relative links (roots.md and friends) into
+# wiki page names using this table. A doc that is not listed here is NOT
+# published -- which is how docs/book/ stays out, since it is a separate tree
+# with its own manifest (fs/aok-book.manifest).
+#
+# Page names are deliberately spelled out rather than derived. The H1 of each
+# doc is a sentence -- "ktop: an htop-style process viewer that understands
+# multiple guest architectures" -- and no rule that produces a good page name
+# from that also produces "/AOK" from "/AOK: what it is and how it's built".
+#
+# Format: <source file>  <Wiki-Page-Name>
+# Wiki page names use hyphens for spaces; that is GitHub's own convention and
+# it is what the existing Crypto-Acceleration page already uses.
+
+00-overview.md                 Overview
+benchmarks.md                  Benchmarks
+binfmt-misc.md                 binfmt_misc
+crypto-accel.md                Crypto-Acceleration
+file-browser.md                File-Browser
+files-app-integration.md       Files-App-Integration
+fuse.md                        FUSE
+ktop.md                        ktop
+llm-chat.md                    LLM-Chat
+md.md                          md
+motepad.md                     motepad
+native-programs.md             Native-Programs
+native-setup.md                Native-Setup
+networking.md                  Networking
+persist.md                     Persist
+proc-ish.md                    proc-ish
+riscv64-vendor-extensions.md   RISC-V-Vendor-Extensions
+roots.md                       Roots
+shortcuts.md                   Shortcuts
+swap.md                        Swap
+themes.md                      Themes
+tuning-knobs.md                Tuning-Knobs
+workspace.md                   Workspace
