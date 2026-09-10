@@ -856,11 +856,23 @@ out:
 
 // ------------------------------------------------------------ the trigger
 
-void checkpoint_request(const char *host_path) {
+int checkpoint_request(const char *host_path) {
+    // Refuse NOW for anything that would stop the deferred save from
+    // happening at all -- see the note in checkpoint.h.
+    int err = ckpt_check_scope();
+    if (err < 0) {
+        lock(&ckpt_lock, 0);
+        ckpt_status.last_err = err;
+        unlock(&ckpt_lock);
+        return err;
+    }
     lock(&ckpt_lock, 0);
     snprintf(ckpt_pending_path, sizeof(ckpt_pending_path), "%s", host_path);
     ckpt_pending = true;
+    ckpt_status.last_err = 0;
+    ckpt_status.last_refusal[0] = '\0';
     unlock(&ckpt_lock);
+    return 0;
 }
 
 void checkpoint_run_pending(void) {

@@ -437,8 +437,10 @@ static int proc_ish_update_checkpoint(struct proc_entry *UNUSED(entry),
     if (!checkpoint_guest_control_allowed())
         return _EPERM;
 
-    checkpoint_request(path);
-    return 0;
+    // The error reaches the guest as the write's own return value, so a
+    // script sees `echo save ... > /proc/ish/checkpoint` fail rather than
+    // having to go and read the file back to find out.
+    return checkpoint_request(path);
 }
 
 static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct proc_data *buf) {

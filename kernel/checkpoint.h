@@ -27,7 +27,15 @@ int checkpoint_restore(const char *host_path);
 // Requested by a write to /proc/ish/checkpoint; performed at the next loop top.
 // Consumed by checkpoint_run_pending, which is the only caller of
 // checkpoint_save.
-void checkpoint_request(const char *host_path);
+//
+// Returns 0 if the request was taken, or a guest _E* code if this guest cannot
+// be checkpointed at all. The check is here as WELL as in checkpoint_save
+// because some refusals mean the deferred save would never run: a native
+// program is dispatched by native_exec_run_pending and never comes back to
+// task_run_current's loop, so a request made from one would simply sit there
+// -- an image that never appears and no error anywhere, which is worse than
+// either outcome.
+int checkpoint_request(const char *host_path);
 void checkpoint_run_pending(void);
 
 // What /proc/ish/checkpoint reports. `restored` is how a guest program tells
