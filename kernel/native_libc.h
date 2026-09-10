@@ -343,6 +343,7 @@ struct timespec;
 int nlibc_ppoll(void *fds, unsigned nfds, const struct timespec *timeout);
 int nlibc_select(int nfds, void *r, void *w, void *e, void *timeout);
 int nlibc_fork(void);
+int nlibc_vfork(void);
 int nlibc_execl(const char *path, const char *arg0, ...);
 /* execl's PATH-searching twin. execv, execvp, execl and execve were all routed
  * and this one was not -- the single form that BOTH takes varargs and walks
@@ -857,6 +858,7 @@ const char *nlibc_dlerror(void);
 #define kevent(a, b, c, d, e, f) nlibc_kevent((a), (b), (c), (d), (e), (f))
 #define select      nlibc_select
 #define fork        nlibc_fork
+#define vfork       nlibc_vfork
 #define execl       nlibc_execl
 #define execlp      nlibc_execlp
 #define chroot      nlibc_chroot

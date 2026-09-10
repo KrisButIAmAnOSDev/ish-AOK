@@ -2105,6 +2105,21 @@ int nlibc_statfs(const char *path, void *buf) {
 // function with no image to execute. nlibc_execv's spawn-then-exit is the
 // shape that does work (see the process section above).
 int nlibc_fork(void)                        { return nlibc_fail(_ENOSYS); } // init, runit, micro
+// vfork MUST be refused here rather than left to reach the host, and the
+// difference between the two is not academic. An unredirected vfork() forks the
+// EMULATOR: measured with native dash, `dash -c '/bin/echo first; /bin/echo
+// second'` printed only "second" and left three ish processes behind, because
+// dash's vforkexec path called Darwin's vfork and the child was a second copy
+// of the whole app running shell code -- which is what vfork forbids even
+// between ordinary processes.
+//
+// It was invisible because it half-worked: an external command that is the LAST
+// thing a shell does goes through shellexec/execve instead, which the spawn
+// path handles correctly, so simple cases looked fine.
+//
+// Any native program that calls vfork has the same hazard, so this belongs in
+// the shim rather than in a patch to one of them.
+int nlibc_vfork(void)                       { return nlibc_fail(_ENOSYS); } // dash's vforkexec
 int nlibc_glob(const char *p, int f, void *e, void *g) { (void) p; (void) f; (void) e; (void) g; return nlibc_fail(_ENOSYS); } // shell globbing
 
 // Darwin and Linux number their ioctls differently, so the request has to be
