@@ -171,3 +171,31 @@ not the usual one-command path.
    project's vendoring rule), built without `mksignames.c`, installed as both
    `dash` and `sh`.
 4. 555 release notes: announce the 556 removal.
+5. **556: `/AOK/native/bash` becomes a symlink to `/bin/bash`.** Maintainer's
+   call, 2026-09-10. Removing the native binary leaves the PATH dangling for
+   everything that is not a login shell -- a script with
+   `#!/AOK/native/bash`, an exported `SHELL`, a Makefile, muscle memory -- and
+   decision 3 above only rewrites `/etc/passwd`. A symlink turns every one of
+   those into the guest's own bash instead of a "not found".
+
+   Already established, so nobody re-derives it:
+
+   - **aokfs serves symlinks already.** `fs/aok.c` has the machinery for
+     `/AOK/fixes/debian` -> `devuan`: `aokfs_node_is_symlink`,
+     `aokfs_symlink_target`, `S_IFLNK | 0777` in `aokfs_node_mode`, and
+     `aokfs_readlink` wired into the mount ops. The change is a node kind, one
+     `case` in the target switch, and dropping the node from
+     `aokfs_node_is_native` -- because the point of 556 is that the interpreter
+     is no longer compiled in.
+   - **`/bin/bash` is the right target on all three roots.** Devuan and Alpine's
+     `bash` package both install it there, and Arch has `/bin` -> `usr/bin`.
+   - **It may dangle, and that is acceptable.** A root with no bash installed
+     gives ENOENT, which is what the path gives today after removal anyway. The
+     login-shell case does not rely on it: `convert_native_bash_shells` in
+     `native-links.sh` already rewrites `/etc/passwd` and falls back to
+     `/bin/sh` when there is no guest bash.
+   - **Check it is not still dispatched.** `kernel/native.c` resolves
+     `/AOK/native/*` before the filesystem answers; the symlink is only reached
+     if the bash entry is gone from the native program table. That is the same
+     removal 556 is doing, so it is one change, not two -- but it is the thing
+     to verify rather than assume (see `syscall-table-entry-not-reachable`).
