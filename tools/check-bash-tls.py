@@ -38,13 +38,15 @@ ALLOW = import_module("bash-tls-fix-externs").ALLOW
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ARCHIVES = [os.path.join(REPO, "build", "libbash.a"),
                     os.path.join(REPO, "build", "libzsh.a"),
+                    os.path.join(REPO, "build", "libdash.a"),
                     os.path.join(REPO, "build", "libish.a")]
 
 # Archives of vendored native programs -- the ones where "mutable and shared
 # between threads" is a bug rather than a design choice, so the whole-class
 # question in shared_mutable() applies. Anything not listed here gets only the
 # mismatch checks.
-VENDORED_NATIVE = ("libbash.a", "libzsh.a", "libsmallclue.a", "libopenssh.a",
+VENDORED_NATIVE = ("libbash.a", "libzsh.a", "libdash.a", "libsmallclue.a",
+                   "libopenssh.a",
                    "libopenssh_scp.a", "libopenssh_stubs.a",
                    "libopenssh_smult_curve25519_ref.a")
 

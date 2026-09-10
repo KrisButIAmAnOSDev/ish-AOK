@@ -1667,6 +1667,19 @@ if have_dash
         '-Dhashcmd=dash_hashcmd',            # zsh:  Src/exec.c
         '-Ddotrap=dash_dotrap',              # zsh:  Src/signals.c
         '-Dxasprintf=dash_xasprintf',        # OpenSSH: xmalloc.c
+        # AND THREE THE LINKER ONLY REPORTED ONCE dash's GLOBALS WENT
+        # __thread. Before that conversion these were TENTATIVE definitions
+        # (`int shlvl;` with no initialiser, which clang emits as a common
+        # symbol), and a common symbol does not collide -- it MERGES with a
+        # real definition of the same name. So dash's $SHLVL and zsh's were one
+        # variable, dash's parser line counter and zsh's were one variable, and
+        # dash's arithmetic yylval and bash's were one variable, in a build
+        # that linked without a word. A __thread definition is a real
+        # definition, so all three became hard errors the moment the conversion
+        # landed. Renamed rather than reasoned about:
+        '-Dshlvl=dash_shlvl',                # zsh:  Src/params.c
+        '-Dlineno=dash_lineno',              # zsh:  Src/params.c
+        '-Dyylval=dash_yylval',              # bash: y.tab.c
         # AND ONE THE LINKER DID NOT REPORT, which is the dangerous kind.
         # bash also defines signal_names (deps/bash/trap.c). Both are DATA
         # symbols, and duplicate data merges silently where duplicate text is a
