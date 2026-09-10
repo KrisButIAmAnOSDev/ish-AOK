@@ -1813,6 +1813,13 @@ static NSString *const ISHWorkspaceGaugeStyleDidChangeNotification = @"ISHWorksp
 static NSString *const ISHWorkspaceToolThemeAuroraIdentifier = @"aurora";
 static NSString *const ISHWorkspaceToolThemeSolsticeIdentifier = @"solstice";
 static NSString *const ISHWorkspaceToolThemeGraphiteIdentifier = @"graphite";
+// The theme a workspace uses when nobody has chosen one.
+//
+// Graphite rather than Aurora since 555: Aurora's light background under the
+// launcher applet's own text did not carry enough contrast to read, and it is
+// the one surface a new user meets first. A theme that has been CHOSEN is
+// stored and is never touched by this; only "no preference yet" resolves here.
+static NSString *const ISHWorkspaceToolThemeDefaultIdentifier = ISHWorkspaceToolThemeGraphiteIdentifier;
 static BOOL ISHWorkspaceLowMemoryWarningShownThisLaunch = NO;
 static const uint64_t ISHWorkspaceOneGB = 1000ull * 1000ull * 1000ull;
 
@@ -2052,10 +2059,11 @@ static NSArray<NSString *> *ISHWorkspaceThemeEditableColorKeys(void) {
 }
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *ISHWorkspaceBuiltInThemeChoices(void) {
+    // The default first, which is the order a picker should offer them in.
     return @[
+        @{@"identifier": ISHWorkspaceToolThemeGraphiteIdentifier, @"title": @"Graphite"},
         @{@"identifier": ISHWorkspaceToolThemeAuroraIdentifier, @"title": @"Aurora"},
         @{@"identifier": ISHWorkspaceToolThemeSolsticeIdentifier, @"title": @"Solstice"},
-        @{@"identifier": ISHWorkspaceToolThemeGraphiteIdentifier, @"title": @"Graphite"},
     ];
 }
 
@@ -2136,20 +2144,20 @@ static BOOL ISHWorkspaceThemeIdentifierIsValid(NSString *identifier) {
 static NSString *ISHWorkspaceCurrentThemeIdentifier(void) {
     NSString *identifier = [NSUserDefaults.standardUserDefaults stringForKey:ISHWorkspaceToolThemePreferenceKey];
     if (!ISHWorkspaceThemeIdentifierIsValid(identifier))
-        return ISHWorkspaceToolThemeAuroraIdentifier;
+        return ISHWorkspaceToolThemeDefaultIdentifier;
     return identifier;
 }
 
 static NSString *ISHWorkspaceCurrentThemeTitle(void) {
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(ISHWorkspaceCurrentThemeIdentifier());
-    return record[@"title"] ?: @"Aurora";
+    return record[@"title"] ?: @"Graphite";
 }
 
 static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *ISHWorkspaceThemeEditablePaletteForIdentifier(NSString *identifier) {
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(identifier);
     NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *palette = record[@"palette"];
     if (![palette isKindOfClass:NSDictionary.class])
-        return ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeAuroraIdentifier);
+        return ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeDefaultIdentifier);
     return palette;
 }
 
@@ -2466,7 +2474,7 @@ static void ISHWorkspaceDeleteCustomThemeRecord(NSString *identifier) {
     [records removeObjectsAtIndexes:indexes];
     [NSUserDefaults.standardUserDefaults setObject:records forKey:ISHWorkspaceCustomThemesDefaultsKey];
     if ([[NSUserDefaults.standardUserDefaults stringForKey:ISHWorkspaceToolThemePreferenceKey] isEqualToString:identifier]) {
-        [NSUserDefaults.standardUserDefaults setObject:ISHWorkspaceToolThemeAuroraIdentifier
+        [NSUserDefaults.standardUserDefaults setObject:ISHWorkspaceToolThemeDefaultIdentifier
                                                 forKey:ISHWorkspaceToolThemePreferenceKey];
     }
     [NSNotificationCenter.defaultCenter postNotificationName:ISHWorkspaceToolThemeDidChangeNotification object:nil];
@@ -6798,7 +6806,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     for (NSString *key in ISHWorkspaceThemeEditableColorKeys()) {
         NSDictionary<NSString *, NSNumber *> *descriptor = palette[key];
         if (![descriptor isKindOfClass:NSDictionary.class]) {
-            descriptor = ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeAuroraIdentifier)[key];
+            descriptor = ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeDefaultIdentifier)[key];
         }
         if (descriptor != nil)
             palette[key] = [descriptor copy];
@@ -7137,7 +7145,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                               style:UIAlertActionStyleDestructive
                                             handler:^(__unused UIAlertAction *action) {
         ISHWorkspaceDeleteCustomThemeRecord(self->_editingThemeIdentifier);
-        ISHWorkspaceSetCurrentThemeIdentifier(ISHWorkspaceToolThemeAuroraIdentifier);
+        ISHWorkspaceSetCurrentThemeIdentifier(ISHWorkspaceToolThemeDefaultIdentifier);
         [self loadThemeIntoEditorWithIdentifier:ISHWorkspaceCurrentThemeIdentifier()];
         [self refreshThemeSelectionButtons];
     }]];
