@@ -3036,6 +3036,37 @@ static TerminalViewController *CreateTerminalViewController(void) {
             int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
             [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
             if (rerr >= 0) {
+                // The machine services a resume needs as much as a boot does.
+                // Neither is part of the boot COMMAND -- they are the pager and
+                // the jetsam early-warning, and a resumed guest runs on the same
+                // device under the same pressure as a booted one. Only the swap
+                // AREA is fresh: the image carries every guest page, because
+                // walking the page tables faults them all back in first.
+                host_mem_pressure_start();
+                swap_startup();
+                // And init itself. checkpoint_restore starts every task in the
+                // image EXCEPT the first, because the first IS `current` and
+                // the entry point decides how to run it -- the CLI runs it on
+                // the thread it is already on (main.c's task_run_current), and
+                // the app gives it a thread, exactly as the boot path below
+                // does after do_execve. Without this, pid 1 came back with no
+                // thread at all: it reaped nothing, respawned nothing, and
+                // could not be frozen, so the FIRST save after a resume refused
+                // with "pid 1 (init) did not reach a syscall boundary".
+                if (task_start(current) < 0) {
+                    os_log_error(ISHSuspendLog(),
+                                 "resumed, but could not give init a thread");
+                    [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume.initThreadFailed"];
+                    return RecordBootFailure(_EAGAIN,
+                                             @"boot.suspend.resume.initThreadFailed",
+                                             @"Resume failed while starting init",
+                                             @"The suspended session was restored, but iSH-AOK could not create a thread to run it.",
+                                             @"Close other apps to free memory, then restart iSH-AOK.",
+                                             @{@"root": defaultRoot});
+                }
+                // This thread is not that process; see the same note in
+                // TerminalViewController's startSession.
+                current = NULL;
                 os_log(ISHSuspendLog(), "resumed a suspended session");
                 [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
                                                details:@{@"root": defaultRoot}];
