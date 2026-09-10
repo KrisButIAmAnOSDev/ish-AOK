@@ -8,6 +8,13 @@
 static struct mount adhoc_mount;
 static unsigned adhoc_inode_seq;
 
+// One more from the same sequence, for a caller that needs two fds to SHARE an
+// inode -- fs/pipe.c, where both ends of a pipe are one object to everything
+// that reads /proc/<pid>/fd.
+qword_t adhoc_next_inode(void) {
+    return __atomic_add_fetch(&adhoc_inode_seq, 1, __ATOMIC_RELAXED);
+}
+
 struct fd *adhoc_fd_create(const struct fd_ops *ops) {
     struct fd *fd = fd_create(ops);
     if (fd == NULL)

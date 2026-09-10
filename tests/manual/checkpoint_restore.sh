@@ -158,6 +158,41 @@ case $mp_back in
     *) echo "FAIL: the child did not survive the restore"; echo "  got: $mp_back"; exit 1;;
 esac
 
+# ---- a pipeline, with bytes still in the pipe ------------------------------
+#
+# The producer writes three lines and exits; the consumer reads one and then
+# suspends, leaving two lines sitting in the pipe. A pipe cannot be restored --
+# it is a HOST pipe belonging to a process that is about to end -- so what
+# travels is the pairing, the direction and the bytes in flight, and the
+# restore builds a new pipe holding them.
+#
+# It is also the test for descriptor IDENTITY: both processes hold the same
+# struct fd, and the image describes it once and references it from the other.
+# Without that they would come back as two objects with two positions.
+rm -f "$IMG"
+pipe_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c '
+/bin/printf "PIPE-DATA-1\nPIPE-DATA-2\nPIPE-DATA-3\n" | {
+    read -r a; echo "launch1 read: $a"
+    echo suspend > /proc/ish/checkpoint
+    read -r b; echo "launch2 read: $b"
+    read -r c; echo "launch2 read: $c"
+}' 2>&1)
+echo "$pipe_out" | sed 's/^/  pipe    | /'
+case $pipe_out in
+    *"launch1 read: PIPE-DATA-1"*) ;;
+    *) echo "FAIL: the pipeline did not run"; exit 1;;
+esac
+case $pipe_out in
+    *"launch2"*) echo "FAIL: the suspending guest kept running"; exit 1;;
+esac
+
+pipe_back=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c 'x' 2>&1)
+echo "$pipe_back" | sed 's/^/  pipe    | /'
+case $pipe_back in
+    *"launch2 read: PIPE-DATA-2"*"launch2 read: PIPE-DATA-3"*) ;;
+    *) echo "FAIL: the bytes in the pipe did not survive"; echo "  got: $pipe_back"; exit 1;;
+esac
+
 # ---- and the refusals ------------------------------------------------------
 #
 # A capability boundary that never fires is not a boundary, it is a comment.
@@ -176,9 +211,5 @@ READ_REFUSAL='while read -r l; do case $l in last_refusal*) echo "$l";; esac; do
 refuse "a native program on the stack" /AOK/native/dash \
     "echo save $IMG > /proc/ish/checkpoint 2>/dev/null; $READ_REFUSAL" \
     "is a native program"
-refuse "a pipe with no restore rule" $SH \
-    "mkfifo /tmp/ckpt-fifo 2>/dev/null; exec 4<> /tmp/ckpt-fifo
-     echo save $IMG > /proc/ish/checkpoint; $READ_REFUSAL" \
-    "is a pipe"
 
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"

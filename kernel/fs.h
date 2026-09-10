@@ -356,6 +356,14 @@ struct mount *find_mount_and_trim_path_flags(char *path, int *mount_flags);
 
 // adhoc fs
 struct fd *adhoc_fd_create(const struct fd_ops *ops);
+// The next adhoc inode, for two fds that must SHARE one -- fs/pipe.c, where
+// both ends of a pipe are one object to everything that reads /proc/<pid>/fd,
+// and the only thing that tells kernel/checkpoint.c they are a pair.
+qword_t adhoc_next_inode(void);
+// Both ends of a fresh pipe, uninstalled, sharing `shared_inode`. For
+// kernel/checkpoint.c -- see the definition in fs/pipe.c.
+int pipe_create_pair(struct fd **read_end, struct fd **write_end,
+        qword_t shared_inode);
 // this is for the "wtf is apple smoking" section
 bool is_adhoc_fd(struct fd *fd);
 

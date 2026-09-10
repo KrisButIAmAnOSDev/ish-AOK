@@ -63,6 +63,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "kernel/calls.h"
@@ -102,6 +103,8 @@ enum ckpt_fd_kind {
     CKPT_FD_TTY,          // the console: re-attach to this run's tty
     CKPT_FD_STDIO,        // 0/1/2 as the app handed them over: re-attach too
     CKPT_FD_CHR,          // /dev/null and friends: re-open the device by path
+    CKPT_FD_PIPE,         // one end of a pipe, with whatever is still in it
+    CKPT_FD_REF,          // the SAME struct fd as one already described
 };
 
 // ISH_CHECKPOINT_DEBUG=1 traces every record on the way out and on the way
@@ -122,6 +125,8 @@ static const char *ckpt_kind_name(uint32_t kind) {
         case CKPT_FD_DIR: return "dir";
         case CKPT_FD_TTY: return "tty";
         case CKPT_FD_CHR: return "chr";
+        case CKPT_FD_PIPE: return "pipe";
+        case CKPT_FD_REF: return "ref";
         case CKPT_FD_STDIO: return "stdio";
         default: return "?";
     }
@@ -194,6 +199,22 @@ struct ckpt_fd {
     uint32_t kind;
     uint64_t offset;
     uint32_t path_len;
+    // WHICH struct fd this is, not just which number it sits at.
+    //
+    // Two descriptors that are the same object have to come back as the same
+    // object: a shell and the child it forked share one struct fd for a
+    // redirected file, and giving each its own on restore gives them
+    // independent offsets -- the child's reads stop advancing the parent's
+    // position, which is the bug `while read; done < file | ...` is made of.
+    // The first record for an id describes it; every later one is a
+    // CKPT_FD_REF naming it.
+    uint32_t id;
+    // CKPT_FD_PIPE: the inode both ends share (fs/pipe.c), so a pair held by
+    // two different processes is rebuilt as ONE host pipe; and which end this
+    // is. `offset` carries the number of bytes that were still in it, which
+    // follow the record for a read end.
+    uint64_t pipe_inode;
+    uint32_t pipe_write_end;
     uint32_t reserved;
 };
 
@@ -428,6 +449,42 @@ static int ckpt_check_scope(void) {
     return err;
 }
 
+// What is still in a pipe, taken out and PUT BACK.
+//
+// A checkpoint is a copy: the guest carries on afterwards and must not notice,
+// so bytes read out here are written straight back in. Safe only because the
+// machine is frozen -- nobody else is at either end -- and bounded by the pipe
+// buffer, so the write can never block on a pipe we have just emptied.
+//
+// FIONREAD first rather than reading until EAGAIN: it says exactly how much is
+// there, so there is no need to make the descriptor non-blocking and no window
+// in which it is.
+static int ckpt_pipe_drain(struct fd *fd, char **out, uint64_t *len) {
+    *out = NULL;
+    *len = 0;
+    int avail = 0;
+    if (ioctl(fd->real_fd, FIONREAD, &avail) < 0 || avail <= 0)
+        return 0;
+    char *buf = malloc((size_t) avail);
+    if (buf == NULL)
+        return _ENOMEM;
+    ssize_t got = read(fd->real_fd, buf, (size_t) avail);
+    if (got <= 0) {
+        free(buf);
+        return 0;
+    }
+    ssize_t put = write(fd->real_fd, buf, (size_t) got);
+    if (put != got) {
+        // Cannot happen on a pipe we have just emptied, and if it somehow does
+        // the guest has lost data -- say so rather than carry on quietly.
+        printk("checkpoint: pipe %llu lost %zd bytes putting them back\n",
+               (unsigned long long) fd->stat.inode, got - (put < 0 ? 0 : put));
+    }
+    *out = buf;
+    *len = (uint64_t) got;
+    return 0;
+}
+
 // One descriptor, gathered under files->lock and described afterwards.
 struct ckpt_saved_fd {
     struct fd *fd;
@@ -435,8 +492,43 @@ struct ckpt_saved_fd {
     unsigned cloexec;
     int kind;
     uint64_t offset;
+    uint32_t id;
+    bool first;              // this record describes the object, not a ref to it
+    char *pipe_bytes;        // CKPT_FD_PIPE read end: what was still in it
+    uint64_t pipe_len;
     char path[MAX_PATH + 1];
 };
+
+// Every distinct struct fd in the image, in the order first seen. The index is
+// the id a record carries; a second sighting of the same pointer -- in this
+// process or another -- becomes a CKPT_FD_REF to it.
+struct ckpt_fd_ids {
+    struct fd **fds;
+    uint32_t count, cap;
+};
+
+// Returns the id, and sets *first to whether this is the first sighting.
+static uint32_t ckpt_fd_id(struct ckpt_fd_ids *ids, struct fd *fd, bool *first) {
+    for (uint32_t i = 0; i < ids->count; i++) {
+        if (ids->fds[i] == fd) {
+            *first = false;
+            return i;
+        }
+    }
+    if (ids->count == ids->cap) {
+        uint32_t cap = ids->cap ? ids->cap * 2 : 32;
+        struct fd **f = realloc(ids->fds, cap * sizeof(*f));
+        if (f == NULL) {
+            *first = true;
+            return UINT32_MAX;   // caller treats it as "describe it again"
+        }
+        ids->fds = f;
+        ids->cap = cap;
+    }
+    ids->fds[ids->count] = fd;
+    *first = true;
+    return ids->count++;
+}
 
 // Where a descriptor is positioned, asked rather than read off struct fd.
 //
@@ -493,9 +585,15 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
     // which is the opposite of what putting it on /dev/null was for.
     if (S_ISCHR(fd->type) && generic_getpath(fd, path) >= 0 && path[0] == '/')
         return CKPT_FD_CHR;
+    // A pipe. AOK's pipes are HOST pipes with a struct fd over each end
+    // (fs/pipe.c), so what has to travel is the pairing, the direction and
+    // whatever bytes are still in flight -- not the object, which cannot
+    // outlive the process that owns it.
+    if (S_ISFIFO(fd->type) && fd->real_fd >= 0 && fd->stat.inode != 0)
+        return CKPT_FD_PIPE;
     if (!S_ISREG(fd->type) && !S_ISDIR(fd->type)) {
         ckpt_refuse("fd %d is a %s on %s with no restore rule",
-                    num, S_ISFIFO(fd->type) ? "pipe" :
+                    num, S_ISFIFO(fd->type) ? "named pipe" :
                          S_ISSOCK(fd->type) ? "socket" : "special file",
                     family);
         return 0;
@@ -596,7 +694,7 @@ static int ckpt_emit_map(void *vctx, page_t start, pages_t pages, unsigned flags
 // task. Safe because every other task is frozen; unsafe the moment that stops
 // being true.
 static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
-        uint32_t *stdio_is_tty, uint64_t *pages_out) {
+        uint32_t *stdio_is_tty, uint64_t *pages_out, struct ckpt_fd_ids *ids) {
     struct task *saved_current = current;
     current = task;
     int ret = 0;
@@ -651,6 +749,13 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
 
     for (unsigned i = 0; i < nfds; i++) {
         struct ckpt_saved_fd *s = &saved[i];
+        s->id = ckpt_fd_id(ids, s->fd, &s->first);
+        if (!s->first) {
+            // Already described, here or in another process. What matters is
+            // that it comes back as the SAME object.
+            s->kind = CKPT_FD_REF;
+            continue;
+        }
         s->kind = ckpt_classify_fd((int) s->num, s->fd, s->path, sizeof(s->path));
         if (s->kind == 0) {
             ret = _EOPNOTSUPP;
@@ -658,6 +763,14 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         }
         s->offset = s->kind == CKPT_FD_STDIO ? (uint64_t) s->fd->real_fd
                                              : ckpt_fd_offset(s->fd);
+        if (s->kind == CKPT_FD_PIPE) {
+            // Only the READ end carries the contents: the bytes are in the
+            // pipe once, and taking them from both ends would double them.
+            if (!(s->fd->flags & O_WRONLY_) &&
+                    (ret = ckpt_pipe_drain(s->fd, &s->pipe_bytes, &s->pipe_len)) < 0)
+                goto out;
+            s->offset = s->pipe_len;
+        }
         if (s->num <= 2 && s->kind == CKPT_FD_TTY)
             *stdio_is_tty = 1;
     }
@@ -745,22 +858,30 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
             .kind = (uint32_t) s->kind,
             // For a standard stream the offset is meaningless and the host
             // descriptor it mirrors is what matters, so the field carries
-            // that instead. A pipe has no offset to lose.
+            // that instead; for a pipe it is how many bytes follow.
             .offset = s->offset,
             .path_len = (uint32_t) strlen(s->path),
+            .id = s->id,
+            .pipe_inode = s->kind == CKPT_FD_PIPE ? s->fd->stat.inode : 0,
+            .pipe_write_end = s->kind == CKPT_FD_PIPE &&
+                    (s->fd->flags & O_WRONLY_) ? 1 : 0,
         };
-        CKPT_TRACE("  save fd %u %-5s real_fd %d flags %#x off %llu %s\n",
-                   cf.fd, ckpt_kind_name(cf.kind), s->fd->real_fd, cf.flags,
-                   (unsigned long long) cf.offset, s->path);
+        CKPT_TRACE("  save fd %u %-5s id %u real_fd %d flags %#x off %llu %s\n",
+                   cf.fd, ckpt_kind_name(cf.kind), cf.id, s->fd->real_fd,
+                   cf.flags, (unsigned long long) cf.offset, s->path);
         wr(w, &cf, sizeof(cf));
         wr(w, s->path, cf.path_len);
+        if (s->pipe_len != 0)
+            wr(w, s->pipe_bytes, s->pipe_len);
     }
     ret = w->err;
 
 out:
     if (saved != NULL) {
-        for (unsigned i = 0; i < nfds; i++)
+        for (unsigned i = 0; i < nfds; i++) {
             fd_close(saved[i].fd);
+            free(saved[i].pipe_bytes);
+        }
         free(saved);
     }
     current = saved_current;
@@ -860,11 +981,13 @@ int checkpoint_save(const char *host_path) {
     wr(&w, &h, sizeof(h));
 
     uint64_t pages = 0;
-    unsigned nfds_total = 0;
-    for (unsigned i = 0; i < snap.count && err == 0; i++) {
-        err = ckpt_save_task(&w, snap.tasks[i], &h.stdio_is_tty, &pages);
-        nfds_total += snap.tasks[i]->files != NULL ? 0 : 0;
-    }
+    // One id space for the whole image, so a descriptor two processes share is
+    // described once and referenced from the other.
+    struct ckpt_fd_ids ids = {0};
+    for (unsigned i = 0; i < snap.count && err == 0; i++)
+        err = ckpt_save_task(&w, snap.tasks[i], &h.stdio_is_tty, &pages, &ids);
+    unsigned nfds_total = ids.count;
+    free(ids.fds);
     task_snapshot_release(&snap);
 
     if (err == 0 && w.err == 0) {
@@ -903,8 +1026,79 @@ int checkpoint_save(const char *host_path) {
 
 // Everything about one task, read back onto `task`, which must already exist
 // and be current.
+// What the restore has built so far, shared by every task in the image.
+struct ckpt_restore_state {
+    struct fd *stdio[3];
+    // id -> the struct fd built for it. A CKPT_FD_REF installs this one again
+    // rather than making a second object, which is what keeps a forked child's
+    // file offset the same object as its parent's.
+    struct fd **by_id;
+    uint32_t id_count, id_cap;
+    // pipe inode -> the two ends built for it, so a pair whose ends are held
+    // by two different processes becomes ONE host pipe.
+    struct { uint64_t inode; struct fd *rd, *wr; } *pipes;
+    uint32_t pipe_count, pipe_cap;
+};
+
+// Record `fd` under `id`, taking a reference of the table's own.
+//
+// The table holding a reference is what makes the ownership rule one sentence:
+// EVERY pointer this structure keeps -- stdio, by_id, both ends of each pipe --
+// is one reference, released once at the end of the restore. Installing a
+// descriptor in a process's table is a separate retain. Getting this wrong the
+// other way round closed the standard streams an extra time each, which shut
+// the app's real stdout and made a restored guest look silently hung.
+static int ckpt_id_put(struct ckpt_restore_state *st, uint32_t id, struct fd *fd) {
+    if (id == UINT32_MAX)
+        return 0;   // the save could not allocate an id; nothing refers to it
+    if (id >= st->id_cap) {
+        uint32_t cap = st->id_cap ? st->id_cap * 2 : 32;
+        while (id >= cap)
+            cap *= 2;
+        struct fd **n = realloc(st->by_id, cap * sizeof(*n));
+        if (n == NULL)
+            return _ENOMEM;
+        memset(n + st->id_cap, 0, (cap - st->id_cap) * sizeof(*n));
+        st->by_id = n;
+        st->id_cap = cap;
+    }
+    if (id >= st->id_count)
+        st->id_count = id + 1;
+    st->by_id[id] = fd_retain(fd);
+    return 0;
+}
+
+// The two ends of the pipe with this inode, created on first sight.
+static int ckpt_pipe_for(struct ckpt_restore_state *st, uint64_t inode,
+        struct fd **out_rd, struct fd **out_wr) {
+    for (uint32_t i = 0; i < st->pipe_count; i++) {
+        if (st->pipes[i].inode == inode) {
+            *out_rd = st->pipes[i].rd;
+            *out_wr = st->pipes[i].wr;
+            return 0;
+        }
+    }
+    int err = pipe_create_pair(out_rd, out_wr, inode);
+    if (err < 0)
+        return err;
+    if (st->pipe_count == st->pipe_cap) {
+        uint32_t cap = st->pipe_cap ? st->pipe_cap * 2 : 8;
+        void *n = realloc(st->pipes, cap * sizeof(*st->pipes));
+        if (n == NULL)
+            return _ENOMEM;
+        st->pipes = n;
+        st->pipe_cap = cap;
+    }
+    st->pipes[st->pipe_count].inode = inode;
+    st->pipes[st->pipe_count].rd = *out_rd;
+    st->pipes[st->pipe_count].wr = *out_wr;
+    st->pipe_count++;
+    return 0;
+}
+
 static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
-        const struct ckpt_task *rec, bool stdio_is_tty, struct fd *shared_stdio[3]) {
+        const struct ckpt_task *rec, bool stdio_is_tty,
+        struct ckpt_restore_state *st) {
     int err;
     char cwd[MAX_PATH + 1] = {0}, root[MAX_PATH + 1] = {0};
     if ((err = rd(f, cwd, rec->cwd_len)) < 0) return err;
@@ -1003,16 +1197,16 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
     // stdout and stderr went with it -- the parent then wrote into a closed
     // descriptor and the session looked hung. A fork shares the struct fd; so
     // does this.
-    if (shared_stdio[0] == NULL) {
+    if (st->stdio[0] == NULL) {
         if (stdio_is_tty)
             create_stdio("/dev/tty1", TTY_CONSOLE_MAJOR, 1);
         else
             create_piped_stdio();
         lock(&files->lock, 0);
         for (unsigned i = 0; i < 3; i++) {
-            shared_stdio[i] = i < files->size ? files->files[i] : NULL;
-            if (shared_stdio[i] != NULL)
-                fd_retain(shared_stdio[i]);   // the restore's own reference
+            st->stdio[i] = i < files->size ? files->files[i] : NULL;
+            if (st->stdio[i] != NULL)
+                fd_retain(st->stdio[i]);   // the restore's own reference
         }
         unlock(&files->lock);
     }
@@ -1021,7 +1215,7 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
     // it, and mirroring fd 10 from a saved pointer afterwards was then a
     // use-after-free that surfaced as `echo: I/O error` in the restored shell
     // rather than as a crash.
-    struct fd **stdio = shared_stdio;
+    struct fd **stdio = st->stdio;
     for (unsigned i = 0; i < 3; i++) {
         if (stdio[i] == NULL)
             continue;
@@ -1039,9 +1233,62 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         if ((err = rd(f, path, cf.path_len)) < 0)
             goto fds_done;
 
-        CKPT_TRACE("  load fd %u %-5s flags %#x off %llu %s\n",
-                   cf.fd, ckpt_kind_name(cf.kind), cf.flags,
+        CKPT_TRACE("  load fd %u %-5s id %u flags %#x off %llu %s\n",
+                   cf.fd, ckpt_kind_name(cf.kind), cf.id, cf.flags,
                    (unsigned long long) cf.offset, path);
+
+        // The same object as one already built -- a descriptor this process
+        // shares with another, or with itself at a second number.
+        if (cf.kind == CKPT_FD_REF) {
+            struct fd *shared = cf.id < st->id_count ? st->by_id[cf.id] : NULL;
+            if (shared == NULL) {
+                err = _EINVAL;
+                goto fds_done;
+            }
+            fd_retain(shared);
+            if ((err = fdtable_install_at(files, (fd_t) cf.fd, shared,
+                                          cf.cloexec != 0)) < 0)
+                goto fds_done;
+            continue;
+        }
+
+        if (cf.kind == CKPT_FD_PIPE) {
+            // NOT named rd/wr: `rd` is this file's reader function, and a
+            // local of that name turns rd(f, ...) below into a call through a
+            // struct fd pointer.
+            struct fd *pipe_rd = NULL, *pipe_wr = NULL;
+            if ((err = ckpt_pipe_for(st, cf.pipe_inode, &pipe_rd, &pipe_wr)) < 0)
+                goto fds_done;
+            struct fd *end = cf.pipe_write_end ? pipe_wr : pipe_rd;
+            // The bytes that were in flight, put back at the write end so the
+            // reader sees them exactly where it left off. Only the read end's
+            // record carries them, so this runs once per pipe.
+            if (cf.offset != 0) {
+                char *buf = malloc((size_t) cf.offset);
+                if (buf == NULL) { err = _ENOMEM; goto fds_done; }
+                if ((err = rd(f, buf, (size_t) cf.offset)) < 0) {
+                    free(buf);
+                    goto fds_done;
+                }
+                ssize_t put = write(pipe_wr->real_fd, buf, (size_t) cf.offset);
+                free(buf);
+                if (put != (ssize_t) cf.offset) {
+                    ckpt_refuse("pipe %llu had %llu bytes in it, more than a "
+                                "fresh pipe will hold",
+                                (unsigned long long) cf.pipe_inode,
+                                (unsigned long long) cf.offset);
+                    err = _EAGAIN;
+                    goto fds_done;
+                }
+            }
+            if ((err = ckpt_id_put(st, cf.id, end)) < 0)
+                goto fds_done;
+            fd_retain(end);   // the process's own
+            if ((err = fdtable_install_at(files, (fd_t) cf.fd, end,
+                                          cf.cloexec != 0)) < 0)
+                goto fds_done;
+            continue;
+        }
 
         // Re-attached, not restored: the terminal or the host pipe this guest
         // was talking to went with the process that owned it. sockrestart is
@@ -1049,13 +1296,19 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         // destroyed either way. 0, 1 and 2 were set up above; anywhere else
         // the same stream is another reference to one of those three.
         if (cf.kind == CKPT_FD_STDIO || cf.kind == CKPT_FD_TTY) {
-            if (cf.fd <= 2)
+            if (cf.fd <= 2) {
+                if (cf.fd < 3 && stdio[cf.fd] != NULL &&
+                        (err = ckpt_id_put(st, cf.id, stdio[cf.fd])) < 0)
+                    goto fds_done;
                 continue;
+            }
             unsigned mirror = cf.kind == CKPT_FD_STDIO ? (unsigned) cf.offset : 0;
             if (mirror > 2)
                 mirror = 0;
             struct fd *src = stdio[mirror];
             if (src != NULL) {
+                if ((err = ckpt_id_put(st, cf.id, src)) < 0)
+                    goto fds_done;
                 fd_retain(src);
                 if ((err = fdtable_install_at(files, (fd_t) cf.fd, src,
                                               cf.cloexec != 0)) < 0)
@@ -1072,6 +1325,8 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         if (cf.kind == CKPT_FD_FILE && fd->ops->lseek != NULL)
             fd->ops->lseek(fd, (off_t_) cf.offset, LSEEK_SET);
         fd->offset = cf.offset;
+        if ((err = ckpt_id_put(st, cf.id, fd)) < 0)
+            goto fds_done;
         // A fresh task's table holds three descriptors; the image may name
         // fd 10, because a shell parks its saved stdin up there. Grow to fit
         // rather than refuse -- the number is part of what is restored.
@@ -1194,9 +1449,9 @@ int checkpoint_restore(const char *host_path) {
     struct ckpt_header h;
     struct task **built = NULL;
     unsigned nbuilt = 0;
-    // The three descriptors every restored process shares, created once by the
-    // first task through here. See the note in ckpt_restore_task.
-    struct fd *shared_stdio[3] = { NULL, NULL, NULL };
+    // What the restore builds as it goes: the shared standard streams, the
+    // descriptor identity table, and the pipes. See ckpt_restore_task.
+    struct ckpt_restore_state st = {0};
     if ((err = rd(f, &h, sizeof(h))) < 0)
         goto out;
     err = _EINVAL;
@@ -1266,7 +1521,7 @@ int checkpoint_restore(const char *host_path) {
                    rec.n_maps, rec.n_fds);
         struct task *saved = current;
         current = task;
-        err = ckpt_restore_task(f, &h, &rec, h.stdio_is_tty != 0, shared_stdio);
+        err = ckpt_restore_task(f, &h, &rec, h.stdio_is_tty != 0, &st);
         current = saved;
         if (err < 0)
             goto out;
@@ -1301,8 +1556,19 @@ int checkpoint_restore(const char *host_path) {
 out:
     // The restore's own references; each task holds its own.
     for (unsigned i = 0; i < 3; i++)
-        if (shared_stdio[i] != NULL)
-            fd_close(shared_stdio[i]);
+        if (st.stdio[i] != NULL)
+            fd_close(st.stdio[i]);
+    for (uint32_t i = 0; i < st.id_count; i++)
+        if (st.by_id[i] != NULL)
+            fd_close(st.by_id[i]);
+    // Both ends of every pipe: pipe_create_pair hands each over with one
+    // reference, and this is where it goes.
+    for (uint32_t i = 0; i < st.pipe_count; i++) {
+        fd_close(st.pipes[i].rd);
+        fd_close(st.pipes[i].wr);
+    }
+    free(st.by_id);
+    free(st.pipes);
     free(built);
     fclose(f);
     return err;
