@@ -325,6 +325,39 @@ static int fdtable_finish_close(struct fd *fd, struct fdtable *owner) {
 // Detach and close in one step, for the two callers where no other thread can
 // be sharing this table -- fdtable_release runs when the last reference is
 // gone, and fdtable_do_cloexec runs on execve, after the other threads have
+// Put `fd` at an exact descriptor number, growing the table if it is short.
+//
+// f_install cannot do this -- it picks the lowest free number, which is the
+// right rule for open(2) and the wrong one for a restore, where the number is
+// part of what is being restored. dup2 has the mechanism but not the shape:
+// it copies an existing descriptor rather than adopting a new one.
+//
+// Takes ownership of `fd` on success, and closes it on failure, so a caller
+// never has to decide which. Anything already at that number is closed.
+int fdtable_install_at(struct fdtable *table, fd_t f, struct fd *fd, bool cloexec) {
+    if (f < 0) {
+        fd_close(fd);
+        return _EBADF;
+    }
+    lock(&table->lock, 0);
+    int err = fdtable_expand(table, f);
+    if (err < 0) {
+        unlock(&table->lock);
+        fd_close(fd);
+        return err;
+    }
+    struct fd *replaced = fdtable_detach(table, f);
+    table->files[f] = fd;
+    if (cloexec)
+        bit_set(f, table->cloexec);
+    else
+        bit_clear(f, table->cloexec);
+    unlock(&table->lock);
+    if (replaced != NULL)
+        fdtable_finish_close(replaced, table);
+    return 0;
+}
+
 // already been reaped. Anywhere else, use fdtable_detach and close outside
 // the lock; see the note above.
 static int fdtable_close(struct fdtable *table, fd_t f) {

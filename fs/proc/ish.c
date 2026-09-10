@@ -10,6 +10,7 @@
 #include "emu/memory.h"
 #include "kernel/swap.h"
 #include "fs/fake-snapshot.h"
+#include "kernel/checkpoint.h"
 #include "kernel/memcomp.h"
 #include "kernel/zswap.h"
 #include "fs/poll.h"
@@ -382,6 +383,64 @@ struct ckpt_family {
     unsigned count;
 };
 
+// The live half. Everything above this point is the INVENTORY -- what a
+// checkpoint would have to deal with. These two are the checkpoint itself
+// (kernel/checkpoint.c).
+//
+//     echo save /host/path > /proc/ish/checkpoint
+//
+// does not save anything by itself: it asks, and the save happens at the next
+// pass round task_run_current's loop, after this write's return value is in
+// the guest's register file and the program counter has moved past it. That is
+// what makes a restore CONTINUE rather than re-run the write.
+//
+// The restore side is not here. A guest cannot restore itself -- the thing
+// being replaced is the caller -- so it is the CLI's ISH_RESTORE, which stands
+// in for what the app will do when iOS has killed it and it comes back.
+// Its own switch rather than sharing the snapshot's. Both hand a guest process
+// a host path, so both are gated, but they are different capabilities: a
+// snapshot copies the root, a checkpoint writes the whole address space out.
+// Same shape as ISH_GUEST_SNAPSHOT, and the same reasoning about getenv.
+static bool checkpoint_guest_control_allowed(void) {
+    const char *env = getenv("ISH_GUEST_CHECKPOINT");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
+static int proc_ish_update_checkpoint(struct proc_entry *UNUSED(entry),
+        struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size >= PATH_MAX)
+        return _EINVAL;
+    char line[PATH_MAX];
+    memcpy(line, data->data, data->size);
+    line[data->size] = '\0';
+    // Same embedded-NUL rule as proc_ish_update_roots: refuse rather than act
+    // on a prefix of what was meant.
+    if (strlen(line) != data->size)
+        return _EINVAL;
+    char *nl = strchr(line, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+
+    static const char verb[] = "save ";
+    if (strncmp(line, verb, sizeof(verb) - 1) != 0)
+        return _EINVAL;
+    const char *path = line + sizeof(verb) - 1;
+    while (*path == ' ')
+        path++;
+    // A host path, so it is the same capability as /proc/ish/snapshot's and
+    // gated the same way: root inside the guest, and only where guest control
+    // of this kind is allowed at all.
+    if (*path != '/')
+        return _EINVAL;
+    if (!checkpoint_guest_control_allowed())
+        return _EPERM;
+
+    checkpoint_request(path);
+    return 0;
+}
+
 static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct ckpt_family fams[CKPT_MAX_FAMILIES];
     unsigned fam_count = 0;
@@ -485,6 +544,27 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
         fdtable_release(files);
     }
     task_snapshot_release(&snapshot);
+
+    // ---- and the checkpoint itself --------------------------------------
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    proc_printf(buf, "\n");
+    proc_printf(buf, "restored        %s\n", ck.restored ? "yes" : "no");
+    proc_printf(buf, "generation      %lu\n", ck.generation);
+    proc_printf(buf, "saves           %lu\n", ck.saves);
+    if (ck.last_path[0] != '\0')
+        proc_printf(buf, "last_path       %s\n", ck.last_path);
+    if (ck.pages != 0)
+        proc_printf(buf, "last_pages      %lu (%llu bytes of guest memory)\n",
+                    ck.pages, ck.bytes);
+    if (ck.fds != 0)
+        proc_printf(buf, "last_fds        %lu\n", ck.fds);
+    if (ck.last_err != 0)
+        proc_printf(buf, "last_err        %d\n", ck.last_err);
+    if (ck.last_refusal[0] != '\0')
+        proc_printf(buf, "last_refusal    %s\n", ck.last_refusal);
+    proc_printf(buf, "\n  echo save /host/path > /proc/ish/checkpoint\n");
+    proc_printf(buf, "  ISH_RESTORE=/host/path ish -f <root>   # brings it back\n");
 
     proc_printf(buf, "what a checkpoint of this guest would have to carry\n");
     proc_printf(buf, "(phase 0 of suspend-to-disk: a measurement, not a feature)\n\n");
@@ -1760,7 +1840,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
     {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
     {"mem_compress", S_IFREG | 0644, .show = proc_ish_show_mem_compress, .update = proc_ish_update_mem_compress},
-    {"checkpoint", .show = proc_ish_show_checkpoint},
+    {"checkpoint", S_IFREG | 0644, .show = proc_ish_show_checkpoint, .update = proc_ish_update_checkpoint},
     {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},

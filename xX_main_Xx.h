@@ -8,6 +8,7 @@
 #include "fs/real.h"
 #include "fs/sock.h"
 #include "kernel/swap.h"
+#include "kernel/checkpoint.h"
 #ifdef __APPLE__
 #include <sys/resource.h>
 #define IOPOL_TYPE_VFS_HFS_CASE_SENSITIVITY 1
@@ -107,6 +108,23 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     // program is loaded out of it rather than after (kernel/init.h).
     if (ish_boot_setup_hook != NULL)
         ish_boot_setup_hook();
+
+    // Bring a guest back instead of starting one. This stands in for what the
+    // app will do when iOS has killed it: same device, same root, same build.
+    // An environment variable rather than a getopt letter because the CLI's
+    // option string is "+r:f:d:c:" and everything after the first non-option
+    // is the guest's own command line -- a restore has no command line at all.
+    const char *restore_path = getenv("ISH_RESTORE");
+    if (restore_path != NULL && restore_path[0] != '\0') {
+        int rerr = checkpoint_restore(restore_path);
+        if (rerr < 0) {
+            fprintf(stderr, "ISH_RESTORE %s: %d\n", restore_path, rerr);
+            return rerr;
+        }
+        tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
+        exit_hook = exit_handler;
+        return 0;
+    }
 
     char argv_copy[4096];
     int i = optind;

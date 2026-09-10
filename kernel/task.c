@@ -6,6 +6,7 @@
 #include "kernel/calls.h"
 #include "kernel/native.h"
 #include "kernel/task.h"
+#include "kernel/checkpoint.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
 #include "jit/jit.h"
@@ -903,6 +904,13 @@ void task_run_current(void) {
     task_pthread_canary_note_tlb(&tlb, sizeof(tlb));
     
     while (true) {
+        // The one place in the guest where a task is at a clean boundary: no
+        // address-space lock held, not inside a syscall, and struct cpu_state
+        // naming the NEXT instruction rather than the one being executed. A
+        // checkpoint asked for from a syscall is taken here, one pass later,
+        // which is what makes a restore continue instead of re-running the
+        // request. See kernel/checkpoint.c.
+        checkpoint_run_pending();
         task_wait_for_mem_quiesce(save);
         read_lock(&save->mem->lock);
 

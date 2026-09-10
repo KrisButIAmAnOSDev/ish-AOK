@@ -496,6 +496,10 @@ struct fd *f_get_retain(fd_t f);
 // steals a reference to the fd, gives it to the table on success and destroys it on error
 // flags is checked for O_CLOEXEC and O_NONBLOCK
 fd_t f_install(struct fd *fd, int flags);
+// Install at an exact number rather than the lowest free one, growing the
+// table if needed. For kernel/checkpoint.c, where the number is part of what
+// is being restored. Takes ownership of `fd` either way.
+int fdtable_install_at(struct fdtable *table, fd_t f, struct fd *fd, bool cloexec);
 int f_close(fd_t f);
 
 // Write a FUSE file's shared mapping back to its daemon (fs/fuse.c). A no-op
