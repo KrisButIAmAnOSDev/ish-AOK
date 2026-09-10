@@ -114,13 +114,29 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     // An environment variable rather than a getopt letter because the CLI's
     // option string is "+r:f:d:c:" and everything after the first non-option
     // is the guest's own command line -- a restore has no command line at all.
+    // A SESSION: one path that is both where a suspend writes and where the
+    // next launch looks. If the file is there the guest resumes; if it is not,
+    // it boots normally and the file appears the first time something asks for
+    // a suspend. That is the shape the app needs, tried out on the CLI first.
+    const char *session = getenv("ISH_SESSION");
     const char *restore_path = getenv("ISH_RESTORE");
+    if (session != NULL && session[0] != '\0') {
+        checkpoint_set_session(session);
+        if (access(session, R_OK) == 0)
+            restore_path = session;
+    }
     if (restore_path != NULL && restore_path[0] != '\0') {
         int rerr = checkpoint_restore(restore_path);
         if (rerr < 0) {
             fprintf(stderr, "ISH_RESTORE %s: %d\n", restore_path, rerr);
             return rerr;
         }
+        // The image is consumed by being restored. Leaving it would resume
+        // the SAME moment again on the launch after this one, which is a
+        // stale session rather than the one the user just had -- and would
+        // quietly hide a guest that had since suspended over the top of it.
+        if (session != NULL && restore_path == session)
+            unlink(session);
         tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
         exit_hook = exit_handler;
         return 0;

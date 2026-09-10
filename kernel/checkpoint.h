@@ -35,8 +35,18 @@ int checkpoint_restore(const char *host_path);
 // task_run_current's loop, so a request made from one would simply sit there
 // -- an image that never appears and no error anywhere, which is worse than
 // either outcome.
-int checkpoint_request(const char *host_path);
+// `and_halt` makes it a SUSPEND rather than a checkpoint: the image is
+// written and the guest then stops, so the next launch resumes it instead of
+// booting. A checkpoint is a copy and the guest carries on; a suspend is a
+// departure.
+int checkpoint_request(const char *host_path, bool and_halt);
 void checkpoint_run_pending(void);
+
+// The session file the entry point was given, if any: restored at startup and
+// written at suspend. Empty means neither. kernel/checkpoint.c owns the
+// string so both halves name the same file.
+void checkpoint_set_session(const char *host_path);
+const char *checkpoint_session(void);
 
 // What /proc/ish/checkpoint reports. `restored` is how a guest program tells
 // the two sides of a checkpoint apart: the write that took it returns

@@ -94,6 +94,39 @@ case $gen_back in
     *) echo "FAIL: a restored guest did not report itself restored: $gen_back"; exit 1;;
 esac
 
+# ---- a full suspend/resume cycle -------------------------------------------
+#
+# The difference from a checkpoint: the guest STOPS once the image is written,
+# and the next launch resumes it rather than booting. One path -- ISH_SESSION
+# -- is both where the suspend writes and where the launch looks, which is the
+# shape the app needs.
+rm -f "$IMG"
+sus_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c '
+exec 3< /tmp/ckpt-lines.txt
+read -r a <&3
+echo "launch-1 read $a"
+echo suspend > /proc/ish/checkpoint
+echo "launch-2 read the rest"
+read -r b <&3; echo "launch-2 got $b"
+' 2>&1)
+echo "$sus_out" | sed 's/^/  suspend | /'
+[ -s "$IMG" ] || { echo "FAIL: suspend wrote no image"; exit 1; }
+case $sus_out in
+    *"launch-2"*) echo "FAIL: the suspending guest kept running"; exit 1;;
+esac
+
+res_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c 'echo "this argv must be ignored"' 2>&1)
+echo "$res_out" | sed 's/^/  resume  | /'
+case $res_out in
+    *"launch-2 read the rest"*"launch-2 got LINE-2-payload"*) ;;
+    *) echo "FAIL: resume did not continue the suspended guest"; echo "  got: $res_out"; exit 1;;
+esac
+case $res_out in
+    *"this argv must be ignored"*) echo "FAIL: resume ran the new command line"; exit 1;;
+esac
+[ -e "$IMG" ] && { echo "FAIL: the session image survived being resumed"; exit 1; }
+echo "  resume  | (image consumed)"
+
 # ---- and the refusals ------------------------------------------------------
 #
 # A capability boundary that never fires is not a boundary, it is a comment.

@@ -423,10 +423,34 @@ static int proc_ish_update_checkpoint(struct proc_entry *UNUSED(entry),
     if (nl != NULL)
         *nl = '\0';
 
-    static const char verb[] = "save ";
-    if (strncmp(line, verb, sizeof(verb) - 1) != 0)
+    // Two verbs, and the difference is what happens afterwards. `save` is a
+    // copy and the guest carries on; `suspend` writes the image and stops the
+    // machine, so the next launch resumes rather than boots.
+    static const char save_verb[] = "save ";
+    static const char suspend_verb[] = "suspend ";
+    const char *path;
+    bool and_halt;
+    if (strncmp(line, save_verb, sizeof(save_verb) - 1) == 0) {
+        path = line + sizeof(save_verb) - 1;
+        and_halt = false;
+    } else if (strncmp(line, suspend_verb, sizeof(suspend_verb) - 1) == 0) {
+        path = line + sizeof(suspend_verb) - 1;
+        and_halt = true;
+    } else if (strcmp(line, "suspend") == 0) {
+        // With no path: the session file the entry point was given. This is
+        // the shape a user actually wants -- `echo suspend >
+        // /proc/ish/checkpoint` and the session comes back next launch --
+        // and the one an app-side button will call.
+        path = checkpoint_session();
+        if (path == NULL || path[0] == '\0')
+            return _EINVAL;
+        and_halt = true;
+        if (!checkpoint_guest_control_allowed())
+            return _EPERM;
+        return checkpoint_request(path, and_halt);
+    } else {
         return _EINVAL;
-    const char *path = line + sizeof(verb) - 1;
+    }
     while (*path == ' ')
         path++;
     // A host path, so it is the same capability as /proc/ish/snapshot's and
@@ -440,7 +464,7 @@ static int proc_ish_update_checkpoint(struct proc_entry *UNUSED(entry),
     // The error reaches the guest as the write's own return value, so a
     // script sees `echo save ... > /proc/ish/checkpoint` fail rather than
     // having to go and read the file back to find out.
-    return checkpoint_request(path);
+    return checkpoint_request(path, and_halt);
 }
 
 static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct proc_data *buf) {

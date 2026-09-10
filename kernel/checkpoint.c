@@ -177,6 +177,8 @@ static lock_t ckpt_lock = LOCK_INITIALIZER;
 static struct checkpoint_status ckpt_status;
 static char ckpt_pending_path[PATH_MAX];
 static bool ckpt_pending;
+static bool ckpt_pending_halt;
+static char ckpt_session_path[PATH_MAX];
 
 void checkpoint_get_status(struct checkpoint_status *out) {
     lock(&ckpt_lock, 0);
@@ -856,7 +858,20 @@ out:
 
 // ------------------------------------------------------------ the trigger
 
-int checkpoint_request(const char *host_path) {
+void checkpoint_set_session(const char *host_path) {
+    lock(&ckpt_lock, 0);
+    snprintf(ckpt_session_path, sizeof(ckpt_session_path), "%s",
+             host_path != NULL ? host_path : "");
+    unlock(&ckpt_lock);
+}
+
+const char *checkpoint_session(void) {
+    // Read without the lock: it is written once, by the entry point, before
+    // any guest task exists.
+    return ckpt_session_path;
+}
+
+int checkpoint_request(const char *host_path, bool and_halt) {
     // Refuse NOW for anything that would stop the deferred save from
     // happening at all -- see the note in checkpoint.h.
     int err = ckpt_check_scope();
@@ -869,6 +884,7 @@ int checkpoint_request(const char *host_path) {
     lock(&ckpt_lock, 0);
     snprintf(ckpt_pending_path, sizeof(ckpt_pending_path), "%s", host_path);
     ckpt_pending = true;
+    ckpt_pending_halt = and_halt;
     ckpt_status.last_err = 0;
     ckpt_status.last_refusal[0] = '\0';
     unlock(&ckpt_lock);
@@ -877,10 +893,12 @@ int checkpoint_request(const char *host_path) {
 
 void checkpoint_run_pending(void) {
     char path[PATH_MAX];
+    bool halt_after;
     lock(&ckpt_lock, 0);
     bool want = ckpt_pending;
     if (want) {
         memcpy(path, ckpt_pending_path, sizeof(path));
+        halt_after = ckpt_pending_halt;
         ckpt_pending = false;
     }
     unlock(&ckpt_lock);
@@ -892,5 +910,17 @@ void checkpoint_run_pending(void) {
         lock(&ckpt_lock, 0);
         ckpt_status.last_err = err;
         unlock(&ckpt_lock);
+        return;
     }
+    if (!halt_after)
+        return;
+
+    // A SUSPEND: the image is written, so this guest's job is done and the
+    // next launch is the one that continues it. Stopping the machine rather
+    // than exiting the task -- an exit would run the guest's own shutdown,
+    // and the image already describes a process that is very much alive.
+    CKPT_TRACE("suspending: image written, halting\n");
+    if (halt_hook != NULL)
+        halt_hook(0);
+    exit(0);
 }
