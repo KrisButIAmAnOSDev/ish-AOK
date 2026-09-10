@@ -130,6 +130,7 @@ six of them were not linked from anywhere at all.
 | [files-app-integration.md](files-app-integration.md) | the File Provider extension, and how iSH-AOK appears in the iOS Files app |
 | [shortcuts.md](shortcuts.md) | driving iSH-AOK from Apple's Shortcuts app |
 | [swap.md](swap.md) | the simulated swap area — turning it on, what it costs, and what it will not do |
+| [suspend.md](suspend.md) | suspend to disk — keeping the session across the app being killed |
 
 **The app around the emulator**
 

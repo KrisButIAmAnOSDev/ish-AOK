@@ -83,6 +83,16 @@ void checkpoint_park_if_frozen(void);
 void checkpoint_native_park(void);
 
 void checkpoint_set_session(const char *host_path);
+
+// Whether the guest may drive this itself through /proc/ish/checkpoint.
+//
+// The app publishes its Settings switch here; the CLI has ISH_GUEST_CHECKPOINT
+// as well. Writing to a /proc file is how a guest reaches every other AOK
+// control (swap_evict, snapshot, the JIT knobs), and there is no reason for
+// this one to be the exception -- but it hands a guest process a HOST path to
+// write, so it is gated rather than open.
+void checkpoint_set_guest_control(bool allowed);
+bool checkpoint_guest_control(void);
 const char *checkpoint_session(void);
 
 // What /proc/ish/checkpoint reports. `restored` is how a guest program tells

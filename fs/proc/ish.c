@@ -402,6 +402,14 @@ struct ckpt_family {
 // snapshot copies the root, a checkpoint writes the whole address space out.
 // Same shape as ISH_GUEST_SNAPSHOT, and the same reasoning about getenv.
 static bool checkpoint_guest_control_allowed(void) {
+    // The app's Settings switch, published at boot and whenever it becomes
+    // active (kernel/checkpoint.c's checkpoint_set_guest_control). Without
+    // this the only gate was the CLI environment variable below, which the app
+    // never sets -- so `echo suspend > /proc/ish/checkpoint` answered EPERM on
+    // a device, and the ONLY way to suspend was to background the app. The
+    // feature had no manual control at all where it matters most.
+    if (checkpoint_guest_control())
+        return true;
     const char *env = getenv("ISH_GUEST_CHECKPOINT");
     return env != NULL && env[0] != '\0' && env[0] != '0';
 }

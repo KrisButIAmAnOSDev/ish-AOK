@@ -474,6 +474,19 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
         task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
         task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
     }
+    // NOT inherited: which native program is running, and what it said about
+    // itself.
+    //
+    // `*task = *parent` above copies both, and native_running is set only
+    // while prog->main() is on the stack -- so a child forked by a native
+    // shell came out claiming to BE that shell. kernel/checkpoint.c then asked
+    // it for zsh's state, on a task that has none, and read zsh's trap table
+    // through a null pointer: EXC_BAD_ACCESS at address 0x84, on the thread of
+    // an emulated /bin/sh. The state pointer would have been a double free by
+    // the same route.
+    task->native_running = NULL;
+    task->ckpt_native_state = NULL;
+
     // Every task's poke flag is its OWN, from the moment it exists.
     //
     // poked_ptr points into its own cpu_state (&cpu->_poked), and each engine's

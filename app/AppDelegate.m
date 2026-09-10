@@ -2605,6 +2605,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // right answer to all of that is the behaviour the user gets with this
     // switch off: boot normally.
     NSString *sessionImage = ISHSuspendImagePath();
+    // The same switch gates the guest's own control of this. Published rather
+    // than read from the kernel, because UserPreferences is Objective-C and
+    // fs/proc/ish.c is not; re-published on every activation below, so
+    // flipping it in Settings takes effect without a relaunch.
+    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
     if (UserPreferences.shared.shouldSuspendToDisk && sessionImage != nil) {
         checkpoint_set_session(sessionImage.fileSystemRepresentation);
         if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
@@ -3988,6 +3993,11 @@ void ISHSuspendGuardEnterForeground(void) {
 
 - (void)applicationWillEnterForeground:(UIApplication *)application {
     [ISHDiagnosticsStore recordBreadcrumb:@"application.willEnterForeground"];
+    // Re-published here because changing it is what put us in the background:
+    // the iOS Settings app is a different app, so flipping the switch there
+    // and coming back is exactly this path. Without it the guest's own control
+    // of suspend would only follow the switch across a relaunch.
+    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
 }
 
 @end

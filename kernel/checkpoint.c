@@ -1918,6 +1918,16 @@ out:
 
 // ------------------------------------------------------------ the trigger
 
+static _Atomic bool ckpt_guest_control;
+
+void checkpoint_set_guest_control(bool allowed) {
+    atomic_store_explicit(&ckpt_guest_control, allowed, memory_order_release);
+}
+
+bool checkpoint_guest_control(void) {
+    return atomic_load_explicit(&ckpt_guest_control, memory_order_acquire);
+}
+
 void checkpoint_set_session(const char *host_path) {
     lock(&ckpt_lock, 0);
     snprintf(ckpt_session_path, sizeof(ckpt_session_path), "%s",
