@@ -61,3 +61,16 @@ extern NSString *const ProcessExitedNotification;
 // call repeatedly.
 void ISHSuspendGuardEnterBackground(void);
 void ISHSuspendGuardEnterForeground(void);
+
+// ---- suspend to disk (kernel/checkpoint.c) --------------------------------
+//
+// Where a suspended session lives, and taking one on demand. The automatic
+// half -- save on backgrounding, resume on launch -- needs no caller; these
+// are for a user asking for it NOW, from the Workspace.
+//
+// ISHSuspendSessionSaveNow BLOCKS: it freezes every guest task, writes the
+// image and thaws before returning. Call it off the main thread. It returns 0,
+// or a guest _E* code with /proc/ish/checkpoint's last_refusal naming the
+// cause. The guest is unharmed either way -- a checkpoint is a copy.
+NSString *ISHSuspendSessionImagePath(void);
+int ISHSuspendSessionSaveNow(void);

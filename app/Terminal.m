@@ -408,6 +408,16 @@ static void NotifyTerminalRegistryChanged(void) {
     return (__bridge Terminal *) (*tty)->data;
 }
 
+struct tty *ISHOpenTerminalForRestoredSession(void) {
+    struct tty *tty = NULL;
+    // The Terminal is retained by the tty itself (ios_tty_init's
+    // CFBridgingRetain), so it outlives this call and is waiting in the
+    // registry for the view controller that adopts the session.
+    if ([Terminal createPseudoTerminal:&tty] == nil)
+        return NULL;
+    return tty;
+}
+
 - (void)setTty:(tty_t)tty {
     @synchronized (self) {
         _tty = tty;

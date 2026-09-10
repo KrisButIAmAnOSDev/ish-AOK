@@ -24,6 +24,7 @@
 #include "kernel/init.h"
 #include "kernel/task.h"
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/fs.h"
 #include "fs/devices.h"
 #include "fs/path.h"
@@ -1247,6 +1248,28 @@ static const CGFloat kFindBarHeight = 44;
 	                                                @"command": commandString ?: @""}];
 	        return err;
 	    }
+	    // ---- a session that came back from suspend to disk ----------------
+	    //
+	    // Its processes are already running, on a pseudo-terminal the restore
+	    // made for them; all this has to do is show it. Before the console
+	    // fallback below, because a restored session is a real session whichever
+	    // way this launch would otherwise have booted -- and before anything
+	    // that would create a second shell, which is what the user saw when this
+	    // was missing: a fresh prompt in the window, and the session they
+	    // suspended alive and unreachable on the console.
+	    struct checkpoint_restored_session restored;
+	    if (checkpoint_take_restored_session(&restored)) {
+	        Terminal *terminal = (__bridge Terminal *) restored.terminal;
+	        if (terminal != nil) {
+	            self.sessionTerminal = terminal;
+	            self.sessionPid = restored.leader_pid;
+	            self.sessionStartedAt = CFAbsoluteTimeGetCurrent();
+	            [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.resumed"
+	                                          details:@{@"pid": @(restored.leader_pid),
+	                                                    @"pts": @(restored.tty_num)}];
+	            return 0;
+	        }
+	    }
 	    if ([AppDelegate bootUsesConsoleSessionFallback]) {
 	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.consoleFallback"
 	                                      details:@{@"reason": @"boot-init-fallback",
@@ -1346,6 +1369,14 @@ static const CGFloat kFindBarHeight = 44;
         task_never_ran_destroy(failed);
         return _EAGAIN;
     }
+    // The session now runs on its OWN thread, so this one must stop claiming to
+    // be it. `current` is per-thread and this is the UI thread; leaving it
+    // pointing at a live guest task means any kernel code the UI later calls
+    // acts as that process. Suspend to disk found it: ckpt_freeze_all does not
+    // freeze `current` -- the task asking for a checkpoint is already at a
+    // boundary -- so the backgrounding save skipped the session's own leader,
+    // photographed it mid-syscall, and the resumed session died on arrival.
+    current = NULL;
     return 0;
 }
 

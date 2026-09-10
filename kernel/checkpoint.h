@@ -95,6 +95,39 @@ void checkpoint_set_guest_control(bool allowed);
 bool checkpoint_guest_control(void);
 const char *checkpoint_session(void);
 
+// ---- a session that came back ------------------------------------------
+//
+// In the app, the terminal a person is looking at is a PSEUDO-terminal whose
+// master side is a UI object -- app/Terminal.m's pty_open_fake -- not a guest
+// process. It is not re-openable the way /dev/console is: it went with the app
+// that was killed, and /dev/pts/1 on the next launch is a different terminal
+// belonging to a different window.
+//
+// So a session on a pty comes back onto a NEW one, and the UI adopts that
+// instead of starting a shell of its own. The app installs the factory below
+// before restoring; the CLI leaves it NULL and a restored pty session falls
+// back to the console, which is the right answer there because the CLI's
+// terminal IS the console.
+struct tty;
+extern struct tty *(*checkpoint_open_session_tty)(void);
+
+struct checkpoint_restored_session {
+    int leader_pid;   // the session leader, so the UI knows whose exit ends it
+    int tty_num;      // the pts number it came back on
+    void *terminal;   // the tty's driver data: the app's Terminal object
+};
+
+// Take the next restored session nothing is showing yet, in the order the
+// image had them. Returns 1 and fills `out`, or 0 when there are none left;
+// each is handed out exactly once.
+int checkpoint_take_restored_session(struct checkpoint_restored_session *out);
+
+// Traces a restored task's first few syscalls when ISH_CHECKPOINT_DEBUG is on.
+void checkpoint_trace_syscall(unsigned long nr);
+
+// Traces one process exit when ISH_CHECKPOINT_DEBUG is on; nothing otherwise.
+void checkpoint_trace_exit(int pid, const char *comm, int status);
+
 // What /proc/ish/checkpoint reports. `restored` is how a guest program tells
 // the two sides of a checkpoint apart: the write that took it returns
 // normally, and so does the same write in the restored guest, because it is

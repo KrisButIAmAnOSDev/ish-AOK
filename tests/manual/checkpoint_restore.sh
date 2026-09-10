@@ -158,6 +158,44 @@ case $mp_back in
     *) echo "FAIL: the child did not survive the restore"; echo "  got: $mp_back"; exit 1;;
 esac
 
+# ---- the session and the process group ------------------------------------
+#
+# A terminal belongs to a SESSION, and which process group is in the FOREGROUND
+# of it decides who may read from it. Both are membership, not just numbers:
+# they live in per-pid lists, and a restore that set the fields and left the
+# lists alone produced a shell whose tcsetpgrp answered ENOTTY -- job control
+# silently off, and on a pseudo-terminal a foreground group that was still the
+# login's, so the shell's first read came back EIO and the session was a pair
+# of zombies a millisecond after the resume.
+#
+# setsid() in a subshell puts this process somewhere its ids are its own, so
+# the check is a real comparison rather than "everything is 1".
+rm -f "$IMG"
+# setsid, so the ids under test are NOT 1/1 -- a restore that lost them
+# entirely would still match if everything in the guest were pid 1's.
+sid_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" \
+    /usr/bin/setsid -w $SH -c '
+read_ids() { set -- $(cut -d" " -f4,5,6 /proc/self/stat); echo "$2/$3"; }
+echo "launch1 pgid/sid: $(read_ids)"
+echo suspend > /proc/ish/checkpoint
+echo "launch2 pgid/sid: $(read_ids)"
+' 2>&1)
+echo "$sid_out" | sed 's/^/  ids     | /'
+[ -s "$IMG" ] || { echo "FAIL: no image for the session test"; exit 1; }
+sid_back=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c 'x' 2>&1)
+echo "$sid_back" | sed 's/^/  ids     | /'
+before=$(echo "$sid_out" | sed -n 's/^launch1 pgid\/sid: //p')
+after=$(echo "$sid_back" | sed -n 's/^launch2 pgid\/sid: //p')
+if [ -z "$after" ] || [ "$before" != "$after" ]; then
+    echo "FAIL: process group / session changed across the restore ($before -> $after)"
+    exit 1
+fi
+# The ids have to be worth comparing. 1/1 is what a guest that lost them
+# entirely also reports, so a pass on those numbers would prove nothing.
+case $before in
+    1/1|/|"") echo "FAIL: the session test ran as pid 1 ($before); setsid did not take"; exit 1;;
+esac
+
 # ---- a pipeline, with bytes still in the pipe ------------------------------
 #
 # The producer writes three lines and exits; the consumer reads one and then

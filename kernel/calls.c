@@ -5036,6 +5036,7 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         log_stub_syscall(cpu, dispatch, (unsigned) syscall_num, "stub");
 
     dispatch->syscall_args(cpu, raw_args);
+    checkpoint_trace_syscall((unsigned long) syscall_num);
     amd64_tty2_shell_syscall_trace_enter(syscall_num, raw_args);
     amd64_tracked_proc_trace_enter(syscall_num, raw_args);
     if (dispatch->abi == GUEST_ABI_AMD64 && syscall_num == 15) {

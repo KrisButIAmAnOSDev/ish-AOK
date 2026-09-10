@@ -182,6 +182,12 @@ struct task {
     // exiting simply never answers, which the freezer's timeout covers.
     _Atomic bool ckpt_freeze_wanted;
     _Atomic bool ckpt_frozen;
+    // This task came back from an image, and how many of its syscalls have
+    // been traced. Diagnostics only (ISH_CHECKPOINT_DEBUG): a restored guest
+    // that loads cleanly and then quietly falls over is this feature's usual
+    // failure, and the first few calls each task makes are what name it.
+    bool ckpt_restored;
+    unsigned ckpt_syscalls_traced;
 
     struct tgroup *group; // immutable
     struct list group_links;
@@ -534,6 +540,9 @@ void task_never_ran_destroy(struct task *task);
 // misc
 void vfork_notify(struct task *task);
 pid_t_ task_setsid(struct task *task);
+// Put a restored process back in the session and process group the image gives
+// it -- see kernel/group.c. Only kernel/checkpoint.c has any business here.
+void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid);
 void task_leave_session(struct task *task);
 // True when no member of this process group has a parent elsewhere in the same
 // session -- so nothing outside it could continue it after a stop. Requires

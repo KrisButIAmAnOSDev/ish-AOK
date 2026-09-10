@@ -77,6 +77,7 @@
 #include "kernel/init.h"
 #include "kernel/native.h"
 #include "kernel/task.h"
+#include "kernel/uts.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
 #include "fs/devices.h"
@@ -84,7 +85,7 @@
 #include "util/sync.h"
 
 #define CKPT_MAGIC "AOKCKPT"
-#define CKPT_VERSION 1
+#define CKPT_VERSION 2
 // How long the freezer waits for a task to reach a syscall boundary.
 //
 // Generous on purpose. Every wait in the guest is broken by the poke, so a
@@ -110,13 +111,33 @@ enum ckpt_fd_kind {
     CKPT_FD_REF,          // the SAME struct fd as one already described
 };
 
+// Which KIND of terminal a process's standard streams were on. The two are
+// not interchangeable: the console is the system's, lives at a fixed path and
+// is simply re-opened, while a pseudo-terminal is a WINDOW -- created by the
+// UI, destroyed with it -- and comes back only by making a new one and handing
+// it to the UI to adopt. Collapsing the second into the first is what a
+// restored session looked like before this existed: alive, correct, and
+// talking to a terminal nobody was looking at, while the app started a fresh
+// shell in the window the user could see.
+enum ckpt_tty_kind {
+    CKPT_TTY_NONE = 0,
+    CKPT_TTY_CONSOLE,
+    CKPT_TTY_PTS,
+};
+
 // ISH_CHECKPOINT_DEBUG=1 traces every record on the way out and on the way
 // back. On the HOST's stderr, not the guest's: at restore time the guest has
 // no descriptors yet, and at save time the thing being diagnosed is usually
 // which descriptor the guest is holding.
 static bool ckpt_debug(void) {
-    const char *e = getenv("ISH_CHECKPOINT_DEBUG");
-    return e != NULL && e[0] != '\0' && e[0] != '0';
+    // Read once. This is consulted from the syscall path, where a getenv per
+    // call would be a measurable cost for a diagnostic that is off.
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ISH_CHECKPOINT_DEBUG");
+        cached = e != NULL && e[0] != '\0' && e[0] != '0';
+    }
+    return cached != 0;
 }
 #define CKPT_TRACE(...) do { \
     if (ckpt_debug()) { fprintf(stderr, "checkpoint: " __VA_ARGS__); } \
@@ -144,12 +165,6 @@ struct ckpt_header {
     uint64_t build_fingerprint;
     uint32_t n_tasks;
     uint64_t total_pages;
-    // Whether the checkpointed guest's standard streams were a terminal or
-    // pipes. They are RE-ATTACHED rather than restored -- the terminal on the
-    // other end belonged to a process that no longer exists -- so all the
-    // image has to carry is which of the two setups to run, exactly as the
-    // entry point chooses it at boot.
-    uint32_t stdio_is_tty;
     // WHICH console, and which device it has to be. The CLI's is /dev/tty1
     // (4:1) and the app's is /dev/console (5:1) -- a session that came back on
     // the other one would be talking to a terminal nobody is looking at.
@@ -157,6 +172,13 @@ struct ckpt_header {
     // they do not match, so both halves travel.
     char console[64];
     uint32_t console_major, console_minor;
+    // The UTS namespace: the guest's own state, and nothing on the resume path
+    // puts it back. The app seeds the hostname while provisioning /etc/hostname
+    // on a fresh boot, which a resume skips entirely -- so a restored shell
+    // kept the name it had cached and every shell started afterwards disagreed
+    // with it, two shells on one rootfs apparently on different machines.
+    char hostname[UTS_NAME_LENGTH];
+    char domainname[UTS_NAME_LENGTH];
     uint32_t reserved;
 };
 
@@ -176,6 +198,30 @@ struct ckpt_task {
     int32_t exit_signal, pdeath_signal, nice, sched_policy;
     uint64_t robust_list;
     uint32_t did_exec;
+    // The terminal this process's standard streams were on: enum ckpt_tty_kind,
+    // and for a pty the number and path it had. The path is kept for the trace
+    // and for the refusal message; nothing re-opens it, because the pty it
+    // names is gone.
+    uint32_t tty_kind;
+    uint32_t tty_num;
+    char tty_path[64];
+    // The terminal's SESSION and FOREGROUND process group. Not decoration:
+    // a read from a terminal by a process outside the foreground group is
+    // EIO when the shell has SIGTTIN ignored, which every interactive shell
+    // does -- so a restored session whose terminal came back with the wrong
+    // foreground group read EIO on its first prompt and exited. Letting the
+    // first process to open the new terminal claim it gave the LOGIN's group,
+    // never the shell's.
+    int32_t tty_session, tty_fg_group;
+    // And the line discipline, byte for byte. A shell puts its terminal into
+    // raw mode for its own line editing and puts it back when it exits; a
+    // terminal rebuilt with the driver's defaults has ECHO on under a shell
+    // that is still echoing for itself, so every keystroke came back twice.
+    // The window size travels with it -- the UI re-syncs its own size a moment
+    // later, but until it does the guest should not think the terminal changed
+    // shape.
+    struct termios_ tty_termios;
+    struct winsize_ tty_winsize;
     // A NATIVE task. There is no address space to photograph and no register
     // file that means anything -- it is a C function on a host thread -- so
     // what travels is the program's name, the argv it was given, and the state
@@ -851,6 +897,12 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
     }
     unlock(&files->lock);
 
+    uint32_t tty_kind = CKPT_TTY_NONE;
+    int tty_num = 0;
+    int tty_session = 0, tty_fg_group = 0;
+    struct termios_ tty_termios = {0};
+    struct winsize_ tty_winsize = {0};
+    char tty_path[64] = {0};
     for (unsigned i = 0; i < nfds; i++) {
         struct ckpt_saved_fd *s = &saved[i];
         s->id = ckpt_fd_id(ids, s->fd, &s->first);
@@ -858,29 +910,66 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
             // Already described, here or in another process. What matters is
             // that it comes back as the SAME object.
             s->kind = CKPT_FD_REF;
-            continue;
-        }
-        s->kind = ckpt_classify_fd((int) s->num, s->fd, s->path, sizeof(s->path));
-        if (s->kind == 0) {
-            ret = _EOPNOTSUPP;
-            goto out;
-        }
-        s->offset = s->kind == CKPT_FD_STDIO ? (uint64_t) s->fd->real_fd
-                                             : ckpt_fd_offset(s->fd);
-        if (s->kind == CKPT_FD_PIPE) {
-            // Only the READ end carries the contents: the bytes are in the
-            // pipe once, and taking them from both ends would double them.
-            if (!(s->fd->flags & O_WRONLY_) &&
-                    (ret = ckpt_pipe_drain(s->fd, &s->pipe_bytes, &s->pipe_len)) < 0)
+        } else {
+            s->kind = ckpt_classify_fd((int) s->num, s->fd, s->path,
+                                       sizeof(s->path));
+            if (s->kind == 0) {
+                ret = _EOPNOTSUPP;
                 goto out;
-            s->offset = s->pipe_len;
+            }
+            s->offset = s->kind == CKPT_FD_STDIO ? (uint64_t) s->fd->real_fd
+                                                 : ckpt_fd_offset(s->fd);
+            if (s->kind == CKPT_FD_PIPE) {
+                // Only the READ end carries the contents: the bytes are in the
+                // pipe once, and taking them from both ends would double them.
+                if (!(s->fd->flags & O_WRONLY_) &&
+                        (ret = ckpt_pipe_drain(s->fd, &s->pipe_bytes,
+                                               &s->pipe_len)) < 0)
+                    goto out;
+                s->offset = s->pipe_len;
+            }
         }
-        if (s->num <= 2 && s->kind == CKPT_FD_TTY) {
-            h->stdio_is_tty = 1;
-            if (h->console[0] == '\0' && s->path[0] == '/') {
-                snprintf(h->console, sizeof(h->console), "%s", s->path);
-                h->console_major = dev_major(s->fd->stat.rdev);
-                h->console_minor = dev_minor(s->fd->stat.rdev);
+
+        // WHICH terminal this process's standard streams were on, asked of
+        // every descriptor rather than only the ones being described. A shell
+        // and the login that forked it hold the SAME struct fd for their
+        // terminal, so the second is a CKPT_FD_REF -- and looking only at
+        // descriptions recorded every process but the first in a session as
+        // having no terminal, which put them all back on the console. The
+        // question here is not "what does this descriptor need in order to
+        // come back", it is "what was this process looking at".
+        if (s->num <= 2 && s->fd->tty != NULL) {
+            // tty->type is the driver's major, which is what pty_open_fake
+            // set; the device node's rdev is a second-hand copy of it.
+            int major = s->fd->tty->type;
+            bool pts = major == TTY_PSEUDO_SLAVE_MAJOR;
+            // A pty always wins over a console: it is the terminal a person is
+            // looking at, and a process holding both is one that opened the
+            // console for logging.
+            if (pts ? tty_kind != CKPT_TTY_PTS : tty_kind == CKPT_TTY_NONE) {
+                tty_kind = pts ? CKPT_TTY_PTS : CKPT_TTY_CONSOLE;
+                tty_num = s->fd->tty->num;
+                lock(&s->fd->tty->lock, 0);
+                tty_session = s->fd->tty->session;
+                tty_fg_group = s->fd->tty->fg_group;
+                tty_termios = s->fd->tty->termios;
+                tty_winsize = s->fd->tty->winsize;
+                unlock(&s->fd->tty->lock);
+                char p[MAX_PATH + 1];
+                if (generic_getpath(s->fd, p) >= 0 && p[0] == '/')
+                    snprintf(tty_path, sizeof(tty_path), "%s", p);
+                else
+                    tty_path[0] = '\0';
+                // The image's console, as a fallback for a record that names
+                // no path of its own. A pty must never set it: the app has
+                // BOTH -- a console supervisor and a session window -- and
+                // whichever was described first used to win, which is how a
+                // session on /dev/pts/1 came back on /dev/console.
+                if (!pts && h->console[0] == '\0' && tty_path[0] == '/') {
+                    snprintf(h->console, sizeof(h->console), "%s", tty_path);
+                    h->console_major = (uint32_t) major;
+                    h->console_minor = dev_minor(s->fd->stat.rdev);
+                }
             }
         }
     }
@@ -914,11 +1003,18 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         .sched_policy = task->sched_policy,
         .robust_list = task->robust_list,
         .did_exec = task->did_exec ? 1 : 0,
+        .tty_kind = tty_kind,
+        .tty_num = (uint32_t) tty_num,
+        .tty_session = tty_session,
+        .tty_fg_group = tty_fg_group,
+        .tty_termios = tty_termios,
+        .tty_winsize = tty_winsize,
         .n_sigactions = NUM_SIGS,
         .cwd_len = (uint32_t) strlen(cwd),
         .root_len = (uint32_t) strlen(root),
     };
     memcpy(rec.comm, task->comm, sizeof(rec.comm));
+    memcpy(rec.tty_path, tty_path, sizeof(rec.tty_path));
 
     struct mem *mem = NULL;
     struct ckpt_count_ctx counts = {0};
@@ -982,9 +1078,14 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         rec.stack_top = mem->stack_top;
         rec.stack_limit_pages = mem->stack_limit_pages;
         CKPT_TRACE("save pid %d (ppid %d pgid %d sid %d) %s: %u maps, %u fds, "
-                   "%llu pages\n", rec.pid, rec.ppid, rec.pgid, rec.sid,
-                   rec.comm, rec.n_maps, rec.n_fds,
-                   (unsigned long long) counts.pages);
+                   "%llu pages, pc %#llx, tty %s%s\n", rec.pid, rec.ppid, rec.pgid,
+                   rec.sid, rec.comm, rec.n_maps, rec.n_fds,
+                   (unsigned long long) counts.pages,
+                   (unsigned long long) (task->abi == GUEST_ABI_ARM64
+                           ? task->cpu.arm64_pc : task->cpu.amd64_rip),
+                   rec.tty_kind == CKPT_TTY_PTS ? "pts" :
+                   rec.tty_kind == CKPT_TTY_CONSOLE ? "console" : "none",
+                   rec.tty_kind == CKPT_TTY_PTS ? rec.tty_path : "");
     }
 
     wr(w, &rec, sizeof(rec));
@@ -1094,7 +1195,27 @@ static void ckpt_order_tasks(struct task **tasks, unsigned count) {
 // The externally-triggered form. Same body; the difference is only that there
 // is no `current` to leave running, so every task is frozen.
 int checkpoint_save_external(const char *host_path) {
-    return checkpoint_save(host_path);
+    // The caller is NOT a guest task, and it has to say so.
+    //
+    // `current` is per-thread and the app's UI thread has one: kernel/init.c's
+    // become_first_process leaves it pointing at init, and every session start
+    // leaves it pointing at that session's own first process. ckpt_freeze_all
+    // deliberately does not freeze `current` -- the task asking for a
+    // checkpoint is already at a boundary -- so an external save inherited
+    // that stale pointer and skipped a task that was running.
+    //
+    // What that produced is the worst kind of quiet: the skipped task was
+    // blocked inside wait(), never woken, never rewound, and its cpu_state was
+    // photographed mid-syscall with the program counter already past the
+    // instruction. The restored process came back as though its wait had
+    // returned, tidied up and exited -- so the session the image was taken to
+    // preserve was a pair of zombies a millisecond after the resume, with
+    // nothing anywhere reporting a failure. See [[current-is-not-always-your-task]].
+    struct task *saved = current;
+    current = NULL;
+    int err = checkpoint_save(host_path);
+    current = saved;
+    return err;
 }
 
 int checkpoint_save(const char *host_path) {
@@ -1152,6 +1273,13 @@ int checkpoint_save(const char *host_path) {
         .n_tasks = snap.count,
     };
     memcpy(h.magic, CKPT_MAGIC, sizeof(h.magic));
+    // The UTS namespace. init's, which is the one every AOK task is in unless
+    // it unshared -- and the one the resume path has to put back, because it
+    // returns before the boot code that seeds it.
+    lock(&init_uts_ns.lock, 0);
+    snprintf(h.hostname, sizeof(h.hostname), "%s", init_uts_ns.hostname);
+    snprintf(h.domainname, sizeof(h.domainname), "%s", init_uts_ns.domainname);
+    unlock(&init_uts_ns.lock);
     // Written now and rewritten at the end: the page count and the stdio kind
     // are only known once every task has been walked, and the header has to
     // come first in the file.
@@ -1206,7 +1334,6 @@ int checkpoint_save(const char *host_path) {
 // and be current.
 // What the restore has built so far, shared by every task in the image.
 struct ckpt_restore_state {
-    struct fd *stdio[3];
     // The native program the task being restored right now is, if it is one.
     // Read by the caller once ckpt_restore_task returns, so it can dispatch
     // the program rather than start a guest thread.
@@ -1225,6 +1352,24 @@ struct ckpt_restore_state {
     // by two different processes becomes ONE host pipe.
     struct { uint64_t inode; struct fd *rd, *wr; } *pipes;
     uint32_t pipe_count, pipe_cap;
+    // One standard-stream set per TERMINAL, made on first sight.
+    //
+    // Not one per image, which is what this was: six gettys on six virtual
+    // consoles all came back reading /dev/console, taking turns at each
+    // other's keystrokes. A terminal is identified by what it is -- a console
+    // by its path, a pseudo-terminal by the SESSION it belongs to, because the
+    // pty itself is new and its old number means nothing.
+    struct ckpt_stdio_set {
+        uint32_t kind;      // enum ckpt_tty_kind
+        uint32_t sid;       // CKPT_TTY_PTS: whose session this terminal is
+        char path[64];      // CKPT_TTY_CONSOLE: which device
+        struct fd *stdio[3];
+        struct tty *tty;    // CKPT_TTY_PTS: the terminal itself
+        int tty_num;
+        void *terminal;     // the tty's driver data, for the UI to adopt
+        int leader_pid;
+    } *sets;
+    uint32_t set_count, set_cap;
 };
 
 // Record `fd` under `id`, taking a reference of the table's own.
@@ -1253,6 +1398,168 @@ static int ckpt_id_put(struct ckpt_restore_state *st, uint32_t id, struct fd *fd
         st->id_count = id + 1;
     st->by_id[id] = fd_retain(fd);
     return 0;
+}
+
+// ---- restored sessions ---------------------------------------------------
+
+struct tty *(*checkpoint_open_session_tty)(void);
+
+// Sessions that came back on a fresh pseudo-terminal, waiting for the UI to
+// show them. Not part of ckpt_restore_state: the restore is over long before
+// the first terminal view controller asks, and there may be several launches
+// worth of view controllers.
+static struct checkpoint_restored_session ckpt_sessions[8];
+static unsigned ckpt_session_count, ckpt_session_taken;
+
+// Every process exit, when ISH_CHECKPOINT_DEBUG is on. A restored guest that
+// comes back and then quietly falls over is the failure mode this feature has
+// most of: the image loads, every task starts, and a second later the ones
+// that mattered are zombies with nothing anywhere saying why. The exit code is
+// the first fact worth having.
+void checkpoint_trace_exit(int pid, const char *comm, int status) {
+    CKPT_TRACE("pid %d (%s) exited, status %#x\n", pid, comm, status);
+}
+
+// The first syscalls each RESTORED task makes, when ISH_CHECKPOINT_DEBUG is on.
+// Bounded, because the point is the handful of calls between "the image was
+// loaded" and "the process that mattered is a zombie" -- after that it is a
+// running guest and this is just noise.
+#define CKPT_SYSCALL_TRACE_LIMIT 20
+void checkpoint_trace_syscall(unsigned long nr) {
+    // The task test first and the environment second: this is on the syscall
+    // path, and for everything that did not come back from an image the whole
+    // cost is one load of a bool that is false.
+    if (current == NULL || !current->ckpt_restored ||
+            current->ckpt_syscalls_traced >= CKPT_SYSCALL_TRACE_LIMIT)
+        return;
+    if (!ckpt_debug())
+        return;
+    current->ckpt_syscalls_traced++;
+    fprintf(stderr, "checkpoint: pid %d (%s) syscall %lu\n",
+            current->pid, current->comm, nr);
+}
+
+int checkpoint_take_restored_session(struct checkpoint_restored_session *out) {
+    int got = 0;
+    lock(&ckpt_lock, 0);
+    if (ckpt_session_taken < ckpt_session_count) {
+        *out = ckpt_sessions[ckpt_session_taken++];
+        got = 1;
+    }
+    unsigned count = ckpt_session_count, taken = ckpt_session_taken;
+    unlock(&ckpt_lock);
+    CKPT_TRACE("UI asked for a restored session: %s (%u of %u taken)\n",
+               got ? "handed one over" : "none left", taken, count);
+    return got;
+}
+
+// The standard streams for one restored task, made on first sight of the
+// terminal it was on and shared by everything else on that same terminal.
+//
+// A pty that cannot be made falls back to the console rather than to nothing:
+// a restored process with no terminal at all reads EOF and exits, which is
+// worse than one on a terminal nobody is watching. The CLI has no factory at
+// all and takes that path deliberately -- its terminal IS the console.
+static struct ckpt_stdio_set *ckpt_stdio_set_for(struct ckpt_restore_state *st,
+        const struct ckpt_header *h, const struct ckpt_task *rec,
+        struct fdtable *files) {
+    uint32_t kind = rec->tty_kind;
+    const char *path = rec->tty_path[0] == '/' ? rec->tty_path :
+                       h->console[0] != '\0' ? h->console : "/dev/tty1";
+    if (kind == CKPT_TTY_PTS && checkpoint_open_session_tty == NULL)
+        kind = CKPT_TTY_CONSOLE, path = h->console[0] != '\0' ? h->console
+                                                              : "/dev/tty1";
+
+    for (uint32_t i = 0; i < st->set_count; i++) {
+        struct ckpt_stdio_set *set = &st->sets[i];
+        if (set->kind != kind)
+            continue;
+        if (kind == CKPT_TTY_PTS ? set->sid == rec->sid
+                                 : strcmp(set->path, path) == 0)
+            return set;
+    }
+
+    if (st->set_count == st->set_cap) {
+        uint32_t cap = st->set_cap ? st->set_cap * 2 : 8;
+        void *n = realloc(st->sets, cap * sizeof(*st->sets));
+        if (n == NULL)
+            return NULL;
+        st->sets = n;
+        st->set_cap = cap;
+    }
+    struct ckpt_stdio_set *set = &st->sets[st->set_count];
+    memset(set, 0, sizeof(*set));
+    set->kind = kind;
+    set->sid = rec->sid;
+    snprintf(set->path, sizeof(set->path), "%s", path);
+
+    if (kind == CKPT_TTY_PTS) {
+        struct tty *tty = checkpoint_open_session_tty();
+        if (tty == NULL || IS_ERR(tty)) {
+            ckpt_refuse("could not make a terminal for restored session %u",
+                        rec->sid);
+            return NULL;
+        }
+        set->tty_num = tty->num;
+        set->terminal = tty->data;
+        set->tty = tty;
+        snprintf(set->path, sizeof(set->path), "/dev/pts/%d", tty->num);
+        int err = create_stdio(set->path, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
+        // create_stdio opened the node itself, so the reference pty_open_fake
+        // handed over is ours to drop -- exactly what starting a session does.
+        tty_release(tty);
+        if (err < 0) {
+            ckpt_refuse("could not attach restored session %u to %s: %d",
+                        rec->sid, set->path, err);
+            return NULL;
+        }
+        // Whose terminal this is, and which group is in the FOREGROUND of it.
+        // Opening it made the first restored process to arrive its owner --
+        // the login, never the shell it forked -- and a shell outside the
+        // foreground group reads EIO and exits, which is what every restored
+        // session did before this: back as a zombie within a millisecond.
+        lock(&tty->lock, 0);
+        if (rec->tty_session != 0)
+            tty->session = rec->tty_session;
+        if (rec->tty_fg_group != 0)
+            tty->fg_group = rec->tty_fg_group;
+        // The line discipline as the guest left it. Guarded on a plausible
+        // record rather than applied blindly: an image from before this
+        // travelled carries zeroes, and a terminal with no ECHO, no ICANON and
+        // no ISIG is one nothing can be typed into.
+        if (rec->tty_termios.lflags != 0 || rec->tty_termios.iflags != 0)
+            tty->termios = rec->tty_termios;
+        if (rec->tty_winsize.col != 0 && rec->tty_winsize.row != 0)
+            tty->winsize = rec->tty_winsize;
+        unlock(&tty->lock);
+        // The session LEADER is what the UI watches: when it exits the window
+        // is finished, whatever else is still in the session. The image's
+        // tasks arrive parents-first, so the first one on this terminal is it
+        // -- and if the leader itself was not saved, the first survivor is the
+        // honest answer to "whose exit ends this".
+        set->leader_pid = (int) rec->pid;
+        CKPT_TRACE("session %u came back on %s (leader pid %u, fg group %d)\n",
+                   rec->sid, set->path, rec->pid, rec->tty_fg_group);
+    } else if (kind == CKPT_TTY_CONSOLE) {
+        create_stdio(set->path,
+                     h->console[0] != '\0' && strcmp(set->path, h->console) == 0
+                             ? (int) h->console_major : TTY_CONSOLE_MAJOR,
+                     h->console[0] != '\0' && strcmp(set->path, h->console) == 0
+                             ? (int) h->console_minor : rec->tty_num);
+        CKPT_TRACE("pid %u came back on %s\n", rec->pid, set->path);
+    } else {
+        create_piped_stdio();
+    }
+
+    lock(&files->lock, 0);
+    for (unsigned i = 0; i < 3; i++) {
+        set->stdio[i] = i < files->size ? files->files[i] : NULL;
+        if (set->stdio[i] != NULL)
+            fd_retain(set->stdio[i]);   // the restore's own reference
+    }
+    unlock(&files->lock);
+    st->set_count++;
+    return set;
 }
 
 // The two ends of the pipe with this inode, created on first sight.
@@ -1284,8 +1591,7 @@ static int ckpt_pipe_for(struct ckpt_restore_state *st, uint64_t inode,
 }
 
 static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
-        const struct ckpt_task *rec, bool stdio_is_tty,
-        struct ckpt_restore_state *st) {
+        const struct ckpt_task *rec, struct ckpt_restore_state *st) {
     int err;
     struct fdtable *files;
     char cwd[MAX_PATH + 1] = {0}, root[MAX_PATH + 1] = {0};
@@ -1335,9 +1641,10 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
     // be installed below and the image's value is the one that was in force.
     lock(&current->group->lock, 0);
     memcpy(current->group->limits, limits, sizeof(limits));
-    current->group->pgid = rec->pgid;
-    current->group->sid = rec->sid;
     unlock(&current->group->lock);
+    // The session and the process group, as MEMBERSHIP and not just as two
+    // numbers -- kernel/group.c says why the fields alone were not enough.
+    tgroup_restore_ids(current, (pid_t_) rec->sid, (pid_t_) rec->pgid);
 
     // The guest architecture, and with it the address space's shape. A fresh
     // task's mm is built for the entry point's default; the image says what
@@ -1407,8 +1714,8 @@ descriptors:
     }
     unlock(&files->lock);
 
-    // The standard streams. Set up ONCE for the whole restore and SHARED by
-    // every process in it -- not created per task.
+    // The standard streams, one set per TERMINAL and shared by every process
+    // on it -- not created per task.
     //
     // Per task is what a fresh boot does, and it is wrong here for the same
     // reason it would be wrong to give a forked child its own dup of the
@@ -1418,27 +1725,29 @@ descriptors:
     // stdout and stderr went with it -- the parent then wrote into a closed
     // descriptor and the session looked hung. A fork shares the struct fd; so
     // does this.
-    if (st->stdio[0] == NULL) {
-        if (stdio_is_tty)
-            create_stdio(h->console[0] != '\0' ? h->console : "/dev/tty1",
-                         h->console[0] != '\0' ? (int) h->console_major : TTY_CONSOLE_MAJOR,
-                         h->console[0] != '\0' ? (int) h->console_minor : 1);
-        else
-            create_piped_stdio();
-        lock(&files->lock, 0);
-        for (unsigned i = 0; i < 3; i++) {
-            st->stdio[i] = i < files->size ? files->files[i] : NULL;
-            if (st->stdio[i] != NULL)
-                fd_retain(st->stdio[i]);   // the restore's own reference
+    struct ckpt_stdio_set *set = ckpt_stdio_set_for(st, h, rec, files);
+    if (set == NULL)
+        return _EAGAIN;
+    struct fd **stdio = set->stdio;
+    // Everything else on this terminal joins the session that owns it. A
+    // tgroup carries its controlling terminal across fork (kernel/fork.c), so
+    // the shell had one before the suspend; only the process that re-opened
+    // the terminal gets one back on its own.
+    if (set->tty != NULL) {
+        lock(&current->group->lock, 0);
+        if (current->group->tty == NULL) {
+            lock(&set->tty->lock, 0);
+            set->tty->refcount++;
+            unlock(&set->tty->lock);
+            current->group->tty = set->tty;
         }
-        unlock(&files->lock);
+        unlock(&current->group->lock);
     }
     // RETAINED before installing, because installing the image's fd 1 detaches
     // and CLOSES whatever was in that slot -- with a refcount of one that frees
     // it, and mirroring fd 10 from a saved pointer afterwards was then a
     // use-after-free that surfaced as `echo: I/O error` in the restored shell
     // rather than as a crash.
-    struct fd **stdio = st->stdio;
     for (unsigned i = 0; i < 3; i++) {
         if (stdio[i] == NULL)
             continue;
@@ -1802,6 +2111,21 @@ int checkpoint_restore(const char *host_path) {
     if (h.n_tasks == 0 || h.n_tasks > 4096)
         goto out;
 
+    // The UTS namespace, before any task runs. Only when the image has one:
+    // an empty hostname means the checkpointed guest had none set either, and
+    // clearing what this launch already established would be inventing a
+    // change the image does not describe.
+    h.hostname[sizeof(h.hostname) - 1] = '\0';
+    h.domainname[sizeof(h.domainname) - 1] = '\0';
+    if (h.hostname[0] != '\0')
+        uts_set_boot_hostname(h.hostname);
+    if (h.domainname[0] != '\0') {
+        lock(&init_uts_ns.lock, 0);
+        snprintf(init_uts_ns.domainname, sizeof(init_uts_ns.domainname),
+                 "%s", h.domainname);
+        unlock(&init_uts_ns.lock);
+    }
+
     built = calloc(h.n_tasks, sizeof(*built));
     if (built == NULL) { err = _ENOMEM; goto out; }
 
@@ -1839,6 +2163,8 @@ int checkpoint_restore(const char *host_path) {
             atomic_store_explicit(&task->ckpt_freeze_wanted, true,
                                   memory_order_release);
         }
+        task->ckpt_restored = true;
+        task->ckpt_syscalls_traced = 0;
         built[nbuilt++] = task;
 
         if (rec.zombie) {
@@ -1852,13 +2178,16 @@ int checkpoint_restore(const char *host_path) {
             continue;   // no register file, no maps, no descriptors follow
         }
 
-        CKPT_TRACE("load pid %u (ppid %u pgid %u sid %u) %s: %u maps, %u fds\n",
+        CKPT_TRACE("load pid %u (ppid %u pgid %u sid %u) %s: %u maps, %u fds, "
+                   "tty %s\n",
                    rec.pid, rec.ppid, rec.pgid, rec.sid, rec.comm,
-                   rec.n_maps, rec.n_fds);
+                   rec.n_maps, rec.n_fds,
+                   rec.tty_kind == CKPT_TTY_PTS ? "pts" :
+                   rec.tty_kind == CKPT_TTY_CONSOLE ? "console" : "none");
         st.native_name = st.native_argv = st.native_state = st.native_env = NULL;
         struct task *saved = current;
         current = task;
-        err = ckpt_restore_task(f, &h, &rec, h.stdio_is_tty != 0, &st);
+        err = ckpt_restore_task(f, &h, &rec, &st);
         current = saved;
         if (err == 0 && rec.native)
             err = ckpt_dispatch_native(task, &st);
@@ -1887,6 +2216,21 @@ int checkpoint_restore(const char *host_path) {
     ckpt_thaw_all();
 
     lock(&ckpt_lock, 0);
+    // Hand the restored sessions to the UI. Published only on success: a
+    // restore that failed half way leaves tasks that are about to be torn
+    // down, and a window adopting one of those would show a corpse.
+    ckpt_session_count = ckpt_session_taken = 0;
+    for (uint32_t i = 0; i < st.set_count &&
+                         ckpt_session_count < (sizeof(ckpt_sessions) /
+                                               sizeof(ckpt_sessions[0])); i++) {
+        if (st.sets[i].kind != CKPT_TTY_PTS || st.sets[i].terminal == NULL)
+            continue;
+        ckpt_sessions[ckpt_session_count++] = (struct checkpoint_restored_session) {
+            .leader_pid = st.sets[i].leader_pid,
+            .tty_num = st.sets[i].tty_num,
+            .terminal = st.sets[i].terminal,
+        };
+    }
     ckpt_status.restored = true;
     ckpt_status.generation++;
     snprintf(ckpt_status.last_path, sizeof(ckpt_status.last_path), "%s", host_path);
@@ -1897,9 +2241,10 @@ int checkpoint_restore(const char *host_path) {
 
 out:
     // The restore's own references; each task holds its own.
-    for (unsigned i = 0; i < 3; i++)
-        if (st.stdio[i] != NULL)
-            fd_close(st.stdio[i]);
+    for (uint32_t i = 0; i < st.set_count; i++)
+        for (unsigned j = 0; j < 3; j++)
+            if (st.sets[i].stdio[j] != NULL)
+                fd_close(st.sets[i].stdio[j]);
     for (uint32_t i = 0; i < st.id_count; i++)
         if (st.by_id[i] != NULL)
             fd_close(st.by_id[i]);
@@ -1911,6 +2256,7 @@ out:
     }
     free(st.by_id);
     free(st.pipes);
+    free(st.sets);
     free(built);
     fclose(f);
     return err;

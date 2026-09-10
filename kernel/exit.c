@@ -352,6 +352,8 @@ noreturn void do_exit(struct task *task, int status) {
     }
     bool was_already_exiting = task->exiting;
     task->exiting = true;
+    if (!was_already_exiting)
+        checkpoint_trace_exit(task->pid, task->comm, status);
 
     // Charge this task's final thread CPU time to its per-virtual-CPU
     // accounting slot (/proc/stat cpuN) while the host thread still exists

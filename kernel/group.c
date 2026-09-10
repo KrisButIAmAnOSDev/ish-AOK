@@ -177,6 +177,47 @@ pid_t_ task_setsid(struct task *task) {
     return new_sid;
 }
 
+// Put a restored process back into the session and process group the image
+// says it was in.
+//
+// setsid/setpgid cannot express this. They are the rules a LIVE process must
+// obey when it ASKS -- a session leader may not create a process group, a
+// child that has exec'd may not be moved, a session may not be joined at all
+// -- and a restore is not a request. It is the state being put back, and the
+// state was legal when it was taken.
+//
+// Assigning group->sid and group->pgid alone is not enough either: membership
+// lives in the per-pid session and pgroup LISTS, which is what tcsetpgrp's
+// "does this group belong to my session" check walks, and what a group signal
+// is delivered through. A restored shell whose lists said one thing and whose
+// fields said another got ENOTTY from tcsetpgrp and came up with job control
+// disabled.
+void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid) {
+    complex_lockt(&pids_lock, 0);
+    struct tgroup *group = task->group;
+    lock(&group->lock, 0);
+    // A session or group whose leader is not in the image (it exited before
+    // the checkpoint and the members were left behind) has no pid struct to
+    // hang off. Keeping the task's own is what a live orphan would look like
+    // and is better than a dangling id.
+    struct pid *spid = pid_get((dword_t) sid);
+    struct pid *gpid = pid_get((dword_t) pgid);
+    if (spid == NULL) { spid = pid_get((dword_t) task->pid); sid = task->pid; }
+    if (gpid == NULL) { gpid = pid_get((dword_t) task->pid); pgid = task->pid; }
+    if (spid != NULL) {
+        list_remove_safe(&group->session);
+        list_add(&spid->session, &group->session);
+        group->sid = sid;
+    }
+    if (gpid != NULL) {
+        list_remove_safe(&group->pgroup);
+        list_add(&gpid->pgroup, &group->pgroup);
+        group->pgid = pgid;
+    }
+    unlock(&group->lock);
+    unlock(&pids_lock);
+}
+
 dword_t sys_setsid(void) {
     STRACE("setsid()");
     return task_setsid(current);

@@ -18,6 +18,13 @@ struct tty;
 + (Terminal *)createPseudoTerminal:(struct tty **)tty;
 
 + (Terminal *)terminalWithUUID:(NSUUID *)uuid;
+
+// The factory kernel/checkpoint.c calls to give a session that came back from
+// suspend-to-disk a terminal of its own. The kernel cannot make one: a
+// pseudo-terminal's master side here is a Terminal, not a guest process.
+// Installed into checkpoint_open_session_tty before the restore runs.
+struct tty *ISHOpenTerminalForRestoredSession(void);
+
 @property (readonly) NSUUID *uuid;
 @property (readonly) int type;
 @property (readonly) int number;

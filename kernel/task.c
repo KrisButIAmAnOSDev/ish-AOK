@@ -484,6 +484,8 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     // through a null pointer: EXC_BAD_ACCESS at address 0x84, on the thread of
     // an emulated /bin/sh. The state pointer would have been a double free by
     // the same route.
+    task->ckpt_restored = false;
+    task->ckpt_syscalls_traced = 0;
     task->native_running = NULL;
     task->ckpt_native_state = NULL;
 

@@ -1,6 +1,7 @@
 #import "WorkspaceViewController.h"
 
 #import "AboutViewController.h"
+#import "AppDelegate.h"
 #import "Diagnostics.h"
 #import "Roots.h"
 #import "SceneDelegate.h"
@@ -21,6 +22,7 @@
 #import <WebKit/WebKit.h>
 #include "kernel/task.h"
 #include "fs/proc/ish.h"
+#include "kernel/checkpoint.h"
 #include "kernel/errno.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -7503,17 +7505,18 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     UIStackView *_quickActionsStack;
     UIStackView *_sessionButtonsStack;
     NSMutableArray<UIButton *> *_trackedButtons;
+    // Suspend to disk (kernel/checkpoint.c). The automatic half needs no UI --
+    // it happens on backgrounding -- so what is here is the state of it and
+    // the one thing a user cannot do any other way from a GUI: take one NOW.
+    UILabel *_suspendLabel;
+    UIButton *_suspendButton;
+    BOOL _suspendInProgress;
 }
 
-- (UIButton *)sessionButtonWithTitle:(NSString *)title subtitle:(NSString *)subtitle selector:(SEL)selector {
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.translatesAutoresizingMaskIntoConstraints = NO;
-    button.contentEdgeInsets = UIEdgeInsetsMake(7, 10, 7, 10);
-    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    button.titleLabel.numberOfLines = 0;
-    button.layer.cornerRadius = 12;
-    button.layer.borderWidth = 1;
-
+// The two-line title these buttons wear, split out because the suspend button
+// changes both halves as its state changes ("Save Session Now" / "Open
+// Settings" / "Saving...").
+- (void)restyleSessionButton:(UIButton *)button title:(NSString *)title subtitle:(NSString *)subtitle {
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
     style.alignment = NSTextAlignmentLeft;
     NSMutableAttributedString *titleString =
@@ -7536,6 +7539,17 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         NSParagraphStyleAttributeName: style,
     }]];
     [button setAttributedTitle:titleString forState:UIControlStateNormal];
+}
+
+- (UIButton *)sessionButtonWithTitle:(NSString *)title subtitle:(NSString *)subtitle selector:(SEL)selector {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    button.contentEdgeInsets = UIEdgeInsetsMake(7, 10, 7, 10);
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.titleLabel.numberOfLines = 0;
+    button.layer.cornerRadius = 12;
+    button.layer.borderWidth = 1;
+    [self restyleSessionButton:button title:title subtitle:subtitle];
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     [_trackedButtons addObject:button];
     return button;
@@ -7645,8 +7659,34 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [sessionsStack.bottomAnchor constraintEqualToAnchor:sessionsCard.bottomAnchor constant:-10],
     ]];
 
+    // ---- suspend to disk --------------------------------------------------
+    UIView *suspendCard = [self workspaceThemeCardView];
+    UIStackView *suspendStack = [UIStackView new];
+    suspendStack.translatesAutoresizingMaskIntoConstraints = NO;
+    suspendStack.axis = UILayoutConstraintAxisVertical;
+    suspendStack.spacing = 6;
+    [suspendCard addSubview:suspendStack];
+    UILabel *suspendTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
+    suspendTitle.text = @"SESSION SUSPEND";
+    suspendTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    _suspendLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
+    _suspendLabel.numberOfLines = 0;
+    _suspendButton = [self sessionButtonWithTitle:@"Save Session Now"
+                                         subtitle:@"Write this session to disk"
+                                         selector:@selector(suspendSessionShortcut:)];
+    [suspendStack addArrangedSubview:suspendTitle];
+    [suspendStack addArrangedSubview:_suspendLabel];
+    [suspendStack addArrangedSubview:_suspendButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [suspendStack.topAnchor constraintEqualToAnchor:suspendCard.topAnchor constant:10],
+        [suspendStack.leadingAnchor constraintEqualToAnchor:suspendCard.leadingAnchor constant:10],
+        [suspendStack.trailingAnchor constraintEqualToAnchor:suspendCard.trailingAnchor constant:-10],
+        [suspendStack.bottomAnchor constraintEqualToAnchor:suspendCard.bottomAnchor constant:-10],
+    ]];
+
     [_contentStack addArrangedSubview:summaryCard];
     [_contentStack addArrangedSubview:quickActionsCard];
+    [_contentStack addArrangedSubview:suspendCard];
     [_contentStack addArrangedSubview:sessionsCard];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -7705,7 +7745,92 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     [self refreshSessions];
 }
 
+// What the card says, which is the state of the feature rather than a label.
+//
+// Four things a user can act on: whether it is on at all, what the last
+// attempt did, why it refused if it did, and how big the session is. The
+// refusal is the one worth showing verbatim -- it names the process, and the
+// answer ("quit that program, or use zsh rather than native dash") is only
+// obvious once you know which one it is.
+- (void)refreshSuspendCard {
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    BOOL on = UserPreferences.shared.shouldSuspendToDisk;
+
+    NSString *text;
+    if (_suspendInProgress) {
+        text = @"Saving…";
+    } else if (!on) {
+        text = @"Off. Turn on Suspend to Disk in Settings to keep this session "
+                "when iSH-AOK is closed or ends.";
+    } else if (ck.last_refusal[0] != '\0') {
+        text = [NSString stringWithFormat:@"On. The last attempt was refused: %s",
+                ck.last_refusal];
+    } else if (ck.saves > 0) {
+        text = [NSString stringWithFormat:
+                @"On. Last saved %lu process%@, %.1f MB. Saved again whenever "
+                "iSH-AOK goes to the background.",
+                ck.tasks, ck.tasks == 1 ? @"" : @"es",
+                (double) ck.bytes / (1024.0 * 1024.0)];
+    } else {
+        text = @"On. This session is saved whenever iSH-AOK goes to the "
+                "background, and comes back on the next launch.";
+    }
+    _suspendLabel.text = text;
+
+    // The button turns into the way to switch it on, because a "Save Session
+    // Now" that quietly does nothing is worse than no button.
+    NSString *title = on ? @"Save Session Now" : @"Open Settings";
+    NSString *subtitle = on ? @"Write this session to disk"
+                            : @"Turn on Suspend to Disk";
+    if (_suspendInProgress) {
+        title = @"Saving…";
+        subtitle = @"Every process is stopped while this is written";
+    }
+    [self restyleSessionButton:_suspendButton title:title subtitle:subtitle];
+    _suspendButton.enabled = !_suspendInProgress;
+    _suspendButton.alpha = _suspendInProgress ? 0.5 : 1.0;
+}
+
+- (void)suspendSessionShortcut:(__unused id)sender {
+    if (!UserPreferences.shared.shouldSuspendToDisk) {
+        [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        return;
+    }
+    if (_suspendInProgress)
+        return;
+    _suspendInProgress = YES;
+    [self refreshSuspendCard];
+
+    // OFF the main thread: the save freezes every guest task, writes the image
+    // and thaws before it returns, and on a large session that is long enough
+    // to be a visible stall. The guest is stopped for that time either way --
+    // it is the UI that must not be.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int err = ISHSuspendSessionSaveNow();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_suspendInProgress = NO;
+            [self refreshSuspendCard];
+            if (err != 0) {
+                struct checkpoint_status ck;
+                checkpoint_get_status(&ck);
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:@"Session not saved"
+                                     message:ck.last_refusal[0] != '\0'
+                                             ? @(ck.last_refusal)
+                                             : @"iSH-AOK could not write the session."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                          style:UIAlertActionStyleDefault
+                                                        handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+            }
+        });
+    });
+}
+
 - (void)refreshSessions {
+    [self refreshSuspendCard];
     NSUInteger sceneCount = 0;
     if (@available(iOS 13.0, *)) {
         sceneCount = UIApplication.sharedApplication.connectedScenes.count;

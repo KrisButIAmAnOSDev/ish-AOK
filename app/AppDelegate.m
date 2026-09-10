@@ -39,6 +39,7 @@
 #import "LocationDevice.h"
 #import "NSObject+SaneKVO.h"
 #import "Roots.h"
+#import "Terminal.h"
 #import "TerminalViewController.h"
 #include "kernel/checkpoint.h"
 #import "UserPreferences.h"
@@ -2429,11 +2430,18 @@ static UIViewController *CreateRootSelectionViewController(void) {
 // not the filesystem -- a root that is exported, copied or deleted should not
 // take a session with it, and a session that no longer matches its root is
 // refused on the way in rather than half-applied.
-static NSString *ISHSuspendImagePath(void) {
+NSString *ISHSuspendSessionImagePath(void) {
     NSURL *container = ContainerURL();
     if (container == nil)
         return nil;
     return [container URLByAppendingPathComponent:@"suspend.img"].path;
+}
+
+int ISHSuspendSessionSaveNow(void) {
+    NSString *image = ISHSuspendSessionImagePath();
+    if (image == nil)
+        return _ENOENT;
+    return checkpoint_save_external(image.fileSystemRepresentation);
 }
 
 static TerminalViewController *CreateTerminalViewController(void) {
@@ -2590,44 +2598,6 @@ static TerminalViewController *CreateTerminalViewController(void) {
 
     FsInitialize();
 
-    // ---- suspend to disk: resume, if there is a session to resume -----------
-    //
-    // Before the device nodes and before the boot command, because a restored
-    // guest brings its own descriptors and its own first program: everything
-    // below this point is what a FRESH boot needs, and a resume needs none of
-    // it. The image is consumed by being restored -- leaving it would resume
-    // the same moment again on the launch after this one, hiding a session the
-    // user had since suspended over the top of it.
-    //
-    // A failure here is not a boot failure. The image may be from another
-    // build (kernel/checkpoint.c refuses one by fingerprint rather than
-    // reinterpreting it), or describe something this build cannot rebuild. The
-    // right answer to all of that is the behaviour the user gets with this
-    // switch off: boot normally.
-    NSString *sessionImage = ISHSuspendImagePath();
-    // The same switch gates the guest's own control of this. Published rather
-    // than read from the kernel, because UserPreferences is Objective-C and
-    // fs/proc/ish.c is not; re-published on every activation below, so
-    // flipping it in Settings takes effect without a relaunch.
-    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
-    if (UserPreferences.shared.shouldSuspendToDisk && sessionImage != nil) {
-        checkpoint_set_session(sessionImage.fileSystemRepresentation);
-        if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
-            int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
-            [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
-            if (rerr >= 0) {
-                os_log(ISHSuspendLog(), "resumed a suspended session");
-                [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
-                                               details:@{@"root": defaultRoot}];
-                return 0;
-            }
-            os_log_error(ISHSuspendLog(),
-                         "could not resume the suspended session (%{public}d); booting",
-                         rerr);
-            [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume_failed"
-                                           details:@{@"err": @(rerr)}];
-        }
-    }
 
     // Repair or recreate the core device nodes the app owns. This keeps older
     // roots working when a device major/minor changes in a later app build.
@@ -3026,6 +2996,59 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // create_stdio's device check miss the 5:1 node and fall back to
     // opening tty1 directly, auto-attaching it to PID 1's session -- which
     // permanently blocked getty@tty1's TIOCSCTTY, leaving every systemd
+    // ---- suspend to disk: resume, if there is a session to resume -----------
+    //
+    // AFTER the tty driver is registered just above, and that ordering is not
+    // cosmetic: a restored process can have a terminal open, and re-opening
+    // one goes through tty_device_open, which ASSERTS on a major with no
+    // driver. Placed earlier, every resume killed the app with SIGABRT on
+    // that assert -- the crash report names tty_device_open directly.
+    //
+    // Still before the boot command, because a restored
+    // guest brings its own descriptors and its own first program: everything
+    // below this point is what a FRESH boot needs, and a resume needs none of
+    // it. The image is consumed by being restored -- leaving it would resume
+    // the same moment again on the launch after this one, hiding a session the
+    // user had since suspended over the top of it.
+    //
+    // A failure here is not a boot failure. The image may be from another
+    // build (kernel/checkpoint.c refuses one by fingerprint rather than
+    // reinterpreting it), or describe something this build cannot rebuild. The
+    // right answer to all of that is the behaviour the user gets with this
+    // switch off: boot normally.
+    // How a restored session gets a terminal a person can see. Installed
+    // before the restore, because the restore is what calls it: a session that
+    // was on a pseudo-terminal comes back on a NEW one, and the terminal view
+    // controller adopts that instead of starting a shell of its own. Without
+    // it, every restored session collapsed onto /dev/console -- alive and
+    // correct, on a terminal nobody was looking at, while the window the user
+    // could see held a shell that had just been started.
+    checkpoint_open_session_tty = ISHOpenTerminalForRestoredSession;
+    NSString *sessionImage = ISHSuspendSessionImagePath();
+    // The same switch gates the guest's own control of this. Published rather
+    // than read from the kernel, because UserPreferences is Objective-C and
+    // fs/proc/ish.c is not; re-published on every activation below, so
+    // flipping it in Settings takes effect without a relaunch.
+    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
+    if (UserPreferences.shared.shouldSuspendToDisk && sessionImage != nil) {
+        checkpoint_set_session(sessionImage.fileSystemRepresentation);
+        if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
+            int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
+            [NSFileManager.defaultManager removeItemAtPath:sessionImage error:nil];
+            if (rerr >= 0) {
+                os_log(ISHSuspendLog(), "resumed a suspended session");
+                [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
+                                               details:@{@"root": defaultRoot}];
+                return 0;
+            }
+            os_log_error(ISHSuspendLog(),
+                         "could not resume the suspended session (%{public}d); booting",
+                         rerr);
+            [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume_failed"
+                                           details:@{@"err": @(rerr)}];
+        }
+    }
+
     // boot without a console login prompt (agetty parked pre-exec in
     // acquire_terminal, "[(agetty)]" in ps).
     err = create_stdio("/dev/console", TTY_ALTERNATE_MAJOR, DEV_CONSOLE_MINOR);
@@ -3887,7 +3910,7 @@ void ISHSuspendGuardEnterBackground(void) {
     // refuses (a native program that cannot describe itself, a descriptor with
     // no restore rule) it says so and the next launch simply boots.
     if (UserPreferences.shared.shouldSuspendToDisk) {
-        NSString *image = ISHSuspendImagePath();
+        NSString *image = ISHSuspendSessionImagePath();
         if (image != nil) {
             int cerr = checkpoint_save_external(image.fileSystemRepresentation);
             struct checkpoint_status ck;
