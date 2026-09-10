@@ -583,8 +583,8 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
     if (ck.pages != 0)
         proc_printf(buf, "last_pages      %lu (%llu bytes of guest memory)\n",
                     ck.pages, ck.bytes);
-    if (ck.fds != 0)
-        proc_printf(buf, "last_fds        %lu\n", ck.fds);
+    if (ck.tasks != 0)
+        proc_printf(buf, "last_tasks      %lu\n", ck.tasks);
     if (ck.last_err != 0)
         proc_printf(buf, "last_err        %d\n", ck.last_err);
     if (ck.last_refusal[0] != '\0')

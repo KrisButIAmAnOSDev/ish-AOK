@@ -219,6 +219,9 @@ void deliver_signal(struct task *task, int sig, struct siginfo_ info);
 void ptrace_discard_interrupt_traps(struct task *task);
 // true when the next unblocked pending signal would run a handler with SA_RESTART
 bool signal_should_restart_syscall(void);
+// Wake a task out of whatever it is blocked in, with no signal involved --
+// kernel/checkpoint.c's freezer. See the definition.
+void task_wake_for_freeze(struct task *task);
 bool signal_should_restart_syscall_nohand(void);
 
 // Turn a wait's _EINTR into _ERESTART when the handler that interrupted it was

@@ -127,6 +127,37 @@ esac
 [ -e "$IMG" ] && { echo "FAIL: the session image survived being resumed"; exit 1; }
 echo "  resume  | (image consumed)"
 
+# ---- more than one process ------------------------------------------------
+#
+# The interesting half, and the reason for the freezer. The parent here is
+# blocked in wait(), its child is blocked in nanosleep, and NEITHER is at a
+# place a checkpoint can describe until the machine is stopped: the freeze
+# wakes them, their waits come back EINTR, the dispatcher rewinds the program
+# counter over the syscall instruction, and they arrive at the loop top about
+# to re-execute the call they were in. On the far side of the restore they do
+# exactly that.
+rm -f "$IMG"
+mp_out=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c '
+/bin/sleep 3 &
+echo "launch1: child is $!"
+echo suspend > /proc/ish/checkpoint
+echo "launch2: back, waiting"
+wait
+echo "launch2: wait returned $?"
+' 2>&1)
+echo "$mp_out" | sed 's/^/  procs   | /'
+case $mp_out in
+    *"launch2"*) echo "FAIL: the suspending guest kept running"; exit 1;;
+esac
+[ -s "$IMG" ] || { echo "FAIL: no image for the two-process guest"; exit 1; }
+
+mp_back=$(ISH_GUEST_CHECKPOINT=1 ISH_SESSION="$IMG" "$ISH" -f "$ROOT" $SH -c 'x' 2>&1)
+echo "$mp_back" | sed 's/^/  procs   | /'
+case $mp_back in
+    *"launch2: back, waiting"*"launch2: wait returned 0"*) ;;
+    *) echo "FAIL: the child did not survive the restore"; echo "  got: $mp_back"; exit 1;;
+esac
+
 # ---- and the refusals ------------------------------------------------------
 #
 # A capability boundary that never fires is not a boundary, it is a comment.
@@ -145,9 +176,6 @@ READ_REFUSAL='while read -r l; do case $l in last_refusal*) echo "$l";; esac; do
 refuse "a native program on the stack" /AOK/native/dash \
     "echo save $IMG > /proc/ish/checkpoint 2>/dev/null; $READ_REFUSAL" \
     "is a native program"
-refuse "a second task still running" $SH \
-    "/bin/sleep 5 & echo save $IMG > /proc/ish/checkpoint 2>/dev/null; $READ_REFUSAL" \
-    "is also running"
 refuse "a pipe with no restore rule" $SH \
     "mkfifo /tmp/ckpt-fifo 2>/dev/null; exec 4<> /tmp/ckpt-fifo
      echo save $IMG > /proc/ish/checkpoint; $READ_REFUSAL" \

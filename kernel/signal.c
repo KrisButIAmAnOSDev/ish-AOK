@@ -667,6 +667,29 @@ static bool signal_wake_task(struct task *task, struct sighand *sighand, int sig
     return interrupted_wait;
 }
 
+// Wake a task out of whatever it is blocked in, with no signal involved.
+//
+// For kernel/checkpoint.c's freezer. It is signal_wake_task's body without the
+// signal: the same two pokes, for the same reason -- pthread_kill(SIGUSR1) to
+// break a HOST syscall, and wake_waiting_task to break a wait parked on a
+// cond_t. Neither alone is enough (see the note above about Darwin swallowing
+// SIGUSR1), and a freeze that misses one task is a freeze that does not
+// happen.
+//
+// No sighand lock: this takes none of the group's locks and delivers nothing,
+// so it cannot be the ABBA hazard signal_wake_task has to dance around.
+void task_wake_for_freeze(struct task *task) {
+    if (task == NULL || task == current)
+        return;
+    __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
+    if (task->thread != 0)
+        pthread_kill(task->thread, SIGUSR1);
+    cpu_poke(&task->cpu);
+    lock(&task->sighand->wake_lock, 0);
+    wake_waiting_task(task);
+    unlock(&task->sighand->wake_lock);
+}
+
 static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {
     if (!interrupted_wait)
         return;

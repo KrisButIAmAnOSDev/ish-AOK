@@ -161,6 +161,20 @@ struct task {
     
     int stuck_count;
 
+    // ---- the checkpoint freezer (kernel/checkpoint.c) --------------------
+    //
+    // `wanted` says this task must reach a syscall boundary and park; `frozen`
+    // says it has. Two flags rather than one because the freezer has to WAIT
+    // for the answer, and "I asked" and "it happened" are different facts --
+    // conflating them is how a checkpoint ends up describing a task that was
+    // still running.
+    //
+    // Atomic and nothing else: set by the freezing thread, read and answered
+    // by the task's own thread, with no lock between them. A task that is
+    // exiting simply never answers, which the freezer's timeout covers.
+    _Atomic bool ckpt_freeze_wanted;
+    _Atomic bool ckpt_frozen;
+
     struct tgroup *group; // immutable
     struct list group_links;
     pid_t_ pid, tgid; // immutable
@@ -484,6 +498,11 @@ static inline bool task_is_64bit(const struct task *task) {
 // parent as NULL to create the init process. Returns NULL if out of memory.
 // Ends with an underscore because there's a mach function by the same name
 struct task *task_create_(struct task *parent);
+// The same, but claiming a SPECIFIC pid rather than the next free one. For
+// kernel/checkpoint.c: a restored process has to answer to the pid it had, or
+// every $$, getppid() and recorded child pid in the guest is wrong. Returns
+// NULL if that pid is already taken or reserved.
+struct task *task_create_with_pid(struct task *parent, pid_t_ want);
 
 // Synthetic kernel threads (kernel/task.c). They have no task and no thread --
 // just enough of /proc for ps to render them bracketed, which is what programs

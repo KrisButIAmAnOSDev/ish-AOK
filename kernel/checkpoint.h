@@ -45,6 +45,24 @@ void checkpoint_run_pending(void);
 // The session file the entry point was given, if any: restored at startup and
 // written at suspend. Empty means neither. kernel/checkpoint.c owns the
 // string so both halves name the same file.
+// ---- the freezer ---------------------------------------------------------
+//
+// Stopping the machine, which AOK can do because it owns the scheduler.
+//
+// A task running guest code parks at the top of task_run_current's loop. A
+// task blocked INSIDE a syscall is woken the way a signal wakes it, its wait
+// returns EINTR, and the dispatcher turns that into a RESTART -- the program
+// counter is rewound over the syscall instruction, so the task arrives at the
+// loop top about to re-execute the call it was in. That is what makes a
+// blocked read() checkpointable: the image says "about to call read", and the
+// restored guest calls it.
+//
+// checkpoint_freeze_pending is read by kernel/calls.c on every syscall return,
+// so it is deliberately one relaxed load of one global in the common case.
+bool checkpoint_freeze_pending(void);
+// Called at the top of task_run_current's loop, with no lock held.
+void checkpoint_park_if_frozen(void);
+
 void checkpoint_set_session(const char *host_path);
 const char *checkpoint_session(void);
 
@@ -62,6 +80,7 @@ struct checkpoint_status {
     unsigned long long bytes; // size of the last file written
     unsigned long pages;      // guest pages in it
     unsigned long fds;        // descriptors in it
+    unsigned long tasks;      // processes in it
 };
 void checkpoint_get_status(struct checkpoint_status *out);
 

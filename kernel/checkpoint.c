@@ -59,6 +59,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,7 @@
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/mm.h"
+#include "kernel/personality.h"
 #include "kernel/resource.h"
 #include "kernel/signal.h"
 #include "kernel/init.h"
@@ -81,6 +83,15 @@
 
 #define CKPT_MAGIC "AOKCKPT"
 #define CKPT_VERSION 1
+// How long the freezer waits for a task to reach a syscall boundary.
+//
+// Generous on purpose. Every wait in the guest is broken by the poke, so a
+// task normally parks in microseconds; the cases that take longer are a task
+// inside a host syscall that the SIGUSR1 has to interrupt, and one running a
+// long stretch of guest code between checkpoints. Two seconds is long enough
+// that neither is a flake and short enough that a genuinely stuck task is
+// reported rather than waited for.
+#define CKPT_FREEZE_TIMEOUT_MS 2000
 
 // Kinds of descriptor this version knows how to bring back. Anything else is a
 // refusal naming the fd number and the filesystem it came from, because "the
@@ -90,6 +101,7 @@ enum ckpt_fd_kind {
     CKPT_FD_DIR,          // directory: re-open by path
     CKPT_FD_TTY,          // the console: re-attach to this run's tty
     CKPT_FD_STDIO,        // 0/1/2 as the app handed them over: re-attach too
+    CKPT_FD_CHR,          // /dev/null and friends: re-open the device by path
 };
 
 // ISH_CHECKPOINT_DEBUG=1 traces every record on the way out and on the way
@@ -109,6 +121,7 @@ static const char *ckpt_kind_name(uint32_t kind) {
         case CKPT_FD_FILE: return "file";
         case CKPT_FD_DIR: return "dir";
         case CKPT_FD_TTY: return "tty";
+        case CKPT_FD_CHR: return "chr";
         case CKPT_FD_STDIO: return "stdio";
         default: return "?";
     }
@@ -121,8 +134,7 @@ struct ckpt_header {
     uint32_t cpu_state_size;   // struct cpu_state is written as bytes
     uint32_t page_size;
     uint64_t build_fingerprint;
-    uint32_t n_maps;
-    uint32_t n_fds;
+    uint32_t n_tasks;
     uint64_t total_pages;
     // Whether the checkpointed guest's standard streams were a terminal or
     // pipes. They are RE-ATTACHED rather than restored -- the terminal on the
@@ -134,7 +146,21 @@ struct ckpt_header {
 };
 
 struct ckpt_task {
-    uint32_t pid, pgid, sid;
+    uint32_t pid, ppid, pgid, sid;
+    uint32_t n_maps, n_fds;
+    uint32_t abi;
+    // A zombie: no address space, no descriptors, nothing but an exit status
+    // its parent has not collected yet. Recorded because dropping it turns the
+    // parent's wait() into a hang on the far side of a restore.
+    uint32_t zombie, exit_code;
+    // What a child sends its parent when it dies. Set by clone() from the
+    // flags; zero on a freshly built task, which is exactly what a restored
+    // child was getting -- it exited cleanly, sent nothing, and its parent's
+    // wait() never returned. The rest travel with it for the same reason:
+    // nothing else puts them back.
+    int32_t exit_signal, pdeath_signal, nice, sched_policy;
+    uint64_t robust_list;
+    uint32_t did_exec;
     uint32_t uid, gid, euid, egid, suid, sgid, fsuid, fsgid;
     uint32_t umask;
     char comm[16];
@@ -213,6 +239,144 @@ static uint64_t ckpt_fingerprint(void) {
     return h;
 }
 
+// ------------------------------------------------------------------ freezer
+
+// >0 while a freeze is in progress. One global rather than a per-task read,
+// because kernel/calls.c consults it on EVERY syscall return: the common
+// answer is "no" and it must cost a relaxed load and a branch.
+static _Atomic int ckpt_freeze_active;
+// The parking lot. A leaf lock -- nothing is ever taken under it.
+static pthread_mutex_t ckpt_park_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ckpt_park_cond = PTHREAD_COND_INITIALIZER;
+
+// A task that will never park, because it is already leaving.
+//
+// A zombie has no thread left to reach the parking place, and a task inside
+// do_exit is not going to get there either. Waiting for one is waiting for
+// something that cannot happen: the freeze times out, the checkpoint refuses,
+// and it looks like a bug in the freezer. It is the ordinary case -- a
+// `( sleep 1; ... ) &` whose child finishes while the image is being taken.
+//
+// They are also not written to the image. A zombie IS real state -- its parent
+// may be about to wait for it -- and losing one turns that wait into a hang,
+// so it is recorded as a zombie and recreated rather than dropped. A task
+// mid-exit is not recorded at all: it has already run its last instruction.
+static bool ckpt_task_is_leaving(struct task *t) {
+    return t->zombie || t->exiting ||
+        atomic_load_explicit(&t->exit_finished, memory_order_acquire);
+}
+
+bool checkpoint_freeze_pending(void) {
+    if (atomic_load_explicit(&ckpt_freeze_active, memory_order_relaxed) == 0)
+        return false;
+    return current != NULL &&
+        atomic_load_explicit(&current->ckpt_freeze_wanted, memory_order_acquire);
+}
+
+void checkpoint_park_if_frozen(void) {
+    if (atomic_load_explicit(&ckpt_freeze_active, memory_order_relaxed) == 0)
+        return;
+    if (current == NULL ||
+            !atomic_load_explicit(&current->ckpt_freeze_wanted, memory_order_acquire))
+        return;
+
+    // No missed wakeup: the flag is re-checked under the mutex the thawer
+    // signals with, the same shape as emu/memory.c's quiesce parking lot.
+    pthread_mutex_lock(&ckpt_park_lock);
+    atomic_store_explicit(&current->ckpt_frozen, true, memory_order_release);
+    pthread_cond_broadcast(&ckpt_park_cond);
+    while (atomic_load_explicit(&current->ckpt_freeze_wanted, memory_order_acquire))
+        pthread_cond_wait(&ckpt_park_cond, &ckpt_park_lock);
+    atomic_store_explicit(&current->ckpt_frozen, false, memory_order_release);
+    pthread_mutex_unlock(&ckpt_park_lock);
+}
+
+// Ask every task but this one to reach a boundary and stop there.
+//
+// Returns 0 with every task parked, or _EBUSY with `blame` naming the one that
+// would not stop. Thaws on failure, so a refusal leaves the guest exactly as
+// it was.
+static int ckpt_freeze_all(unsigned timeout_ms, char *blame, size_t blame_size) {
+    struct task_snapshot snap = {0};
+    if (task_snapshot_collect(&snap, false) < 0)
+        return _EAGAIN;
+
+    atomic_fetch_add_explicit(&ckpt_freeze_active, 1, memory_order_acq_rel);
+    for (unsigned i = 0; i < snap.count; i++) {
+        struct task *t = snap.tasks[i];
+        if (t == current)
+            continue;
+        atomic_store_explicit(&t->ckpt_freeze_wanted, true, memory_order_release);
+    }
+    // Woken only AFTER every flag is set. A task woken while a sibling's flag
+    // was still clear could run on, block again in something the freezer has
+    // already passed, and never be asked a second time.
+    for (unsigned i = 0; i < snap.count; i++) {
+        struct task *t = snap.tasks[i];
+        if (t != current)
+            task_wake_for_freeze(t);
+    }
+
+    int err = 0;
+    struct task *stuck = NULL;
+    for (unsigned spins = 0; ; spins++) {
+        stuck = NULL;
+        for (unsigned i = 0; i < snap.count; i++) {
+            struct task *t = snap.tasks[i];
+            if (t == current)
+                continue;
+            if (ckpt_task_is_leaving(t))
+                continue;   // see ckpt_task_is_leaving
+            if (!atomic_load_explicit(&t->ckpt_frozen, memory_order_acquire)) {
+                stuck = t;
+                break;
+            }
+        }
+        if (stuck == NULL)
+            break;
+        if (spins * 2 >= timeout_ms) {
+            err = _EBUSY;
+            break;
+        }
+        // Poked again on every pass. One wake can be lost -- a task that was
+        // between waits when the first arrived takes the next one instead --
+        // and a freeze that gives up because of a single dropped poke would
+        // be a flake rather than a limit.
+        task_wake_for_freeze(stuck);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+
+    if (err != 0 && stuck != NULL && blame != NULL)
+        snprintf(blame, blame_size, "pid %d (%s) did not reach a syscall "
+                 "boundary within %ums", stuck->pid, stuck->comm, timeout_ms);
+    if (err != 0) {
+        for (unsigned i = 0; i < snap.count; i++)
+            atomic_store_explicit(&snap.tasks[i]->ckpt_freeze_wanted, false,
+                                  memory_order_release);
+        pthread_mutex_lock(&ckpt_park_lock);
+        pthread_cond_broadcast(&ckpt_park_cond);
+        pthread_mutex_unlock(&ckpt_park_lock);
+        atomic_fetch_sub_explicit(&ckpt_freeze_active, 1, memory_order_acq_rel);
+    }
+    task_snapshot_release(&snap);
+    return err;
+}
+
+static void ckpt_thaw_all(void) {
+    struct task_snapshot snap = {0};
+    if (task_snapshot_collect(&snap, false) == 0) {
+        for (unsigned i = 0; i < snap.count; i++)
+            atomic_store_explicit(&snap.tasks[i]->ckpt_freeze_wanted, false,
+                                  memory_order_release);
+        task_snapshot_release(&snap);
+    }
+    pthread_mutex_lock(&ckpt_park_lock);
+    pthread_cond_broadcast(&ckpt_park_cond);
+    pthread_mutex_unlock(&ckpt_park_lock);
+    atomic_fetch_sub_explicit(&ckpt_freeze_active, 1, memory_order_acq_rel);
+}
+
 // ------------------------------------------------------------------ writing
 
 struct ckpt_writer {
@@ -246,25 +410,22 @@ static int ckpt_check_scope(void) {
     int err = 0;
     for (unsigned i = 0; i < snap.count; i++) {
         struct task *t = snap.tasks[i];
-        if (t == current)
-            continue;
-        ckpt_refuse("pid %d (%s) is also running -- v1 checkpoints a "
-                    "single-task guest", t->pid, t->comm);
-        err = _EBUSY;
-        break;
+        // A native program is a C function on a HOST thread -- there is no
+        // serialising that stack, and it never returns to task_run_current's
+        // loop, so it can neither be frozen nor described. The project's rule
+        // is that it either dumps its own state or the checkpoint refuses;
+        // this is the refusing half, and it names the program so the limit is
+        // reportable rather than mysterious.
+        if (t->native_exec != NULL || t->native_cmdline != NULL) {
+            ckpt_refuse("pid %d is a native program (%s); a native program is "
+                        "a C function on a host thread and its stack cannot "
+                        "be serialised", t->pid, t->comm[0] ? t->comm : "?");
+            err = _EOPNOTSUPP;
+            break;
+        }
     }
     task_snapshot_release(&snap);
-    if (err != 0)
-        return err;
-
-    if (current->native_exec != NULL || current->native_cmdline != NULL) {
-        ckpt_refuse("pid %d is a native program (%s); a native program is a C "
-                    "function on a host thread and its stack cannot be "
-                    "serialised", current->pid,
-                    current->comm[0] ? current->comm : "?");
-        return _EOPNOTSUPP;
-    }
-    return 0;
+    return err;
 }
 
 // One descriptor, gathered under files->lock and described afterwards.
@@ -307,7 +468,7 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
     // whatever family opened it, and it comes back by being RE-OPENED rather
     // than restored -- sockrestart's model, and the only honest one for a
     // terminal belonging to a process that no longer exists.
-    if (S_ISCHR(fd->type) || fd->tty != NULL)
+    if (fd->tty != NULL)
         return CKPT_FD_TTY;
     // The standard streams as the entry point handed them over. On the CLI
     // with output piped these are host descriptors wrapped in a struct fd
@@ -325,6 +486,13 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
     if (fd->real_fd >= 0 && fd->real_fd <= 2 &&
             !S_ISREG(fd->type) && !S_ISDIR(fd->type))
         return CKPT_FD_STDIO;
+    // An ordinary character device -- /dev/null, /dev/zero, /dev/urandom.
+    // These have a stable path and no state, so they come back by being
+    // opened again, and they are NOT the terminal case above: treating
+    // /dev/null as a console gave a backgrounded `sleep &` a tty for stdin,
+    // which is the opposite of what putting it on /dev/null was for.
+    if (S_ISCHR(fd->type) && generic_getpath(fd, path) >= 0 && path[0] == '/')
+        return CKPT_FD_CHR;
     if (!S_ISREG(fd->type) && !S_ISDIR(fd->type)) {
         ckpt_refuse("fd %d is a %s on %s with no restore rule",
                     num, S_ISFIFO(fd->type) ? "pipe" :
@@ -418,37 +586,57 @@ static int ckpt_emit_map(void *vctx, page_t start, pages_t pages, unsigned flags
     return c->w->err;
 }
 
-int checkpoint_save(const char *host_path) {
-    int err = ckpt_check_scope();
-    if (err < 0)
-        return err;
+// One task, written in full: its record, its register file, its signal
+// dispositions and limits, its address space, its descriptors.
+//
+// `current` is REPOINTED at the task for the duration. That is an established
+// move in this tree (kernel/init.c does it in three places) and it is what
+// lets every helper below -- generic_getpath, mem_ptr, the filesystem's lseek
+// -- be the ordinary one rather than a second copy that takes an explicit
+// task. Safe because every other task is frozen; unsafe the moment that stops
+// being true.
+static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
+        uint32_t *stdio_is_tty, uint64_t *pages_out) {
+    struct task *saved_current = current;
+    current = task;
+    int ret = 0;
 
-    struct mem *mem = current->mem;
-    struct mm *mm = current->mm;
+    if (task->zombie) {
+        // Nothing but the status its parent has not collected. No address
+        // space, no descriptors, no register file -- a zombie has already run
+        // its last instruction, and what makes it worth recording is that
+        // something is still going to wait() for it.
+        struct ckpt_task z = {
+            .pid = task->pid,
+            .ppid = task->parent != NULL ? task->parent->pid : 0,
+            .pgid = task->group != NULL ? task->group->pgid : 0,
+            .sid = task->group != NULL ? task->group->sid : 0,
+            .abi = (uint32_t) task->abi,
+            .zombie = 1,
+            .exit_code = task->exit_code,
+            .n_sigactions = NUM_SIGS,
+        };
+        memcpy(z.comm, task->comm, sizeof(z.comm));
+        CKPT_TRACE("save pid %d (ppid %d) %s: ZOMBIE, exit code %#x\n",
+                   z.pid, z.ppid, z.comm, z.exit_code);
+        wr(w, &z, sizeof(z));
+        current = saved_current;
+        return w->err;
+    }
 
-    // Classify every descriptor BEFORE opening the output file, so a guest
-    // holding something unrestorable gets a refusal and no half-written image.
-    // Every descriptor is gathered ONCE, with a reference held, and the table
-    // lock is dropped before anything is asked of them. Two reasons, and the
-    // second was found the hard way:
-    //
-    //  - Classifying twice (a pre-flight pass and then the write) meant
-    //    describing a table that could have changed in between.
-    //  - Asking a descriptor where it is positioned runs the filesystem's
-    //    lseek, and on /proc/ish/checkpoint that regenerates the file --
-    //    which walks every task's fd table, including this one. Holding
-    //    files->lock across it deadlocked the guest against itself.
-    struct fdtable *files = current->files;
-    struct ckpt_saved_fd *saved;
-    unsigned nfds = 0, cap;
-    uint32_t stdio_is_tty = 0;
+    struct mem *mem = task->mem;
+    struct mm *mm = task->mm;
+    struct fdtable *files = task->files;
+    struct ckpt_saved_fd *saved = NULL;
+    unsigned nfds = 0;
 
     lock(&files->lock, 0);
-    cap = files->size;
+    unsigned cap = files->size;
     saved = calloc(cap != 0 ? cap : 1, sizeof(*saved));
     if (saved == NULL) {
         unlock(&files->lock);
-        return _ENOMEM;
+        ret = _ENOMEM;
+        goto out;
     }
     for (unsigned i = 0; i < files->size; i++) {
         struct fd *fd = files->files[i];
@@ -465,60 +653,50 @@ int checkpoint_save(const char *host_path) {
         struct ckpt_saved_fd *s = &saved[i];
         s->kind = ckpt_classify_fd((int) s->num, s->fd, s->path, sizeof(s->path));
         if (s->kind == 0) {
-            for (unsigned j = 0; j < nfds; j++)
-                fd_close(saved[j].fd);
-            free(saved);
-            return _EOPNOTSUPP;
+            ret = _EOPNOTSUPP;
+            goto out;
         }
         s->offset = s->kind == CKPT_FD_STDIO ? (uint64_t) s->fd->real_fd
                                              : ckpt_fd_offset(s->fd);
         if (s->num <= 2 && s->kind == CKPT_FD_TTY)
-            stdio_is_tty = 1;
+            *stdio_is_tty = 1;
     }
-
-    FILE *f = fopen(host_path, "wb");
-    if (f == NULL)
-        return errno_map();
-    struct ckpt_writer w = { .f = f };
 
     read_lock(&mem->lock);
     struct ckpt_count_ctx counts = {0};
     ckpt_for_each_map(mem, ckpt_count_map, &counts);
 
-    struct ckpt_header h = {
-        .version = CKPT_VERSION,
-        .abi = (uint32_t) current->abi,
-        .cpu_state_size = (uint32_t) sizeof(struct cpu_state),
-        .page_size = PAGE_SIZE,
-        .build_fingerprint = ckpt_fingerprint(),
-        .n_maps = counts.maps,
-        .n_fds = nfds,
-        .total_pages = counts.pages,
-        .stdio_is_tty = stdio_is_tty,
-    };
-    memcpy(h.magic, CKPT_MAGIC, sizeof(h.magic));
-    wr(&w, &h, sizeof(h));
-
     char cwd[MAX_PATH + 1] = "/", root[MAX_PATH + 1] = "/";
-    lock(&current->fs->lock, 0);
-    if (current->fs->pwd != NULL)
-        generic_getpath(current->fs->pwd, cwd);
-    if (current->fs->root != NULL)
-        generic_getpath(current->fs->root, root);
-    mode_t_ umask = current->fs->umask;
-    unlock(&current->fs->lock);
+    lock(&task->fs->lock, 0);
+    if (task->fs->pwd != NULL)
+        generic_getpath(task->fs->pwd, cwd);
+    if (task->fs->root != NULL)
+        generic_getpath(task->fs->root, root);
+    mode_t_ umask = task->fs->umask;
+    unlock(&task->fs->lock);
 
-    struct ckpt_task t = {
-        .pid = current->pid,
-        .pgid = current->group->pgid, .sid = current->group->sid,
-        .uid = current->uid, .gid = current->gid,
-        .euid = current->euid, .egid = current->egid,
-        .suid = current->suid, .sgid = current->sgid,
-        .fsuid = current->fsuid, .fsgid = current->fsgid,
+    struct ckpt_task rec = {
+        .pid = task->pid,
+        .zombie = task->zombie ? 1 : 0,
+        .exit_code = task->exit_code,
+        .exit_signal = task->exit_signal,
+        .pdeath_signal = task->pdeath_signal,
+        .nice = task->nice,
+        .sched_policy = task->sched_policy,
+        .robust_list = task->robust_list,
+        .did_exec = task->did_exec ? 1 : 0,
+        .ppid = task->parent != NULL ? task->parent->pid : 0,
+        .pgid = task->group->pgid, .sid = task->group->sid,
+        .n_maps = counts.maps, .n_fds = nfds,
+        .abi = (uint32_t) task->abi,
+        .uid = task->uid, .gid = task->gid,
+        .euid = task->euid, .egid = task->egid,
+        .suid = task->suid, .sgid = task->sgid,
+        .fsuid = task->fsuid, .fsgid = task->fsgid,
         .umask = umask,
-        .blocked = current->blocked, .pending = current->pending,
-        .altstack = current->altstack, .altstack_size = current->altstack_size,
-        .clear_tid = current->clear_tid,
+        .blocked = task->blocked, .pending = task->pending,
+        .altstack = task->altstack, .altstack_size = task->altstack_size,
+        .clear_tid = task->clear_tid,
         .brk = mm->brk, .start_brk = mm->start_brk,
         .vdso = mm->vdso, .stack_start = mm->stack_start,
         .argv_start = mm->argv_start, .argv_end = mm->argv_end,
@@ -533,28 +711,32 @@ int checkpoint_save(const char *host_path) {
         .stack_top = mem->stack_top,
         .stack_limit_pages = mem->stack_limit_pages,
     };
-    memcpy(t.comm, current->comm, sizeof(t.comm));
-    wr(&w, &t, sizeof(t));
-    wr(&w, cwd, t.cwd_len);
-    wr(&w, root, t.root_len);
+    memcpy(rec.comm, task->comm, sizeof(rec.comm));
+    CKPT_TRACE("save pid %d (ppid %d pgid %d sid %d) %s: %u maps, %u fds, "
+               "%llu pages\n", rec.pid, rec.ppid, rec.pgid, rec.sid, rec.comm,
+               rec.n_maps, rec.n_fds, (unsigned long long) counts.pages);
+    wr(w, &rec, sizeof(rec));
+    wr(w, cwd, rec.cwd_len);
+    wr(w, root, rec.root_len);
 
     // The register file, as bytes. See ckpt_fingerprint for why that is safe
     // and what stops it from being unsafe.
-    wr(&w, &current->cpu, sizeof(struct cpu_state));
+    wr(w, &task->cpu, sizeof(struct cpu_state));
 
-    lock(&current->sighand->lock, 0);
-    wr(&w, current->sighand->action, sizeof(struct sigaction_) * NUM_SIGS);
-    unlock(&current->sighand->lock);
+    lock(&task->sighand->lock, 0);
+    wr(w, task->sighand->action, sizeof(struct sigaction_) * NUM_SIGS);
+    unlock(&task->sighand->lock);
 
-    lock(&current->group->lock, 0);
-    wr(&w, current->group->limits, sizeof(current->group->limits));
-    unlock(&current->group->lock);
+    lock(&task->group->lock, 0);
+    wr(w, task->group->limits, sizeof(task->group->limits));
+    unlock(&task->group->lock);
 
-    struct ckpt_emit_ctx emit = { .w = &w, .mem = mem };
+    struct ckpt_emit_ctx emit = { .w = w, .mem = mem };
     ckpt_for_each_map(mem, ckpt_emit_map, &emit);
     read_unlock(&mem->lock);
+    *pages_out += counts.pages;
 
-    for (unsigned i = 0; i < nfds && w.err == 0; i++) {
+    for (unsigned i = 0; i < nfds && w->err == 0; i++) {
         struct ckpt_saved_fd *s = &saved[i];
         struct ckpt_fd cf = {
             .fd = s->num,
@@ -567,20 +749,138 @@ int checkpoint_save(const char *host_path) {
             .offset = s->offset,
             .path_len = (uint32_t) strlen(s->path),
         };
-        CKPT_TRACE("save fd %u %-5s real_fd %d type %o flags %#x off %llu %s\n",
-                   cf.fd, ckpt_kind_name(cf.kind), s->fd->real_fd,
-                   (unsigned) (s->fd->type >> 12), cf.flags,
+        CKPT_TRACE("  save fd %u %-5s real_fd %d flags %#x off %llu %s\n",
+                   cf.fd, ckpt_kind_name(cf.kind), s->fd->real_fd, cf.flags,
                    (unsigned long long) cf.offset, s->path);
-        wr(&w, &cf, sizeof(cf));
-        wr(&w, s->path, cf.path_len);
+        wr(w, &cf, sizeof(cf));
+        wr(w, s->path, cf.path_len);
     }
-    for (unsigned i = 0; i < nfds; i++)
-        fd_close(saved[i].fd);
-    free(saved);
+    ret = w->err;
 
-    err = w.err;
+out:
+    if (saved != NULL) {
+        for (unsigned i = 0; i < nfds; i++)
+            fd_close(saved[i].fd);
+        free(saved);
+    }
+    current = saved_current;
+    return ret;
+}
+
+// Order the tasks so a parent is always written before its children.
+//
+// Not tidiness: the restore creates each task as a CHILD of one that already
+// exists, because that is the only way the parent/child lists and the wait
+// machinery come out right. A child written first would have nothing to be
+// created under.
+static void ckpt_order_tasks(struct task **tasks, unsigned count) {
+    unsigned placed = 0;
+    while (placed < count) {
+        unsigned progress = 0;
+        for (unsigned i = placed; i < count; i++) {
+            struct task *t = tasks[i];
+            bool parent_ready = t->parent == NULL;
+            for (unsigned j = 0; j < placed && !parent_ready; j++)
+                if (tasks[j] == t->parent)
+                    parent_ready = true;
+            if (!parent_ready)
+                continue;
+            struct task *swap = tasks[placed];
+            tasks[placed] = t;
+            tasks[i] = swap;
+            placed++;
+            progress++;
+        }
+        // A task whose parent is not in the snapshot at all -- reparented to
+        // init while this was being collected. Take it anyway rather than
+        // spinning; the restore reparents it to pid 1, which is where it was
+        // going.
+        if (progress == 0)
+            break;
+    }
+}
+
+int checkpoint_save(const char *host_path) {
+    int err = ckpt_check_scope();
+    if (err < 0)
+        return err;
+
+    // STOP THE MACHINE. Everything below describes tasks that are not running,
+    // which is the whole difference between a checkpoint and a photograph of a
+    // moving object.
+    char blame[192] = "";
+    err = ckpt_freeze_all(CKPT_FREEZE_TIMEOUT_MS, blame, sizeof(blame));
+    if (err < 0) {
+        ckpt_refuse("%s", blame);
+        return err;
+    }
+
+    struct task_snapshot snap = {0};
+    if (task_snapshot_collect(&snap, false) < 0) {
+        ckpt_thaw_all();
+        ckpt_refuse("could not enumerate tasks");
+        return _EAGAIN;
+    }
+    // A task inside do_exit has already run its last instruction and has no
+    // state left worth carrying. Dropped here rather than in the writer, so
+    // the header's task count is the number actually written.
+    unsigned live = 0;
+    for (unsigned i = 0; i < snap.count; i++) {
+        struct task *t = snap.tasks[i];
+        if (t->zombie || !ckpt_task_is_leaving(t))
+            snap.tasks[live++] = t;
+        else
+            task_ref_cnt_mod(t, -1);
+    }
+    snap.count = live;
+    ckpt_order_tasks(snap.tasks, snap.count);
+
+    FILE *f = fopen(host_path, "wb");
+    if (f == NULL) {
+        err = errno_map();
+        task_snapshot_release(&snap);
+        ckpt_thaw_all();
+        return err;
+    }
+    struct ckpt_writer w = { .f = f };
+
+    struct ckpt_header h = {
+        .version = CKPT_VERSION,
+        .abi = (uint32_t) current->abi,
+        .cpu_state_size = (uint32_t) sizeof(struct cpu_state),
+        .page_size = PAGE_SIZE,
+        .build_fingerprint = ckpt_fingerprint(),
+        .n_tasks = snap.count,
+    };
+    memcpy(h.magic, CKPT_MAGIC, sizeof(h.magic));
+    // Written now and rewritten at the end: the page count and the stdio kind
+    // are only known once every task has been walked, and the header has to
+    // come first in the file.
+    long header_at = ftell(f);
+    wr(&w, &h, sizeof(h));
+
+    uint64_t pages = 0;
+    unsigned nfds_total = 0;
+    for (unsigned i = 0; i < snap.count && err == 0; i++) {
+        err = ckpt_save_task(&w, snap.tasks[i], &h.stdio_is_tty, &pages);
+        nfds_total += snap.tasks[i]->files != NULL ? 0 : 0;
+    }
+    task_snapshot_release(&snap);
+
+    if (err == 0 && w.err == 0) {
+        h.total_pages = pages;
+        if (fseek(f, header_at, SEEK_SET) == 0)
+            wr(&w, &h, sizeof(h));
+        else
+            w.err = errno_map();
+    }
+    if (err == 0)
+        err = w.err;
     if (fclose(f) != 0 && err == 0)
         err = errno_map();
+
+    ckpt_thaw_all();
+
     if (err != 0) {
         unlink(host_path);
         return err;
@@ -591,14 +891,299 @@ int checkpoint_save(const char *host_path) {
     ckpt_status.last_err = 0;
     ckpt_status.last_refusal[0] = '\0';
     snprintf(ckpt_status.last_path, sizeof(ckpt_status.last_path), "%s", host_path);
-    ckpt_status.pages = (unsigned long) counts.pages;
-    ckpt_status.fds = nfds;
-    ckpt_status.bytes = (unsigned long long) counts.pages * PAGE_SIZE;
+    ckpt_status.pages = (unsigned long) pages;
+    ckpt_status.tasks = h.n_tasks;
+    ckpt_status.fds = nfds_total;
+    ckpt_status.bytes = (unsigned long long) pages * PAGE_SIZE;
     unlock(&ckpt_lock);
     return 0;
 }
 
 // ------------------------------------------------------------------ reading
+
+// Everything about one task, read back onto `task`, which must already exist
+// and be current.
+static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
+        const struct ckpt_task *rec, bool stdio_is_tty, struct fd *shared_stdio[3]) {
+    int err;
+    char cwd[MAX_PATH + 1] = {0}, root[MAX_PATH + 1] = {0};
+    if ((err = rd(f, cwd, rec->cwd_len)) < 0) return err;
+    if ((err = rd(f, root, rec->root_len)) < 0) return err;
+
+    struct cpu_state cpu;
+    if ((err = rd(f, &cpu, sizeof(cpu))) < 0) return err;
+    struct sigaction_ actions[NUM_SIGS];
+    if ((err = rd(f, actions, sizeof(actions))) < 0) return err;
+    rlim_t_ limits[sizeof(current->group->limits) / sizeof(current->group->limits[0])][2];
+    if ((err = rd(f, limits, sizeof(limits))) < 0) return err;
+
+    // The limits first, because RLIMIT_NOFILE gates how many descriptors can
+    // be installed below and the image's value is the one that was in force.
+    lock(&current->group->lock, 0);
+    memcpy(current->group->limits, limits, sizeof(limits));
+    current->group->pgid = rec->pgid;
+    current->group->sid = rec->sid;
+    unlock(&current->group->lock);
+
+    // The guest architecture, and with it the address space's shape. A fresh
+    // task's mm is built for the entry point's default; the image says what
+    // this process actually was, and every mapping below depends on it. Set
+    // before a single page is mapped.
+    current->abi = (enum guest_abi) rec->abi;
+    struct mem *mem = current->mem;
+    struct mm *mm = current->mm;
+    mem_set_page_limit(mem, (page_t) rec->page_limit);
+    mem_set_mmap_window(mem, (page_t) rec->mmap_floor, (page_t) rec->mmap_ceiling);
+    mem_set_stack_bounds(mem, (page_t) rec->stack_top,
+                         (uint64_t) rec->stack_limit_pages << PAGE_BITS);
+
+    for (uint32_t i = 0; i < rec->n_maps; i++) {
+        struct ckpt_map m;
+        if ((err = rd(f, &m, sizeof(m))) < 0)
+            return err;
+        page_t start_page = (page_t) (m.start >> PAGE_BITS);
+        write_lock(&mem->lock);
+        // A fresh mm is not empty -- mm_new maps the vdso -- and the image is
+        // the complete truth about this address space, so anything already
+        // sitting where a mapping goes is replaced rather than collided with.
+        pt_unmap_always(mem, start_page, (pages_t) m.pages);
+        // Mapped WRITABLE regardless of the saved protection, then set to the
+        // saved flags once the bytes are in: a PROT_NONE guard page or a
+        // read-only text segment cannot be filled through mem_ptr otherwise.
+        err = pt_map_nothing(mem, start_page, (pages_t) m.pages,
+                             P_READ | P_WRITE | P_ANONYMOUS);
+        write_unlock(&mem->lock);
+        if (err < 0)
+            return err;
+        for (uint64_t pg = 0; pg < m.pages; pg++) {
+            guest_addr_t addr = ((guest_addr_t) (start_page + pg)) << PAGE_BITS;
+            write_lock(&mem->lock);
+            char *dst = mem_ptr(mem, addr, MEM_WRITE);
+            write_unlock(&mem->lock);
+            if (dst == NULL)
+                return _EFAULT;
+            if ((err = rd(f, dst, PAGE_SIZE)) < 0)
+                return err;
+        }
+        write_lock(&mem->lock);
+        err = pt_set_flags(mem, start_page, (pages_t) m.pages, (int) m.flags);
+        write_unlock(&mem->lock);
+        if (err < 0)
+            return err;
+    }
+
+    mm->brk = rec->brk;
+    mm->start_brk = rec->start_brk;
+    mm->vdso = rec->vdso;
+    mm->stack_start = rec->stack_start;
+    mm->argv_start = rec->argv_start; mm->argv_end = rec->argv_end;
+    mm->env_start = rec->env_start; mm->env_end = rec->env_end;
+    mm->auxv_start = rec->auxv_start; mm->auxv_end = rec->auxv_end;
+
+    // The descriptors. Everything the fresh task opened for itself goes
+    // first: the image is the complete truth about what this process had open.
+    struct fdtable *files = current->files;
+    lock(&files->lock, 0);
+    for (unsigned i = 0; i < files->size; i++) {
+        if (files->files[i] != NULL) {
+            fd_close(files->files[i]);
+            files->files[i] = NULL;
+        }
+    }
+    unlock(&files->lock);
+
+    // The standard streams. Set up ONCE for the whole restore and SHARED by
+    // every process in it -- not created per task.
+    //
+    // Per task is what a fresh boot does, and it is wrong here for the same
+    // reason it would be wrong to give a forked child its own dup of the
+    // terminal: create_piped_stdio wraps the HOST's descriptors 0, 1 and 2, so
+    // N restored processes meant N struct fds over the same three host
+    // descriptors. The first child to exit closed them, and the app's real
+    // stdout and stderr went with it -- the parent then wrote into a closed
+    // descriptor and the session looked hung. A fork shares the struct fd; so
+    // does this.
+    if (shared_stdio[0] == NULL) {
+        if (stdio_is_tty)
+            create_stdio("/dev/tty1", TTY_CONSOLE_MAJOR, 1);
+        else
+            create_piped_stdio();
+        lock(&files->lock, 0);
+        for (unsigned i = 0; i < 3; i++) {
+            shared_stdio[i] = i < files->size ? files->files[i] : NULL;
+            if (shared_stdio[i] != NULL)
+                fd_retain(shared_stdio[i]);   // the restore's own reference
+        }
+        unlock(&files->lock);
+    }
+    // RETAINED before installing, because installing the image's fd 1 detaches
+    // and CLOSES whatever was in that slot -- with a refcount of one that frees
+    // it, and mirroring fd 10 from a saved pointer afterwards was then a
+    // use-after-free that surfaced as `echo: I/O error` in the restored shell
+    // rather than as a crash.
+    struct fd **stdio = shared_stdio;
+    for (unsigned i = 0; i < 3; i++) {
+        if (stdio[i] == NULL)
+            continue;
+        fd_retain(stdio[i]);
+        if ((err = fdtable_install_at(files, (fd_t) i, stdio[i], false)) < 0)
+            return err;
+    }
+
+    for (uint32_t i = 0; i < rec->n_fds; i++) {
+        struct ckpt_fd cf;
+        if ((err = rd(f, &cf, sizeof(cf))) < 0)
+            goto fds_done;
+        char path[MAX_PATH + 1] = {0};
+        if (cf.path_len > MAX_PATH) { err = _EINVAL; goto fds_done; }
+        if ((err = rd(f, path, cf.path_len)) < 0)
+            goto fds_done;
+
+        CKPT_TRACE("  load fd %u %-5s flags %#x off %llu %s\n",
+                   cf.fd, ckpt_kind_name(cf.kind), cf.flags,
+                   (unsigned long long) cf.offset, path);
+
+        // Re-attached, not restored: the terminal or the host pipe this guest
+        // was talking to went with the process that owned it. sockrestart is
+        // the precedent -- record enough to REBUILD, because the original is
+        // destroyed either way. 0, 1 and 2 were set up above; anywhere else
+        // the same stream is another reference to one of those three.
+        if (cf.kind == CKPT_FD_STDIO || cf.kind == CKPT_FD_TTY) {
+            if (cf.fd <= 2)
+                continue;
+            unsigned mirror = cf.kind == CKPT_FD_STDIO ? (unsigned) cf.offset : 0;
+            if (mirror > 2)
+                mirror = 0;
+            struct fd *src = stdio[mirror];
+            if (src != NULL) {
+                fd_retain(src);
+                if ((err = fdtable_install_at(files, (fd_t) cf.fd, src,
+                                              cf.cloexec != 0)) < 0)
+                    goto fds_done;
+            }
+            continue;
+        }
+
+        struct fd *fd = generic_open(path, (int) cf.flags, 0);
+        if (IS_ERR(fd)) {
+            err = (int) PTR_ERR(fd);
+            goto fds_done;
+        }
+        if (cf.kind == CKPT_FD_FILE && fd->ops->lseek != NULL)
+            fd->ops->lseek(fd, (off_t_) cf.offset, LSEEK_SET);
+        fd->offset = cf.offset;
+        // A fresh task's table holds three descriptors; the image may name
+        // fd 10, because a shell parks its saved stdin up there. Grow to fit
+        // rather than refuse -- the number is part of what is restored.
+        if ((err = fdtable_install_at(files, (fd_t) cf.fd, fd,
+                                      cf.cloexec != 0)) < 0)
+            goto fds_done;
+    }
+    err = 0;
+fds_done:
+    if (err < 0)
+        return err;
+
+    // Credentials, identity and the rest of the task.
+    current->uid = rec->uid; current->gid = rec->gid;
+    current->euid = rec->euid; current->egid = rec->egid;
+    current->suid = rec->suid; current->sgid = rec->sgid;
+    current->fsuid = rec->fsuid; current->fsgid = rec->fsgid;
+    memcpy(current->comm, rec->comm, sizeof(current->comm));
+    current->blocked = rec->blocked;
+    current->pending = rec->pending;
+    current->altstack = rec->altstack;
+    current->altstack_size = rec->altstack_size;
+    current->clear_tid = rec->clear_tid;
+    current->exit_signal = rec->exit_signal;
+    current->pdeath_signal = rec->pdeath_signal;
+    current->nice = rec->nice;
+    current->sched_policy = rec->sched_policy;
+    current->robust_list = rec->robust_list;
+    current->did_exec = rec->did_exec != 0;
+
+    lock(&current->sighand->lock, 0);
+    memcpy(current->sighand->action, actions, sizeof(actions));
+    unlock(&current->sighand->lock);
+    lock(&current->fs->lock, 0);
+    current->fs->umask = rec->umask;
+    unlock(&current->fs->lock);
+    if (cwd[0] == '/') {
+        struct fd *pwd = generic_open(cwd, O_RDONLY_, 0);
+        if (!IS_ERR(pwd))
+            fs_chdir(current->fs, pwd);
+    }
+
+    // The register file last, so nothing above can have run guest code with a
+    // half-restored one. The two pointers in struct cpu_state name host
+    // objects that belong to THIS run: the address space's mmu, and the flag
+    // the wake path sets to break out of guest execution. Everything else in
+    // there is guest value state; these two are re-attached rather than
+    // restored.
+    struct mmu *mmu = current->cpu.mmu;
+    current->cpu = cpu;
+    current->cpu.mmu = mmu;
+    // poked_ptr points INTO its own cpu_state (&cpu->_poked, set by every
+    // engine's entry). So it can be neither restored from the image -- that is
+    // a host address from a process that has exited -- nor carried over from
+    // before the assignment: a task built by task_create_with_pid got its
+    // parent's whole cpu_state by struct copy, parent's _poked address and
+    // all. A restored child would then have its "stop executing" flag set by
+    // pokes aimed at its parent and never by its own, so it ran on past every
+    // wake and its parent's wait() never returned.
+    current->cpu.poked_ptr = &current->cpu._poked;
+    (void) h;
+    return 0;
+}
+
+// Build a task to restore INTO: a fresh process, at the pid the image names,
+// as a child of the task that image named as its parent.
+//
+// The same shape as kernel/init.c's construct_task, and deliberately not a
+// call to it: that one allocates the next free pid and roots everything at
+// init, which is exactly the two things a restore must not do.
+static struct task *ckpt_new_task(struct task *parent, pid_t_ pid) {
+    struct task *task = task_create_with_pid(parent, pid);
+    if (task == NULL)
+        return NULL;
+    if (parent != NULL)
+        uts_ns_retain(task->uts_ns);
+
+    struct tgroup *group = malloc(sizeof(struct tgroup));
+    if (group == NULL)
+        return NULL;
+    *group = (struct tgroup) {};
+    list_init(&group->threads);
+    lock_init(&group->lock, "ckpt_new_task\0");
+    cond_init(&group->child_exit);
+    cond_init(&group->stopped_cond);
+    group->leader = task;
+    group->personality = ADDR_NO_RANDOMIZE_;
+    // The defaults, before the image's own limits land further down. Without
+    // them RLIMIT_NOFILE is zero on a freshly built tgroup, and the first
+    // descriptor the restore tries to install comes back EMFILE -- a "too
+    // many open files" on a table holding none.
+    memcpy(group->limits, init_rlimits, sizeof(init_rlimits));
+    list_add(&group->threads, &task->group_links);
+    task->group = group;
+    task->tgid = task->pid;
+    task_setsid(task);
+
+    task_set_mm(task, mm_new(task->abi));
+    task->sighand = sighand_new();
+    task->files = fdtable_new(3);
+    task->fs = fs_info_new();
+    task->fs->umask = 0022;
+
+    struct task *saved = current;
+    current = task;
+    task->fs->root = generic_open("/", O_RDONLY_, 0);
+    current = saved;
+    if (IS_ERR(task->fs->root))
+        return NULL;
+    task->fs->pwd = fd_retain(task->fs->root);
+    return task;
+}
 
 int checkpoint_restore(const char *host_path) {
     FILE *f = fopen(host_path, "rb");
@@ -607,6 +1192,11 @@ int checkpoint_restore(const char *host_path) {
 
     int err;
     struct ckpt_header h;
+    struct task **built = NULL;
+    unsigned nbuilt = 0;
+    // The three descriptors every restored process shares, created once by the
+    // first task through here. See the note in ckpt_restore_task.
+    struct fd *shared_stdio[3] = { NULL, NULL, NULL };
     if ((err = rd(f, &h, sizeof(h))) < 0)
         goto out;
     err = _EINVAL;
@@ -618,240 +1208,102 @@ int checkpoint_restore(const char *host_path) {
     if (h.build_fingerprint != ckpt_fingerprint() ||
             h.cpu_state_size != sizeof(struct cpu_state))
         goto out;
-
-    struct ckpt_task t;
-    if ((err = rd(f, &t, sizeof(t))) < 0)
-        goto out;
-    err = _EINVAL;
-    if (t.cwd_len > MAX_PATH || t.root_len > MAX_PATH || t.n_sigactions != NUM_SIGS)
-        goto out;
-    char cwd[MAX_PATH + 1] = {0}, root[MAX_PATH + 1] = {0};
-    if ((err = rd(f, cwd, t.cwd_len)) < 0) goto out;
-    if ((err = rd(f, root, t.root_len)) < 0) goto out;
-
-    struct cpu_state cpu;
-    if ((err = rd(f, &cpu, sizeof(cpu))) < 0)
+    if (h.n_tasks == 0 || h.n_tasks > 4096)
         goto out;
 
-    struct sigaction_ actions[NUM_SIGS];
-    if ((err = rd(f, actions, sizeof(actions))) < 0)
-        goto out;
-    rlim_t_ limits[sizeof(current->group->limits) / sizeof(current->group->limits[0])][2];
-    if ((err = rd(f, limits, sizeof(limits))) < 0)
-        goto out;
+    built = calloc(h.n_tasks, sizeof(*built));
+    if (built == NULL) { err = _ENOMEM; goto out; }
 
-    // The address space. current already has a fresh one from
-    // become_first_process; every mapping in the image is added to it, and the
-    // bytes go in through the ordinary write path so the pager, the JIT's
-    // invalidation and the accounting all see them the way they see a guest's
-    // own writes.
-    // The guest architecture, and with it the address space's shape. A fresh
-    // init's mm is built for the entry point's default; the image says what
-    // the checkpointed guest actually was, and every mapping below depends on
-    // it. Set before a single page is mapped.
-    current->abi = (enum guest_abi) h.abi;
-    struct mem *mem = current->mem;
-    struct mm *mm = current->mm;
-    mem_set_page_limit(mem, (page_t) t.page_limit);
-    mem_set_mmap_window(mem, (page_t) t.mmap_floor, (page_t) t.mmap_ceiling);
-    mem_set_stack_bounds(mem, (page_t) t.stack_top,
-                         (uint64_t) t.stack_limit_pages << PAGE_BITS);
-
-    for (uint32_t i = 0; i < h.n_maps; i++) {
-        struct ckpt_map m;
-        if ((err = rd(f, &m, sizeof(m))) < 0)
+    struct task *first = current;
+    for (uint32_t i = 0; i < h.n_tasks; i++) {
+        struct ckpt_task rec;
+        if ((err = rd(f, &rec, sizeof(rec))) < 0)
             goto out;
-        page_t start = (page_t) (m.start >> PAGE_BITS);
-        write_lock(&mem->lock);
-        // A fresh init's mm is not empty -- mm_new maps the vdso -- and the
-        // image is the complete truth about this address space, so anything
-        // already sitting where a mapping goes is replaced rather than
-        // collided with.
-        pt_unmap_always(mem, start, (pages_t) m.pages);
-        // Mapped WRITABLE regardless of the saved protection, then set to the
-        // saved flags once the bytes are in: a PROT_NONE guard page or a
-        // read-only text segment cannot be filled through mem_ptr otherwise.
-        err = pt_map_nothing(mem, start, (pages_t) m.pages,
-                             P_READ | P_WRITE | P_ANONYMOUS);
-        write_unlock(&mem->lock);
-        if (err < 0)
+        err = _EINVAL;
+        if (rec.cwd_len > MAX_PATH || rec.root_len > MAX_PATH ||
+                rec.n_sigactions != NUM_SIGS)
             goto out;
-        for (uint64_t p = 0; p < m.pages; p++) {
-            guest_addr_t addr = ((guest_addr_t) (start + p)) << PAGE_BITS;
-            write_lock(&mem->lock);
-            char *dst = mem_ptr(mem, addr, MEM_WRITE);
-            write_unlock(&mem->lock);
-            if (dst == NULL) {
-                err = _EFAULT;
+
+        struct task *task;
+        if (i == 0 && rec.pid == first->pid) {
+            // The image's first task IS this one: the entry point has already
+            // made a pid 1 and it is the process the image calls pid 1.
+            task = first;
+        } else {
+            struct task *parent = NULL;
+            for (unsigned j = 0; j < nbuilt; j++)
+                if (built[j]->pid == (pid_t_) rec.ppid)
+                    parent = built[j];
+            // A task whose parent is not in the image was reparented to init
+            // between the freeze and the walk. init is where it was going.
+            if (parent == NULL)
+                parent = first;
+            task = ckpt_new_task(parent, (pid_t_) rec.pid);
+            if (task == NULL) {
+                ckpt_refuse("could not recreate pid %u", rec.pid);
+                err = _EAGAIN;
                 goto out;
             }
-            if ((err = rd(f, dst, PAGE_SIZE)) < 0)
-                goto out;
+            // Frozen from birth, so nothing runs until every task is built.
+            atomic_store_explicit(&task->ckpt_freeze_wanted, true,
+                                  memory_order_release);
         }
-        write_lock(&mem->lock);
-        err = pt_set_flags(mem, start, (pages_t) m.pages, (int) m.flags);
-        write_unlock(&mem->lock);
+        built[nbuilt++] = task;
+
+        if (rec.zombie) {
+            CKPT_TRACE("load pid %u (ppid %u) %s: ZOMBIE, exit code %#x\n",
+                       rec.pid, rec.ppid, rec.comm, rec.exit_code);
+            memcpy(task->comm, rec.comm, sizeof(task->comm));
+            task->exit_code = rec.exit_code;
+            task->zombie = true;
+            atomic_store_explicit(&task->ckpt_freeze_wanted, false,
+                                  memory_order_release);
+            continue;   // no register file, no maps, no descriptors follow
+        }
+
+        CKPT_TRACE("load pid %u (ppid %u pgid %u sid %u) %s: %u maps, %u fds\n",
+                   rec.pid, rec.ppid, rec.pgid, rec.sid, rec.comm,
+                   rec.n_maps, rec.n_fds);
+        struct task *saved = current;
+        current = task;
+        err = ckpt_restore_task(f, &h, &rec, h.stdio_is_tty != 0, shared_stdio);
+        current = saved;
         if (err < 0)
             goto out;
     }
 
-    mm->brk = t.brk;
-    mm->start_brk = t.start_brk;
-    mm->vdso = t.vdso;
-    mm->stack_start = t.stack_start;
-    mm->argv_start = t.argv_start; mm->argv_end = t.argv_end;
-    mm->env_start = t.env_start; mm->env_end = t.env_end;
-    mm->auxv_start = t.auxv_start; mm->auxv_end = t.auxv_end;
-
-    // The descriptors. Everything the fresh init opened for itself goes first:
-    // the image is the complete truth about what this guest had open.
-    struct fdtable *files = current->files;
-    lock(&files->lock, 0);
-    for (unsigned i = 0; i < files->size; i++) {
-        if (files->files[i] != NULL) {
-            fd_close(files->files[i]);
-            files->files[i] = NULL;
-        }
-    }
-    unlock(&files->lock);
-
-    // The standard streams, set up the way the entry point sets them up at
-    // boot rather than reconstructed. Done BEFORE the descriptor loop so a
-    // record for 0, 1 or 2 finds them already there and leaves them alone.
-    if (h.stdio_is_tty)
-        create_stdio("/dev/tty1", TTY_CONSOLE_MAJOR, 1);
-    else
-        create_piped_stdio();
-    // Held aside, because the loop below can REPLACE what is at 0, 1 or 2. A
-    // shell in the middle of `> file` has the redirection live on fd 1 and its
-    // real stdout parked on fd 10, so the image says exactly that -- and
-    // mirroring fd 10 from "whatever is at slot 1 now" gave it the redirection
-    // instead of the terminal. `echo` in the restored shell answered EIO.
-    // RETAINED, not just pointed at. Installing the image's fd 1 detaches
-    // and CLOSES whatever was in that slot, and with a refcount of one that
-    // frees it -- so mirroring fd 10 from the saved pointer afterwards was a
-    // use-after-free, which surfaced as `echo: I/O error` in the restored
-    // shell rather than as a crash. Released at the end of the loop.
-    struct fd *stdio[3];
-    lock(&files->lock, 0);
-    for (unsigned i = 0; i < 3; i++) {
-        stdio[i] = i < files->size ? files->files[i] : NULL;
-        if (stdio[i] != NULL)
-            fd_retain(stdio[i]);
-    }
-    unlock(&files->lock);
-
-    for (uint32_t i = 0; i < h.n_fds; i++) {
-        struct ckpt_fd cf;
-        if ((err = rd(f, &cf, sizeof(cf))) < 0)
-            goto out;
-        char path[MAX_PATH + 1] = {0};
-        if (cf.path_len > MAX_PATH) { err = _EINVAL; goto out; }
-        if ((err = rd(f, path, cf.path_len)) < 0)
-            goto out;
-
-        // Re-attached, not restored: the terminal or the host pipe this guest
-        // was talking to went with the process that owned it. sockrestart is
-        // the precedent -- record enough to REBUILD, because the original is
-        // destroyed either way. 0, 1 and 2 were set up above; anywhere else
-        // the same stream is another reference to one of those three.
-        CKPT_TRACE("load fd %u %-5s flags %#x off %llu %s\n",
-                   cf.fd, ckpt_kind_name(cf.kind), cf.flags,
-                   (unsigned long long) cf.offset, path);
-        if (cf.kind == CKPT_FD_STDIO || cf.kind == CKPT_FD_TTY) {
-            if (cf.fd <= 2)
-                continue;
-            unsigned mirror = cf.kind == CKPT_FD_STDIO ?
-                    (unsigned) cf.offset : 0;
-            if (mirror > 2)
-                mirror = 0;
-            struct fd *src = stdio[mirror];
-            if (src != NULL)
-                fd_retain(src);
-            if (src != NULL &&
-                    (err = fdtable_install_at(files, (fd_t) cf.fd, src,
-                                              cf.cloexec != 0)) < 0)
-                goto out;
-            continue;
-        }
-
-        struct fd *fd;
-        if (cf.kind == CKPT_FD_TTY) {
-            fd = generic_open("/dev/tty1", O_RDWR_, 0);
-            if (IS_ERR(fd))
-                fd = generic_open("/dev/null", O_RDWR_, 0);
-        } else {
-            fd = generic_open(path, (int) cf.flags, 0);
-        }
-        if (IS_ERR(fd)) {
-            err = (int) PTR_ERR(fd);
+    // Every task exists and is complete; now let them go. The freezer's own
+    // parking lot does the releasing, so a restored task and a checkpointed
+    // one wait in exactly the same place.
+    atomic_fetch_add_explicit(&ckpt_freeze_active, 1, memory_order_acq_rel);
+    for (unsigned i = 1; i < nbuilt; i++) {
+        if (built[i]->zombie)
+            continue;   // nothing to run; it is a status waiting to be read
+        CKPT_TRACE("starting restored pid %d\n", built[i]->pid);
+        if (task_start(built[i]) < 0) {
+            ckpt_refuse("could not start restored pid %d", built[i]->pid);
+            err = _EAGAIN;
+            ckpt_thaw_all();
             goto out;
         }
-        if (cf.kind == CKPT_FD_FILE && fd->ops->lseek != NULL)
-            fd->ops->lseek(fd, (off_t_) cf.offset, LSEEK_SET);
-        fd->offset = cf.offset;
-        // A fresh init's table holds three descriptors; the image may name
-        // fd 10, because a shell parks its saved stdin up there. Grow to fit
-        // rather than refuse -- the number is part of what is restored.
-        err = fdtable_install_at(files, (fd_t) cf.fd, fd, cf.cloexec != 0);
-        if (err < 0)
-            goto out;
     }
-
-    for (unsigned i = 0; i < 3; i++)
-        if (stdio[i] != NULL)
-            fd_close(stdio[i]);
-
-    // Credentials, identity and the rest of the task.
-    current->uid = t.uid; current->gid = t.gid;
-    current->euid = t.euid; current->egid = t.egid;
-    current->suid = t.suid; current->sgid = t.sgid;
-    current->fsuid = t.fsuid; current->fsgid = t.fsgid;
-    memcpy(current->comm, t.comm, sizeof(current->comm));
-    current->blocked = t.blocked;
-    current->pending = t.pending;
-    current->altstack = t.altstack;
-    current->altstack_size = t.altstack_size;
-    current->clear_tid = t.clear_tid;
-
-    lock(&current->sighand->lock, 0);
-    memcpy(current->sighand->action, actions, sizeof(actions));
-    unlock(&current->sighand->lock);
-    lock(&current->group->lock, 0);
-    memcpy(current->group->limits, limits, sizeof(limits));
-    unlock(&current->group->lock);
-
-    lock(&current->fs->lock, 0);
-    current->fs->umask = t.umask;
-    unlock(&current->fs->lock);
-    if (cwd[0] == '/') {
-        struct fd *pwd = generic_open(cwd, O_RDONLY_, 0);
-        if (!IS_ERR(pwd))
-            fs_chdir(current->fs, pwd);
-    }
-
-    // The register file last, so nothing above can have run guest code with a
-    // half-restored one.
-    struct mmu *mmu = current->cpu.mmu;
-    bool *poked = current->cpu.poked_ptr;
-    current->cpu = cpu;
-    // The two pointers in struct cpu_state name host objects that belong to
-    // THIS run: the address space's mmu, and the flag the wake path sets to
-    // break out of guest execution. Everything else in there is guest value
-    // state; these two are re-attached rather than restored.
-    current->cpu.mmu = mmu;
-    current->cpu.poked_ptr = poked;
+    ckpt_thaw_all();
 
     lock(&ckpt_lock, 0);
     ckpt_status.restored = true;
     ckpt_status.generation++;
     snprintf(ckpt_status.last_path, sizeof(ckpt_status.last_path), "%s", host_path);
     ckpt_status.pages = (unsigned long) h.total_pages;
-    ckpt_status.fds = h.n_fds;
+    ckpt_status.tasks = h.n_tasks;
     unlock(&ckpt_lock);
     err = 0;
 
 out:
+    // The restore's own references; each task holds its own.
+    for (unsigned i = 0; i < 3; i++)
+        if (shared_stdio[i] != NULL)
+            fd_close(shared_stdio[i]);
+    free(built);
     fclose(f);
     return err;
 }
@@ -909,6 +1361,9 @@ void checkpoint_run_pending(void) {
     if (err < 0) {
         lock(&ckpt_lock, 0);
         ckpt_status.last_err = err;
+        CKPT_TRACE("save failed: %d -- %s\n", err,
+                   ckpt_status.last_refusal[0] ? ckpt_status.last_refusal
+                                               : "(no reason recorded)");
         unlock(&ckpt_lock);
         return;
     }

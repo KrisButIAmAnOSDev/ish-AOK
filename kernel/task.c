@@ -456,7 +456,7 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
     return 0;
 }
 
-struct task *task_create_(struct task *parent) {
+static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     struct task *task = malloc(sizeof(struct task));
     if (task == NULL)
         return NULL;
@@ -646,13 +646,28 @@ struct task *task_create_(struct task *parent) {
     task->reference.ready_to_be_freed = false;
 
     complex_lockt(&pids_lock, 0);
-    do {
-        last_allocated_pid++;
-        if (last_allocated_pid >= task_pid_max()) last_allocated_pid = 1;
-        // Reserved for a synthetic kernel thread: handing it to a real task
-        // would make two different processes answer to one pid.
-    } while (!pid_empty(&pids[last_allocated_pid]) ||
-             pid_is_kthread(last_allocated_pid, NULL));
+    if (want_pid != 0) {
+        // A CHOSEN pid, for a restore (kernel/checkpoint.c). Refused rather
+        // than quietly given a different one: a process that comes back under
+        // another number is not the process that was saved, and everything
+        // holding its old pid -- its parent's wait, a shell's $!, a pidfile --
+        // is then wrong in a way nothing would report.
+        if (want_pid >= task_pid_max() || !pid_empty(&pids[want_pid]) ||
+                pid_is_kthread(want_pid, NULL)) {
+            unlock(&pids_lock);
+            free(task);
+            return NULL;
+        }
+        last_allocated_pid = want_pid;
+    } else {
+        do {
+            last_allocated_pid++;
+            if (last_allocated_pid >= task_pid_max()) last_allocated_pid = 1;
+            // Reserved for a synthetic kernel thread: handing it to a real task
+            // would make two different processes answer to one pid.
+        } while (!pid_empty(&pids[last_allocated_pid]) ||
+                 pid_is_kthread(last_allocated_pid, NULL));
+    }
     struct pid *pid = &pids[last_allocated_pid];
     pid->id = last_allocated_pid;
     list_init(&pid->alive);
@@ -668,6 +683,14 @@ struct task *task_create_(struct task *parent) {
     }
     unlock(&pids_lock);
     return task;
+}
+
+struct task *task_create_(struct task *parent) {
+    return task_create_pid_(parent, 0);
+}
+
+struct task *task_create_with_pid(struct task *parent, pid_t_ want) {
+    return task_create_pid_(parent, want);
 }
 
 // We consolidate the check for whether the task is in a critical section,
@@ -910,6 +933,7 @@ void task_run_current(void) {
         // checkpoint asked for from a syscall is taken here, one pass later,
         // which is what makes a restore continue instead of re-running the
         // request. See kernel/checkpoint.c.
+        checkpoint_park_if_frozen();
         checkpoint_run_pending();
         task_wait_for_mem_quiesce(save);
         read_lock(&save->mem->lock);

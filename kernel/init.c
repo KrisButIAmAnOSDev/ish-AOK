@@ -189,7 +189,9 @@ static void establish_signal_handlers(void) {
 }
 
 // copied from include/asm-generic/resource.h in the kernel
-static struct rlimit_ init_rlimits[16] = {
+// Not static: kernel/checkpoint.c builds tgroups of its own for restored
+// processes and needs the same starting point construct_task uses.
+struct rlimit_ init_rlimits[16] = {
     [RLIMIT_CPU_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_FSIZE_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_DATA_]       = {RLIM_INFINITY_, RLIM_INFINITY_},

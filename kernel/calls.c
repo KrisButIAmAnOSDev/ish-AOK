@@ -4,6 +4,7 @@
 #include "app/DiagnosticsBridge.h"
 #include "jit/jit.h"
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "emu/interrupt.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
@@ -2232,6 +2233,28 @@ static bool syscall_result_is_errno(dword_t result) {
 
 static bool syscall_result_should_restart(dword_t result) {
     sdword_t r = (sdword_t) result;
+    // A CHECKPOINT FREEZE restarts everything, including the calls signal(7)
+    // never restarts.
+    //
+    // That is not a liberty, it is the definition of a freeze: the guest must
+    // not be able to tell it happened. Linux's own freezer does the same --
+    // a task is woken out of its wait, parks, and re-enters the wait
+    // afterwards, and poll() does not report EINTR because the machine was
+    // suspended. Here the wake comes from checkpoint_freeze_all rather than
+    // from a signal, so there is no handler to consult and no SA_RESTART to
+    // honour; the PC is rewound and the syscall re-executes on the far side,
+    // which for a restore is the far side of a reboot.
+    //
+    // The one thing it costs is a timed wait's remaining time: a nanosleep
+    // interrupted this way sleeps its full span again. Linux answers that
+    // with a restart_block carrying the remainder; this does not, and a
+    // suspend across which the guest was frozen anyway is the case where it
+    // matters least.
+    if (r == _EINTR && checkpoint_freeze_pending()) {
+        if (current != NULL)
+            current->restart_nohand_pending = false;
+        return true;
+    }
     if (r != _ERESTART && r != _ERESTART_NOHAND) {
         if (current != NULL)
             current->restart_nohand_pending = false;

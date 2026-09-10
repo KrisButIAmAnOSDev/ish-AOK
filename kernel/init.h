@@ -2,6 +2,7 @@
 #define KERNEL_INIT_H
 
 #include "fs/tty.h"
+#include "kernel/resource.h"
 
 // Incredibly sloppy. Please do not reference as an example of good API design.
 // / reports /dev/<GUEST_DISK_NAME> as its source in /proc/mounts, matching
@@ -14,6 +15,8 @@ void ensure_root_fstab_entry(void);
 void ensure_dev_fd_links(void);
 void set_console_device(int major, int minor);
 void get_console_device(int *major, int *minor);
+// The rlimits a brand-new process starts with. See kernel/init.c.
+extern struct rlimit_ init_rlimits[16];
 intptr_t become_first_process(void);
 intptr_t become_new_init_child(void);
 int create_stdio(const char *file, int major, int minor);
