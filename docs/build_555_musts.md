@@ -44,9 +44,12 @@ one makes archaeology. So:
    load. It also corrected the roadmap's cost model -- a snapshot is O(files),
    not O(bytes), at ~25 us per directory entry -- so the app side needs progress
    and a cancel rather than a spinner. What is left is the app side and restore.
-3. **Suspend to disk phase 0** — roadmap, and *a gate*. Publish the fd
-   inventory; if it says the common session is full of things with no restore
-   rule, that is the result and the right move is to stop.
+3. **Suspend to disk** — roadmap. **Done, and past phase 0.** The inventory
+   said the common session is mostly the easy kind, so it went on: the machine
+   can be stopped, a multi-process guest saved and restored, and the app saves
+   on backgrounding and resumes on launch behind a Settings switch. A native
+   zsh describes itself and comes back with its session; anything that cannot
+   be described is refused by name rather than half-saved.
 4. **Desktop chrome** — #580, #579, and #483/#482 (confirm they are one bug
    before scheduling two).
 5. **The rest of this document**, as fill.

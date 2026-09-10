@@ -276,7 +276,38 @@ everything rather than everything cold. The eviction path a checkpoint needs is
 therefore not just present but exercised continuously, on every device with
 compressed memory switched on.
 
-**Next step is phase 0, and phase 0 is a gate, not a feature.** Two things, in
+**SHIPPED IN 555, and further than phase 0 asked for.** What follows from here
+to the end of this section is the plan as it was written; it is kept because the
+reasoning still holds and because what actually got built can be read against
+it. What exists now:
+
+- `kernel/checkpoint.c`, `/proc/ish/checkpoint` (`save <path>` and `suspend`),
+  `ISH_RESTORE`/`ISH_SESSION` on the CLI, and a Settings switch in the app that
+  saves on backgrounding and resumes on launch. Off by default.
+- **A freezer**, which is the part AOK can do and CRIU cannot: AOK owns the
+  scheduler. A task running guest code parks at the top of task_run_current's
+  loop; a task blocked INSIDE a syscall is woken, its wait returns EINTR, and
+  the dispatcher rewinds the program counter over the syscall instruction, so
+  it arrives at the loop top about to re-execute the call it was in. The image
+  says "about to call read", and the restored guest calls it.
+- **More than one process**, with the process tree, pids, sessions and process
+  groups, and zombies whose status a parent has not collected yet.
+- **Descriptor identity**: two processes sharing one struct fd get one back.
+- **Pipes**, with the bytes still in them.
+- **Native programs**, by the rule this section already named: zsh describes
+  itself (its fork-by-relaunch already turns a live shell into a script that
+  rebuilds it) and comes back with its parameters, functions and aliases. dash
+  cannot -- it has no way to emit its shell functions as text -- and is refused
+  by name.
+- `tests/manual/checkpoint_restore.sh` is the proof, including every refusal.
+
+**What is still open**, and it is the same list this section predicted: sockets
+(sockrestart's model applies but is not wired to the image), a native program in
+a compute loop that makes no syscalls and so never reaches a boundary, and
+dash's self-description. The measurement this section asked for on a real device
+session has not been taken.
+
+**Phase 0 was a gate, not a feature.** Two things, in
 order. First, an inventory: walk a real booted guest and enumerate everything
 held that cannot be trivially serialised, per `fd_ops` family, with counts --
 because the interesting number is not whether a pty is hard, it is how many of
