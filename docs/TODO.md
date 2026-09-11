@@ -19,6 +19,37 @@ Started 2026-08-19, after the 549 release run. Closed entries from the 549 and
 
 ## Diagnosed, not fixed
 
+### The app's UI thread impersonates a guest process
+
+`current` is per-thread, and on the app's main thread it is whatever the last
+`TerminalViewController.startSession` left there -- the session's own first
+process -- or init after a boot. The thread is not that process, and kernel
+code it calls acts as one.
+
+**Established** (2026-09-11): clearing it is a one-line change and it does not
+work. Suspend to disk needed the UI thread not to be mistaken for a task
+(`ckpt_freeze_all` skips `current`, so the backgrounding save skipped the
+session leader). Clearing it in `startSession` fixed that and crashed
+Settings -> Appearance the same day: `pty_slave_init_inode` reads
+`current->euid`, and the appearance preview creates its pty from the UI thread.
+The audit that followed found the surface is wide -- `CurrentRoot`,
+`AudioLibrary` and `MotePadDocumentStore` all call `generic_open` /
+`generic_statat` / `generic_renameat` with `AT_PWD` from that thread, resolving
+paths through `current->fs` and checking permission as `current->fsuid`, none of
+them borrowing a task first.
+
+So the clearing was reverted and the checkpoint instead clears `current` for
+the duration of its own call (`checkpoint_save_external`), which is correct and
+scoped.
+
+**Next step**: give every app-side kernel caller on the UI thread
+`AppDelegate`'s `pushUsableInitTaskAsCurrent` / `popCurrentTask`, which two
+callers already use (`UpgradeRootViewController`, and `AboutAppearance` since
+this crash). Then clearing `current` in `startSession` becomes safe and the
+invariant is "the UI thread is not a process; borrow one if you need to be".
+Worth doing as its own change with the whole surface audited, not as a rider on
+something else.
+
 ### Under `set -T`, some bash re-launches announce a command twice
 
 The last trap divergence between a re-launched subshell and a forked one, and

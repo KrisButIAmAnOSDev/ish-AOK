@@ -13,9 +13,21 @@ extern struct tty_driver pty_slave;
 // when the master cleans up it hangs up the slave, making any operation that references the master unreachable
 
 static void pty_slave_init_inode(struct tty *tty) {
-    tty->pty.uid = current->euid;
+    // `current` is not guaranteed here. A pty is usually opened by a guest
+    // process through /dev/ptmx, and then the node belongs to whoever opened
+    // it -- but the APP also makes them, on its UI thread, which is not a task:
+    // the appearance preview, the Wayland display session, and the terminal a
+    // restored session is re-attached to. Owned by root in that case, which is
+    // what a device node the system created IS.
+    //
+    // This read used to be unconditional and survived only because the UI
+    // thread happened to be carrying a stale task pointer from the last
+    // session start. Clearing that pointer -- correctly, see
+    // TerminalViewController's startSession -- turned it into an immediate
+    // EXC_BAD_ACCESS on opening Settings -> Appearance.
+    tty->pty.uid = current != NULL ? current->euid : 0;
     // TODO make these mount options
-    tty->pty.gid = current->egid;
+    tty->pty.gid = current != NULL ? current->egid : 0;
     tty->pty.perms = 0620;
 }
 

@@ -6,6 +6,7 @@
 //
 
 #import "AboutAppearanceViewController.h"
+#import "AppDelegate.h"
 #import "FontPickerViewController.h"
 #import "TerminalView.h"
 #import "ThemesViewController.h"
@@ -77,7 +78,16 @@ char *previewString = "# cat /proc/ish/colors\r\n"
     [self updateOtherControls];
 
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"recovery"]) {
-        _terminal = [Terminal createPseudoTerminal:&_tty];
+        // Borrow init for the duration, as UpgradeRootViewController does for
+        // its own preview terminal. Making a pty reaches kernel code that
+        // expects to be running as SOME process -- the slave node takes its
+        // ownership from the caller -- and this is the UI thread, which is not
+        // one.
+        struct task *previousCurrent = NULL;
+        if ([AppDelegate pushUsableInitTaskAsCurrent:&previousCurrent]) {
+            _terminal = [Terminal createPseudoTerminal:&_tty];
+            [AppDelegate popCurrentTask:previousCurrent];
+        }
         [_terminal sendOutput:previewString length:(int)strlen(previewString)];
     }
 }

@@ -3064,9 +3064,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                              @"Close other apps to free memory, then restart iSH-AOK.",
                                              @{@"root": defaultRoot});
                 }
-                // This thread is not that process; see the same note in
-                // TerminalViewController's startSession.
-                current = NULL;
+                // `current` is left pointing at init, exactly as the boot path
+                // below leaves it after its own task_start -- the two paths
+                // have to agree, because app code on this thread reads it. See
+                // the note in TerminalViewController's startSession.
                 os_log(ISHSuspendLog(), "resumed a suspended session");
                 [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
                                                details:@{@"root": defaultRoot}];

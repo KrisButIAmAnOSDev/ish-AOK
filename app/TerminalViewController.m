@@ -1369,14 +1369,17 @@ static const CGFloat kFindBarHeight = 44;
         task_never_ran_destroy(failed);
         return _EAGAIN;
     }
-    // The session now runs on its OWN thread, so this one must stop claiming to
-    // be it. `current` is per-thread and this is the UI thread; leaving it
-    // pointing at a live guest task means any kernel code the UI later calls
-    // acts as that process. Suspend to disk found it: ckpt_freeze_all does not
-    // freeze `current` -- the task asking for a checkpoint is already at a
-    // boundary -- so the backgrounding save skipped the session's own leader,
-    // photographed it mid-syscall, and the resumed session died on arrival.
-    current = NULL;
+    // `current` is deliberately LEFT pointing at the session here, and that is
+    // not hygiene, it is a load-bearing wart: a lot of app code calls into the
+    // kernel from this thread without borrowing a task first -- CurrentRoot,
+    // AudioLibrary and MotePadDocumentStore all resolve AT_PWD through
+    // current->fs -- and clearing it crashed them. Clearing it once, correctly,
+    // took out Settings -> Appearance within a day (pty_slave_init_inode read
+    // current->euid). The right fix is to give every one of those callers
+    // AppDelegate's pushUsableInitTaskAsCurrent, which is a job of its own; see
+    // docs/TODO.md. Nothing in the kernel may ASSUME this pointer: an external
+    // caller that must not be mistaken for a task clears it for its own
+    // duration instead (checkpoint_save_external).
     return 0;
 }
 
