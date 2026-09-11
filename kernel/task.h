@@ -2,6 +2,7 @@
 #define TASK_H
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include "emu/cpu.h"
 #include "kernel/abi.h"
@@ -788,6 +789,11 @@ extern void (*exit_hook)(struct task *task, int code);
 // terminates the host process with a status derived from init's exit code, so the
 // host exit status mirrors the guest's instead of the process dying via the
 // pthread_kill(SIGKILL) sweep. Left NULL by the iOS app, preserving its behavior.
+// Raw return addresses from another task's HOST thread, innermost first: where
+// a task that will not park actually IS. Returns how many were collected, 0 if
+// the thread cannot be read. See kernel/task.c.
+unsigned task_host_backtrace(struct task *task, uintptr_t *frames, unsigned max);
+
 extern void (*halt_hook)(int status);
 
 #define superuser() (current != NULL && current->euid == 0)

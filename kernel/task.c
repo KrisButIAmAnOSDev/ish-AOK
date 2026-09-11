@@ -2220,3 +2220,66 @@ bool current_is_valid(void) {
     
     return false;
 }
+
+// Raw return addresses from another task's host thread.
+//
+// The freeze blame can name the syscall a stuck task is in by reading x8 -- but
+// only if it IS in a syscall. A task spinning in guest code, or blocked on a
+// lock inside the kernel, leaves x8 holding whatever its LAST syscall was, and
+// the blame then points at an innocent path: chronyd on an M4 iPad read
+// "blocked in arm64 syscall 72" while every pselect6 shape reproducible on the
+// CLI parked correctly. These frames settle that kind of disagreement.
+//
+// Here rather than in kernel/checkpoint.c because this file can already see the
+// Mach headers: including them there makes PAGE_SIZE a runtime variable, which
+// silently turns a later `static const char zero[PAGE_SIZE]` into a VLA.
+//
+// Collected while the thread is suspended, which is only memory reads, and every
+// read is bounded to that thread's own stack so a garbage frame pointer ends the
+// walk instead of faulting the app. The caller symbolizes AFTER this returns and
+// the thread is running again: a suspended thread may hold the malloc or dyld
+// lock that dladdr needs, and waiting on it here would hang the caller.
+unsigned task_host_backtrace(struct task *task, uintptr_t *frames, unsigned max) {
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    if (task == NULL || frames == NULL || max == 0)
+        return 0;
+    // The liveness test task_wake_for_freeze makes, for its reason: a pthread_t
+    // whose thread has exited is undefined to touch, not a no-op.
+    if (!atomic_load_explicit(&task->host_thread_started, memory_order_acquire) ||
+            task->zombie || task->exiting ||
+            atomic_load_explicit(&task->exit_finished, memory_order_acquire))
+        return 0;
+    uintptr_t stack_top = (uintptr_t) pthread_get_stackaddr_np(task->thread);
+    uintptr_t stack_bottom = stack_top - pthread_get_stacksize_np(task->thread);
+    mach_port_t th = pthread_mach_thread_np(task->thread);
+    if (th == MACH_PORT_NULL || thread_suspend(th) != KERN_SUCCESS)
+        return 0;
+    unsigned n = 0;
+    arm_thread_state64_t st;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, ARM_THREAD_STATE64,
+                         (thread_state_t) &st, &count) == KERN_SUCCESS) {
+        // The same pointer-authentication strip the canary report uses.
+        frames[n++] = (uintptr_t) arm_thread_state64_get_pc(st) & 0x0000ffffffffffffULL;
+        if (n < max)
+            frames[n++] = (uintptr_t) arm_thread_state64_get_lr(st) & 0x0000ffffffffffffULL;
+        uintptr_t fp = (uintptr_t) arm_thread_state64_get_fp(st);
+        while (n < max && fp >= stack_bottom && fp + 16 <= stack_top && (fp & 7) == 0) {
+            const uintptr_t *rec = (const uintptr_t *) fp;
+            uintptr_t next = rec[0];
+            uintptr_t ret = rec[1] & 0x0000ffffffffffffULL;
+            if (ret == 0)
+                break;
+            frames[n++] = ret;
+            if (next <= fp)
+                break;
+            fp = next;
+        }
+    }
+    thread_resume(th);
+    return n;
+#else
+    (void) task; (void) frames; (void) max;
+    return 0;
+#endif
+}

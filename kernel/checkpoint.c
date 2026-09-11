@@ -58,6 +58,7 @@
 // to measure it against.
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -464,6 +465,26 @@ void checkpoint_native_park(void) {
 // Returns 0 with every task parked, or _EBUSY with `blame` naming the one that
 // would not stop. Thaws on failure, so a refusal leaves the guest exactly as
 // it was.
+// Where a task that would not park actually IS, on the host. The frames come
+// from kernel/task.c, which can see the Mach headers: including them here made
+// PAGE_SIZE a runtime variable and turned a later static array into a VLA.
+static void ckpt_trace_host_backtrace(struct task *t) {
+    uintptr_t frames[32];
+    unsigned n = task_host_backtrace(t, frames, 32);
+    for (unsigned i = 0; i < n; i++) {
+        Dl_info info;
+        if (dladdr((void *) frames[i], &info) && info.dli_fname != NULL) {
+            const char *img = strrchr(info.dli_fname, '/');
+            CKPT_TRACE("  host frame %2u: %s+%#lx %s\n", i,
+                       img != NULL ? img + 1 : info.dli_fname,
+                       (unsigned long) (frames[i] - (uintptr_t) info.dli_fbase),
+                       info.dli_sname != NULL ? info.dli_sname : "?");
+        } else {
+            CKPT_TRACE("  host frame %2u: %#lx\n", i, (unsigned long) frames[i]);
+        }
+    }
+}
+
 static int ckpt_freeze_all(unsigned timeout_ms, char *blame, size_t blame_size) {
     struct task_snapshot snap = {0};
     if (task_snapshot_collect(&snap, false) < 0)
@@ -530,6 +551,11 @@ static int ckpt_freeze_all(unsigned timeout_ms, char *blame, size_t blame_size) 
         else
             snprintf(blame, blame_size, "pid %d (%s) did not reach a syscall "
                      "boundary within %ums", stuck->pid, stuck->comm, timeout_ms);
+        if (ckpt_debug()) {
+            CKPT_TRACE("host backtrace of pid %d (%s), the task that would not park:\n",
+                       stuck->pid, stuck->comm);
+            ckpt_trace_host_backtrace(stuck);
+        }
     }
     if (err != 0) {
         for (unsigned i = 0; i < snap.count; i++)
