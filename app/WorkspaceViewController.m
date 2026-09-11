@@ -191,6 +191,14 @@ static BOOL ISHWorkspaceUsesModernStyle(void) {
     return UserPreferences.shared.workspaceStyle == WorkspaceStyleModern;
 }
 
+// Contrast helpers, defined with the rest of the theme maths further down but
+// needed by the window chrome above it. See ISHWorkspaceThemeOnSurfaceColor for
+// why a foreground is measured against its fill rather than assumed.
+static UIColor *ISHWorkspaceThemeOnSurfaceColor(UIColor *fill, CGFloat minimumContrast);
+static UIColor *ISHWorkspaceThemeMutedOnSurfaceColor(UIColor *ink, UIColor *fill,
+                                                     CGFloat minimumContrast);
+static UIColor *ISHWorkspaceThemeWashOverColor(UIColor *wash, CGFloat alpha, UIColor *base);
+
 // User-defined launcher shortcuts: each is @{@"name", @"command"} (a leaf that runs a command
 // in a fresh terminal) or @{@"name", @"children"} (a group whose "children" is itself an array
 // of shortcuts, recursively — lets a shortcut like "Remote Login" hold multiple hosts). Stored
@@ -669,9 +677,12 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
 
     self.panelView.backgroundColor = card;
     self.contentContainerView.backgroundColor = card;
-    // Focused window: solid accent title bar with white text. Otherwise the flat card.
+    // Focused window: solid accent title bar, with the text and glyphs measured
+    // against that accent rather than assumed white -- white is 5.16:1 on a teal
+    // accent and 1.49:1 on a mint one, and the palette editor can produce worse.
+    UIColor *titleBarInk = ISHWorkspaceThemeOnSurfaceColor(accent, 4.5);
     self.titleBarView.backgroundColor = active ? accent : card;
-    self.titleLabel.textColor = active ? UIColor.whiteColor : titleText;
+    self.titleLabel.textColor = active ? titleBarInk : titleText;
 
     // Hairline border in repose; a crisp accent ring marks focus.
     self.panelView.layer.borderWidth = active ? 1.5 : 1.0;
@@ -680,10 +691,10 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     // Quiet, flat window controls: tinted glyphs, no filled chips or borders.
     self.closeButton.backgroundColor = UIColor.clearColor;
     self.closeButton.layer.borderWidth = 0.0;
-    [self.closeButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+    [self.closeButton setTitleColor:(active ? titleBarInk : mutedGlyph) forState:UIControlStateNormal];
     self.utilityButton.backgroundColor = UIColor.clearColor;
     self.utilityButton.layer.borderWidth = 0.0;
-    [self.utilityButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+    [self.utilityButton setTitleColor:(active ? titleBarInk : mutedGlyph) forState:UIControlStateNormal];
 
     self.resizeHandleView.backgroundColor = active ? [focusRing colorWithAlphaComponent:0.9] : hairline;
 
@@ -2052,6 +2063,59 @@ static UIColor *ISHWorkspaceThemeFocusRingColor(UIColor *accent, UIColor *backgr
         }
     }
     return best;
+}
+
+// The colour to draw ON a filled surface -- a focused title bar, a selected row,
+// a chip. Measured against the fill, not assumed from the palette.
+//
+// Three places used to assume one, and each assumption held for some palettes
+// and failed for others. Measured: white glyphs are 5.16:1 on Aurora's teal
+// title bar and 1.49:1 on Graphite's mint one; the card colour as text on a
+// selected accent wash is 1.60:1 on Aurora, 1.67:1 on Solstice and 2.27:1 on
+// Graphite; the accent as text on a paler wash of itself is 4.77:1 on Graphite
+// and 3.69:1 on Aurora. Every one of those is a palette that is FINE -- Aurora's
+// primary on its card is 15:1 -- paired with a foreground nobody checked.
+//
+// And the palette editor lets anyone build a fourth palette that breaks a
+// different one, so measuring is the only answer that keeps working.
+//
+// Prefers the light pole where it clears the bar, so a deep accent keeps the
+// white-on-accent look it was drawn for; the dark pole is near-black rather than
+// black so it reads as ink and not as a hole.
+static UIColor *ISHWorkspaceThemeOnSurfaceColor(UIColor *fill, CGFloat minimumContrast) {
+    UIColor *light = UIColor.whiteColor;
+    UIColor *dark = [UIColor colorWithRed:0.05 green:0.06 blue:0.09 alpha:1.0];
+    CGFloat lightRatio = ISHWorkspaceThemeContrastRatio(light, fill);
+    if (lightRatio >= minimumContrast)
+        return light;
+    CGFloat darkRatio = ISHWorkspaceThemeContrastRatio(dark, fill);
+    if (darkRatio >= minimumContrast)
+        return dark;
+    return lightRatio >= darkRatio ? light : dark;
+}
+
+// A softer companion to the ink above, for secondary text on the same fill --
+// but only as soft as that fill allows. Aurora's selected row clears 10.75:1, so
+// fading to 82% still leaves 7.47; Graphite's clears 5.33:1 and the same fade
+// drops it to 4.19, under the bar. There the secondary text stays at full
+// strength and the hierarchy comes from size and weight instead, which is the
+// right trade: a dimmer label that cannot be read is not a hierarchy.
+static UIColor *ISHWorkspaceThemeMutedOnSurfaceColor(UIColor *ink, UIColor *fill,
+                                                     CGFloat minimumContrast) {
+    if (ink == nil || fill == nil)
+        return ink;
+    UIColor *muted = ISHWorkspaceThemeBlendColors([ink colorWithAlphaComponent:0.82], fill);
+    return ISHWorkspaceThemeContrastRatio(muted, fill) >= minimumContrast ? muted : ink;
+}
+
+// What a translucent wash actually paints over `base`. That composite is what
+// text on it has to contrast with -- neither the wash colour nor the base alone,
+// which is how a 34% accent over a near-white card came to be treated as though
+// it were the accent.
+static UIColor *ISHWorkspaceThemeWashOverColor(UIColor *wash, CGFloat alpha, UIColor *base) {
+    if (wash == nil || base == nil)
+        return base ?: wash;
+    return ISHWorkspaceThemeBlendColors([wash colorWithAlphaComponent:alpha], base);
 }
 
 static NSArray<NSString *> *ISHWorkspaceThemeEditableColorKeys(void) {
@@ -3886,10 +3950,13 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     } else {
         [pip setTitle:@"☰" forState:UIControlStateNormal];
     }
-    pip.tintColor = UIColor.whiteColor;
-    [pip setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     NSDictionary<NSString *, UIColor *> *pipTheme = ISHWorkspaceThemeDescriptor();
-    pip.backgroundColor = pipTheme[@"accent"] ?: [UIColor colorWithRed:0.20 green:0.48 blue:0.96 alpha:1.0];
+    UIColor *pipFill = pipTheme[@"accent"] ?: [UIColor colorWithRed:0.20 green:0.48 blue:0.96 alpha:1.0];
+    // Same rule as the title bar: the glyph is measured against the pill it sits on.
+    UIColor *pipInk = ISHWorkspaceThemeOnSurfaceColor(pipFill, 4.5);
+    pip.tintColor = pipInk;
+    [pip setTitleColor:pipInk forState:UIControlStateNormal];
+    pip.backgroundColor = pipFill;
     pip.layer.cornerRadius = 22.0;
     pip.layer.borderWidth = 1.5;
     pip.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
@@ -7476,8 +7543,15 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         button.layer.shadowOffset = CGSizeMake(0, 0);
         _themePreviewImageViewsByIdentifier[identifier].layer.borderColor =
             (selected ? theme[@"accentAlt"] : theme[@"stroke"]).CGColor;
-        _themeTitleLabelsByIdentifier[identifier].textColor = selected ? theme[@"card"] : theme[@"primary"];
-        _themeDetailLabelsByIdentifier[identifier].textColor = selected ? theme[@"cardAlt"] : theme[@"secondary"];
+        // The selected row is an accent wash over the card, so its text is measured
+        // against that composite. Using the card colour as the text assumed the
+        // wash was darker than the card, which is true for no built-in theme.
+        UIColor *selectedFill = ISHWorkspaceThemeWashOverColor(theme[@"accent"], 0.34, theme[@"card"]);
+        UIColor *selectedInk = ISHWorkspaceThemeOnSurfaceColor(selectedFill, 4.5);
+        _themeTitleLabelsByIdentifier[identifier].textColor = selected ? selectedInk : theme[@"primary"];
+        _themeDetailLabelsByIdentifier[identifier].textColor =
+            selected ? ISHWorkspaceThemeMutedOnSurfaceColor(selectedInk, selectedFill, 4.5)
+                     : theme[@"secondary"];
     }
     BOOL editingCustom = !ISHWorkspaceThemeIdentifierIsBuiltIn(_editingThemeIdentifier);
     for (UIButton *button in _editorActionButtons) {
@@ -11530,10 +11604,19 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                              weight:active ? UIFontWeightSemibold : UIFontWeightRegular];
     jump.layer.cornerRadius = 10;
     jump.layer.borderWidth = 1;
-    jump.layer.borderColor = (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35]).CGColor;
-    jump.backgroundColor = active ? [accent colorWithAlphaComponent:0.22] : nil;
+    // The active Desktop reads by its accent BORDER and its fill; its label is
+    // measured against that fill. Drawing the label in the accent over a paler
+    // wash of the same accent was 3.69:1 on Aurora -- the same hue twice, which
+    // is the one pairing that cannot work whatever the palette.
+    UIColor *activeFill = ISHWorkspaceThemeWashOverColor(accent, 0.22,
+                                                         theme[@"card"] ?: UIColor.whiteColor);
+    jump.layer.borderColor = (active ? accent
+                                     : (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35])).CGColor;
+    jump.backgroundColor = active ? activeFill : nil;
     [jump setTitle:[NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)] forState:UIControlStateNormal];
-    [jump setTitleColor:active ? accent : (theme[@"primary"] ?: UIColor.darkTextColor) forState:UIControlStateNormal];
+    [jump setTitleColor:(active ? ISHWorkspaceThemeOnSurfaceColor(activeFill, 4.5)
+                                : (theme[@"primary"] ?: UIColor.darkTextColor))
+               forState:UIControlStateNormal];
     if (active) {
         jump.accessibilityTraits |= UIAccessibilityTraitSelected;
     } else {
