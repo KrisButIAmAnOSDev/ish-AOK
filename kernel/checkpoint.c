@@ -558,10 +558,15 @@ static int ckpt_check_scope(void) {
             const struct native_program *prog = native_program_running(t);
             if (prog != NULL && prog->ckpt_dump != NULL)
                 continue;   // it can describe itself; see checkpoint_native_park
-            ckpt_refuse("pid %d is running the native program %s, which cannot "
-                        "describe its own state -- a native program is a C "
-                        "function on a host thread and its stack cannot be "
-                        "serialised", t->pid,
+            // Say what to DO as well as why. The message is most often read
+            // by someone whose LOGIN shell is native bash, who cannot simply
+            // quit it, and for whom the fix is a different native shell --
+            // native zsh does have a ckpt_dump and is saved rather than
+            // refused. Kept short enough that last_refusal cannot truncate it.
+            ckpt_refuse("pid %d is running the native program %s, whose C stack "
+                        "on a host thread cannot be serialised. Exit it and save "
+                        "again -- or, if it is your login shell, switch with "
+                        "/AOK/tools/native-links.sh --shell zsh", t->pid,
                         prog != NULL ? prog->name :
                         (t->comm[0] ? t->comm : "?"));
             err = _EOPNOTSUPP;
