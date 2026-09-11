@@ -997,6 +997,47 @@ static const CGFloat kFindBarHeight = 44;
         }]];
     }
 
+    // Separate from "Save Session Now" because the outcome is different in the
+    // way that matters: the app goes away. Confirmed rather than immediate --
+    // the two entries sit next to each other and one of them quits.
+    if (enabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            UIAlertController *confirm = [UIAlertController
+                alertControllerWithTitle:@"Suspend and exit?"
+                                 message:@"iSH-AOK writes this session to disk and quits. "
+                                         @"The next launch picks it up where you left it."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [confirm addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(__unused UIAlertAction *go) {
+                [self _scheduleSaveProgressHUD];
+                self.saveSessionInProgress = YES;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    // Returns only on FAILURE: on success the process is gone.
+                    int err = ISHSuspendSessionSuspendAndExit();
+                    struct checkpoint_status ck;
+                    checkpoint_get_status(&ck);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.saveSessionInProgress = NO;
+                        [self _dismissSaveProgressHUDThen:^{
+                            [self showMessage:@"Session not suspended"
+                                     subtitle:ck.last_refusal[0] != '\0'
+                                              ? @(ck.last_refusal)
+                                              : @"iSH-AOK could not write the session."];
+                        }];
+                    });
+                });
+            }]];
+            [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                        style:UIAlertActionStyleCancel
+                                                      handler:nil]];
+            if (self.presentedViewController == nil)
+                [self presentViewController:confirm animated:YES completion:nil];
+        }]];
+    }
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"What Would Be Saved"
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *a) {

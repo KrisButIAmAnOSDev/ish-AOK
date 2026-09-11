@@ -2444,6 +2444,31 @@ int ISHSuspendSessionSaveNow(void) {
     return checkpoint_save_external(image.fileSystemRepresentation);
 }
 
+// Write the session and GO, which is a different thing from saving one.
+//
+// A save is a copy: the image is written and the guest carries straight on, so
+// two saves in a row are two photographs of a machine that never stopped. A
+// suspend is a departure -- the point is to put the machine down and have the
+// next launch be the one that continues it. Without this the only way to do
+// that was /AOK/tools/suspend.sh from inside the guest, which already ends in
+// the same exit(0) (kernel/checkpoint.c's halt path, where the app installs no
+// halt_hook).
+//
+// Exiting immediately rather than after a beat, and that is deliberate: the
+// image describes the guest as it was when the freeze stopped it, while the
+// filesystem keeps changing for as long as the app is alive. Every millisecond
+// between the two is a millisecond the root can drift from the image.
+int ISHSuspendSessionSuspendAndExit(void) {
+    NSString *image = ISHSuspendSessionImagePath();
+    if (image == nil)
+        return _ENOENT;
+    int err = checkpoint_save_external(image.fileSystemRepresentation);
+    if (err < 0)
+        return err;
+    os_log(ISHSuspendLog(), "session suspended on request; exiting");
+    exit(0);
+}
+
 static TerminalViewController *CreateTerminalViewController(void) {
     UIViewController *viewController = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];
     return [viewController isKindOfClass:TerminalViewController.class] ? (TerminalViewController *) viewController : nil;

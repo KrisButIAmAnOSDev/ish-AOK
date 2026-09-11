@@ -74,3 +74,8 @@ void ISHSuspendGuardEnterForeground(void);
 // cause. The guest is unharmed either way -- a checkpoint is a copy.
 NSString *ISHSuspendSessionImagePath(void);
 int ISHSuspendSessionSaveNow(void);
+
+// Save the session and terminate the app, so the next launch resumes it. Does
+// not return on success. A SAVE is a copy and the guest carries on; this is the
+// departure.
+int ISHSuspendSessionSuspendAndExit(void);
