@@ -897,6 +897,17 @@ static const CGFloat kFindBarHeight = 44;
     [button.widthAnchor constraintEqualToAnchor:self.infoButton.widthAnchor].active = YES;
     self.saveSessionButton = button;
 
+    // Tap saves; touch and hold asks what else there is. The menu exists mostly
+    // for one question -- "it said the session was not saved, why?" -- which
+    // the checkpoint can answer precisely and had nowhere to say.
+    UILongPressGestureRecognizer *hold =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(showSessionMenu:)];
+    hold.minimumPressDuration = 0.5;
+    [button addGestureRecognizer:hold];
+    button.accessibilityHint = @"Writes this session to disk so the next launch resumes it. "
+                               @"Touch and hold for session options.";
+
     // Follows the Settings switch live, so turning it on does not need a
     // relaunch to put the button there -- and turning it off takes it away.
     [UserPreferences.shared observe:@[@"shouldSuspendToDisk"]
@@ -907,6 +918,112 @@ static const CGFloat kFindBarHeight = 44;
             self.saveSessionButton.hidden = !UserPreferences.shared.shouldSuspendToDisk;
         });
     }];
+}
+
+- (void)showSessionMenu:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan)
+        return;
+    [self presentSessionMenuFromView:recognizer.view];
+}
+
+// Everything about suspending, in the one place a person is already touching
+// when they want it.
+//
+// The refusal is the reason this exists. /proc/ish/checkpoint has always known
+// exactly why a save was refused -- it names the pid and the program -- but in
+// the app that string only ever appeared in the toast of a save you had just
+// attempted, and was gone a moment later. "Session not saved" with no way back
+// to the reason is the complaint this answers.
+- (void)presentSessionMenuFromView:(UIView *)sourceView {
+    if (sourceView == nil)
+        sourceView = self.saveSessionButton ?: self.infoButton;
+
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    BOOL enabled = UserPreferences.shared.shouldSuspendToDisk;
+
+    NSString *subtitle;
+    if (!enabled) {
+        subtitle = @"Suspend to Disk is off, so nothing is being saved.";
+    } else if (ck.last_refusal[0] != '\0') {
+        subtitle = @"The last attempt was refused.";
+    } else if (ck.saves > 0) {
+        subtitle = [NSString stringWithFormat:@"%lu saved so far; the last held %lu processes.",
+                    ck.saves, ck.tasks];
+    } else {
+        subtitle = @"Nothing saved yet this run.";
+    }
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Session"
+                                            message:subtitle
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    if (enabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session Now"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [self saveSessionFromBar:nil];
+        }]];
+    } else {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Turn On Suspend to Disk…"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }]];
+    }
+
+    // Only when there is one. An empty "why it refused" is worse than no entry,
+    // because it implies something went wrong when nothing did.
+    if (ck.last_refusal[0] != '\0') {
+        NSString *why = [NSString stringWithUTF8String:ck.last_refusal];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Why It Was Not Saved"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            UIAlertController *alert =
+                [UIAlertController alertControllerWithTitle:@"Session not saved"
+                                                    message:why
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+            if (self.presentedViewController == nil)
+                [self presentViewController:alert animated:YES completion:nil];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"What Would Be Saved"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        struct checkpoint_status now;
+        checkpoint_get_status(&now);
+        NSMutableString *body = [NSMutableString string];
+        [body appendFormat:@"Saves this run: %lu\n", now.saves];
+        if (now.saves > 0) {
+            [body appendFormat:@"Last image: %lu processes, %lu descriptors, %lu pages\n",
+                               now.tasks, now.fds, now.pages];
+        }
+        [body appendFormat:@"This launch resumed a saved session: %@", now.restored ? @"yes" : @"no"];
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"Session"
+                                                message:body
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        if (self.presentedViewController == nil)
+            [self presentViewController:alert animated:YES completion:nil];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    // An action sheet on iPad is a popover and needs somewhere to point.
+    sheet.popoverPresentationController.sourceView = sourceView;
+    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
+    if (self.presentedViewController == nil)
+        [self presentViewController:sheet animated:YES completion:nil];
 }
 
 // Command-S, arriving up the responder chain from TerminalView. Same save as
