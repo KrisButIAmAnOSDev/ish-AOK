@@ -220,6 +220,7 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 @property (weak, nonatomic) IBOutlet UIButton *infoButton;
 @property (strong, nonatomic) UIButton *workspaceButton;
 @property (strong, nonatomic) UIButton *saveSessionButton;
+@property (weak, nonatomic) UIAlertController *saveProgressHUD;
 @property (nonatomic) BOOL saveSessionInProgress;
 @property (strong, nonatomic) UIButton *terminalSwitcherButton;
 @property (strong, nonatomic) BarButton *dotKey;
@@ -1060,11 +1061,66 @@ static const CGFloat kFindBarHeight = 44;
     [self saveSessionFromBar:sender];
 }
 
+// Shown only if the save is SLOW, and that delay is the whole design.
+//
+// A save of a nine-process session is ~260ms, and a dialog that appears and
+// disappears inside 260ms is worse than no dialog: it reads as a glitch. But
+// the time is not a constant -- it scales with the session, and a native
+// program that has to be asked to flush its work before the machine can stop
+// can make it seconds. So the HUD is SCHEDULED rather than shown, and a save
+// that beats the threshold never puts anything on screen.
+static const NSTimeInterval kSaveProgressDelay = 0.4;
+
+- (void)_scheduleSaveProgressHUD {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSaveProgressDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        // Beaten by the save, or something else is on screen: say nothing.
+        if (!self.saveSessionInProgress || self.presentedViewController != nil)
+            return;
+        UIAlertController *hud =
+            [UIAlertController alertControllerWithTitle:@"Saving session…"
+                                                message:@"\n\n"
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        UIActivityIndicatorView *spinner;
+        if (@available(iOS 13, *)) {
+            spinner = [[UIActivityIndicatorView alloc]
+                       initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+        } else {
+            spinner = [[UIActivityIndicatorView alloc] init];
+        }
+        spinner.translatesAutoresizingMaskIntoConstraints = NO;
+        [spinner startAnimating];
+        [hud.view addSubview:spinner];
+        [NSLayoutConstraint activateConstraints:@[
+            [spinner.centerXAnchor constraintEqualToAnchor:hud.view.centerXAnchor],
+            [spinner.bottomAnchor constraintEqualToAnchor:hud.view.bottomAnchor constant:-20],
+        ]];
+        self.saveProgressHUD = hud;
+        [self presentViewController:hud animated:YES completion:nil];
+    });
+}
+
+// Take the HUD down, then run `next` -- ordered, because the confirmation and
+// the refusal both present something of their own and UIKit will not present
+// on top of a controller that is still dismissing.
+- (void)_dismissSaveProgressHUDThen:(void (^)(void))next {
+    UIAlertController *hud = self.saveProgressHUD;
+    self.saveProgressHUD = nil;
+    if (hud == nil || hud.presentingViewController == nil) {
+        next();
+        return;
+    }
+    [hud dismissViewControllerAnimated:NO completion:^{
+        next();
+    }];
+}
+
 - (void)saveSessionFromBar:(__unused id)sender {
     if (self.saveSessionInProgress)
         return;
     self.saveSessionInProgress = YES;
     self.saveSessionButton.enabled = NO;
+    [self _scheduleSaveProgressHUD];
 
     // OFF the main thread: the save freezes every guest task, writes the image
     // and thaws before it returns. The guest is stopped for that time either
@@ -1078,14 +1134,16 @@ static const CGFloat kFindBarHeight = 44;
         dispatch_async(dispatch_get_main_queue(), ^{
             self.saveSessionInProgress = NO;
             self.saveSessionButton.enabled = YES;
-            if (err == 0) {
-                [self flashSaveSessionConfirmation];
-                return;
-            }
-            [self showMessage:@"Session not saved"
-                     subtitle:ck.last_refusal[0] != '\0'
-                              ? @(ck.last_refusal)
-                              : @"iSH-AOK could not write the session."];
+            [self _dismissSaveProgressHUDThen:^{
+                if (err == 0) {
+                    [self flashSaveSessionConfirmation];
+                    return;
+                }
+                [self showMessage:@"Session not saved"
+                         subtitle:ck.last_refusal[0] != '\0'
+                                  ? @(ck.last_refusal)
+                                  : @"iSH-AOK could not write the session."];
+            }];
         });
     });
 }
