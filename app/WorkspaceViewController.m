@@ -2949,6 +2949,27 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     return UIEdgeInsetsInsetRect(bounds, UIEdgeInsetsMake(insets.top, 0, 0, 0));
 }
 
+// Where a window is ALLOWED TO BE, as opposed to where a new one is PUT.
+//
+// desktopUsableBounds keeps clear of the status bar and the home indicator,
+// which is right for placing a window nobody has positioned yet -- one should
+// not be born under the notch. It is wrong as a limit on a window the person
+// has dragged somewhere on purpose: they moved it to the top edge because they
+// wanted it at the top edge, and clamping it back is the app overruling them.
+//
+// The symptom that named this: a window WOULD sit at the very top, and then
+// any re-layout -- a rotation, a tool opening, the portrait-sized pass iOS
+// runs while the app is backgrounded -- put it back below the status bar. It
+// looked like the window drifting on its own.
+//
+// The grab strip is what keeps this safe rather than the insets:
+// clampedDesktopFrame always leaves a title bar's height and 140pt of width
+// inside these bounds, so a window can reach any edge and still be draggable
+// back.
+- (CGRect)desktopWindowClampBounds {
+    return self.desktopSurfaceView.bounds;
+}
+
 - (CGRect)desktopFrameForWindowWithPreferredSize:(CGSize)preferredSize {
     CGRect usableBounds = [self desktopUsableBounds];
     CGFloat width = MIN(preferredSize.width, CGRectGetWidth(usableBounds));
@@ -2987,12 +3008,15 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     if (CGRectGetHeight(frame) > CGRectGetHeight(usableBounds))
         frame.size.height = CGRectGetHeight(usableBounds);
 
+    // The SIZE was limited by the usable bounds above; the POSITION is limited
+    // only by the surface, so a window can sit against any edge of the screen.
+    CGRect clampBounds = [self desktopWindowClampBounds];
     CGFloat visibleWidth = MIN(CGRectGetWidth(frame), 140.0);
-    CGFloat minX = CGRectGetMinX(usableBounds) - (CGRectGetWidth(frame) - visibleWidth);
-    CGFloat maxX = CGRectGetMaxX(usableBounds) - visibleWidth;
+    CGFloat minX = CGRectGetMinX(clampBounds) - (CGRectGetWidth(frame) - visibleWidth);
+    CGFloat maxX = CGRectGetMaxX(clampBounds) - visibleWidth;
     CGFloat visibleHeight = MIN(CGRectGetHeight(frame), ISHWorkspaceWindowTitleBarHeight);
-    CGFloat minY = CGRectGetMinY(usableBounds);
-    CGFloat maxY = CGRectGetMaxY(usableBounds) - visibleHeight;
+    CGFloat minY = CGRectGetMinY(clampBounds);
+    CGFloat maxY = CGRectGetMaxY(clampBounds) - visibleHeight;
 
     if (maxX < minX)
         maxX = minX;
