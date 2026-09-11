@@ -7,6 +7,7 @@
 
 #import "TerminalViewController.h"
 #import "AppDelegate.h"
+#import "UIApplication+OpenURL.h"
 #import "TerminalView.h"
 #import "BarButton.h"
 #import "ArrowBarButton.h"
@@ -908,6 +909,33 @@ static const CGFloat kFindBarHeight = 44;
     }];
 }
 
+// Command-S, arriving up the responder chain from TerminalView. Same save as
+// the bar button, but it must handle the preference being off itself: the bar
+// button is hidden in that case and simply is not there to press, while a key
+// command with a discoverability title is always advertised.
+- (void)saveSessionFromKeyCommand:(__unused id)sender {
+    if (!UserPreferences.shared.shouldSuspendToDisk) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Suspend to Disk is off"
+                             message:@"Turn on Suspend to Disk in the iOS Settings app, under "
+                                     @"iSH-AOK. This session is then saved whenever iSH-AOK goes "
+                                     @"to the background, and Command-S saves one on demand."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Open Settings"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Not Now"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        if (self.presentedViewController == nil)
+            [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    [self saveSessionFromBar:sender];
+}
+
 - (void)saveSessionFromBar:(__unused id)sender {
     if (self.saveSessionInProgress)
         return;
@@ -945,8 +973,17 @@ static const CGFloat kFindBarHeight = 44;
 // An alert for "it worked" would be worse than saying nothing at all.
 - (void)flashSaveSessionConfirmation {
     UIButton *button = self.saveSessionButton;
-    if (button == nil)
+    // No button to flash: a hardware keyboard hides the accessory bar, and on
+    // iPhone the button is never installed. Command-S would then save in total
+    // silence, so say it out loud instead -- brief, and it cannot be missed.
+    if (button == nil || button.hidden || button.window == nil) {
+        struct checkpoint_status ck;
+        checkpoint_get_status(&ck);
+        [self showMessage:@"Session saved"
+                 subtitle:[NSString stringWithFormat:
+                           @"%lu processes written. The next launch resumes here.", ck.tasks]];
         return;
+    }
     if (@available(iOS 13, *)) {
         [button setImage:[UIImage systemImageNamed:@"checkmark"] forState:UIControlStateNormal];
     } else {

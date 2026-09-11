@@ -863,6 +863,23 @@ static const char *viRepeatKeys = "hjkl";
                                                 modifierFlags:UIKeyModifierCommand|UIKeyModifierShift
                                                        action:@selector(clearScrollback:)
                                          discoverabilityTitle:@"Clear Scrollback"]];
+    // Suspend to disk. Not implemented here: it goes up the responder chain to
+    // TerminalViewController, which owns the save.
+    //
+    // This is the ONLY way to reach it with a hardware keyboard attached. The
+    // accessory bar carries the button, and a hardware keyboard is exactly when
+    // that bar is not on screen -- which is also exactly the setup someone
+    // leaves running for hours and most wants to save. Registered even when the
+    // preference is off, so holding Command advertises that the feature exists;
+    // the handler explains rather than doing nothing.
+    //
+    // Command is free here: iSH-AOK sends Control and Alt to the guest and
+    // keeps Command for the app, which is why Clear Scrollback could take
+    // Command-Shift-K above.
+    [_keyCommands addObject:[UIKeyCommand keyCommandWithInput:@"s"
+                                                modifierFlags:UIKeyModifierCommand
+                                                       action:@selector(saveSessionFromKeyCommand:)
+                                         discoverabilityTitle:@"Save Session"]];
 
     return _keyCommands;
 }
