@@ -79,3 +79,16 @@ int ISHSuspendSessionSaveNow(void);
 // not return on success. A SAVE is a copy and the guest carries on; this is the
 // departure.
 int ISHSuspendSessionSuspendAndExit(void);
+
+// ---- saved sessions -----------------------------------------------------
+// Each entry: path, name, date, bytes, tasks, hostname, loadable. Newest first.
+NSArray<NSDictionary *> *ISHSessionSlots(void);
+// How many are worth keeping on this device right now, space considered.
+NSUInteger ISHSessionSlotLimit(void);
+// Which slot the next save writes to; nil resets to "pick one".
+void ISHSessionSetCurrentSlot(NSString *_Nullable path);
+// The slot this launch should resume, chosen before the guest boots. nil means
+// start fresh, and the boot will not look for an image at all.
+void ISHSessionSetResumeChoice(NSString *_Nullable path);
+// YES while nothing has been chosen and there is something to choose between.
+BOOL ISHSessionResumeChoicePending(void);

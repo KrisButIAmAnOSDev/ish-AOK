@@ -2430,11 +2430,160 @@ static UIViewController *CreateRootSelectionViewController(void) {
 // not the filesystem -- a root that is exported, copied or deleted should not
 // take a session with it, and a session that no longer matches its root is
 // refused on the way in rather than half-applied.
-NSString *ISHSuspendSessionImagePath(void) {
+// ---- session slots ------------------------------------------------------
+//
+// More than one saved session, because one is a strange number for something
+// this cheap: the images are a few megabytes and the alternative to keeping the
+// old one is throwing it away every time you save.
+//
+// A DIRECTORY of images rather than a naming convention on one file, so that
+// listing them is a directory read and deleting one cannot disturb another.
+// Each slot describes ITSELF -- checkpoint_peek reads the header -- rather than
+// carrying a sidecar, because an image can be written by the app or by the
+// guest (/AOK/tools/suspend.sh) and only one of those would keep a sidecar up
+// to date.
+static NSString *ISHSessionsDirectory(void) {
     NSURL *container = ContainerURL();
     if (container == nil)
         return nil;
-    return [container URLByAppendingPathComponent:@"suspend.img"].path;
+    NSString *dir = [container URLByAppendingPathComponent:@"sessions"].path;
+    [NSFileManager.defaultManager createDirectoryAtPath:dir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+    return dir;
+}
+
+// The single suspend.img earlier builds wrote, folded into the new layout the
+// first time this runs. Moved rather than copied: two files that both claim to
+// be "the" session is exactly the ambiguity the directory removes.
+static void ISHSessionMigrateLegacyImage(void) {
+    NSURL *container = ContainerURL();
+    NSString *dir = ISHSessionsDirectory();
+    if (container == nil || dir == nil)
+        return;
+    NSString *legacy = [container URLByAppendingPathComponent:@"suspend.img"].path;
+    if (![NSFileManager.defaultManager fileExistsAtPath:legacy])
+        return;
+    NSString *dest = [dir stringByAppendingPathComponent:@"session-1.img"];
+    if ([NSFileManager.defaultManager fileExistsAtPath:dest]) {
+        [NSFileManager.defaultManager removeItemAtPath:legacy error:nil];
+        return;
+    }
+    NSError *err = nil;
+    if (![NSFileManager.defaultManager moveItemAtPath:legacy toPath:dest error:&err])
+        os_log_error(ISHSuspendLog(), "could not migrate the old session image: %{public}@", err);
+}
+
+// Newest first, because the one you want is almost always the last one you made.
+NSArray<NSDictionary *> *ISHSessionSlots(void) {
+    ISHSessionMigrateLegacyImage();
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return @[];
+    NSArray<NSString *> *names =
+        [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (NSString *name in names) {
+        if (![name.pathExtension isEqualToString:@"img"])
+            continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+        struct checkpoint_image_info info;
+        if (checkpoint_peek(path.fileSystemRepresentation, &info) < 0)
+            continue;   // not an image, or truncated -- not a slot
+        [out addObject:@{
+            @"path": path,
+            @"name": name.stringByDeletingPathExtension,
+            @"date": attrs[NSFileModificationDate] ?: NSDate.distantPast,
+            @"bytes": attrs[NSFileSize] ?: @0,
+            @"tasks": @(info.tasks),
+            @"hostname": @(info.hostname),
+            @"loadable": @(info.loadable != false),
+        }];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"date"] compare:a[@"date"]];
+    }];
+    return out;
+}
+
+// How many slots are worth keeping, given what is left on the disk.
+//
+// "If there is enough space" is the rule, so it is asked rather than assumed:
+// an image is roughly the size of the guest's resident memory, and filling a
+// device with sessions is a worse failure than keeping fewer of them.
+#define ISH_SESSION_SLOT_CEILING 5
+NSUInteger ISHSessionSlotLimit(void) {
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return 1;
+    NSDictionary *fs = [NSFileManager.defaultManager attributesOfFileSystemForPath:dir error:nil];
+    unsigned long long free = [fs[NSFileSystemFreeSize] unsignedLongLongValue];
+    if (free == 0)
+        return ISH_SESSION_SLOT_CEILING;   // could not tell; do not punish the user for that
+    // Room for the ceiling at 64 MB each, plus 512 MB left for everything else.
+    unsigned long long budget = free > (512ULL << 20) ? free - (512ULL << 20) : 0;
+    NSUInteger affordable = (NSUInteger) (budget / (64ULL << 20));
+    if (affordable < 1)
+        affordable = 1;    // always at least the one you are about to write
+    return affordable < ISH_SESSION_SLOT_CEILING ? affordable : ISH_SESSION_SLOT_CEILING;
+}
+
+// Which slot the NEXT save writes to. The one this launch resumed from, so a
+// session keeps its own slot across suspends rather than wandering; otherwise
+// the first free number, and when they are all taken, the oldest.
+static NSString *ishSessionCurrentSlot = nil;
+
+NSString *ISHSuspendSessionImagePath(void) {
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return nil;
+    if (ishSessionCurrentSlot != nil)
+        return ishSessionCurrentSlot;
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    NSUInteger limit = ISHSessionSlotLimit();
+    if (slots.count < limit) {
+        for (NSUInteger n = 1; ; n++) {
+            NSString *candidate = [dir stringByAppendingPathComponent:
+                                   [NSString stringWithFormat:@"session-%lu.img", (unsigned long) n]];
+            if (![NSFileManager.defaultManager fileExistsAtPath:candidate]) {
+                ishSessionCurrentSlot = candidate;
+                return candidate;
+            }
+        }
+    }
+    // Full: the oldest is the one with the least to lose.
+    ishSessionCurrentSlot = slots.lastObject[@"path"];
+    return ishSessionCurrentSlot;
+}
+
+void ISHSessionSetCurrentSlot(NSString *path) {
+    ishSessionCurrentSlot = path;
+}
+
+// The choice, made once per launch and BEFORE the guest boots.
+//
+// Not a preference: it is about this launch only. `decided` is separate from
+// `path` because "start fresh" is a real answer and nil is not the absence of
+// one -- without it, choosing New Session and then reaching the boot would look
+// exactly like never having been asked.
+static NSString *ishSessionResumeChoice = nil;
+static BOOL ishSessionResumeDecided = NO;
+
+void ISHSessionSetResumeChoice(NSString *path) {
+    ishSessionResumeChoice = path;
+    ishSessionResumeDecided = YES;
+    // A resumed session keeps writing to the slot it came from.
+    ISHSessionSetCurrentSlot(path);
+}
+
+BOOL ISHSessionResumeChoicePending(void) {
+    if (ishSessionResumeDecided)
+        return NO;
+    if (!UserPreferences.shared.shouldSuspendToDisk)
+        return NO;
+    return ISHSessionSlots().count > 0;
 }
 
 int ISHSuspendSessionSaveNow(void) {
@@ -3049,7 +3198,21 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // correct, on a terminal nobody was looking at, while the window the user
     // could see held a shell that had just been started.
     checkpoint_open_session_tty = ISHOpenTerminalForRestoredSession;
-    NSString *sessionImage = ISHSuspendSessionImagePath();
+    // The slot the picker settled on, not "the" image: a launch that was asked
+    // and answered "New Session" must not resume anything, and one that was
+    // never asked (a Shortcut, a background entry point -- nobody is looking at
+    // a dialog there) falls back to the newest slot, which is what a single
+    // suspend.img used to mean.
+    NSString *sessionImage = nil;
+    if (ishSessionResumeDecided) {
+        sessionImage = ishSessionResumeChoice;
+    } else {
+        sessionImage = ISHSessionSlots().firstObject[@"path"];
+        if (sessionImage != nil)
+            ISHSessionSetCurrentSlot(sessionImage);
+    }
+    if (sessionImage == nil)
+        sessionImage = ISHSuspendSessionImagePath();
     // The same switch gates the guest's own control of this. Published rather
     // than read from the kernel, because UserPreferences is Objective-C and
     // fs/proc/ish.c is not; re-published on every activation below, so
@@ -3627,7 +3790,17 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [ISHDiagnosticsStore recordLaunchStage:@"roots.loaded"
                                    details:@{@"needsInitialRootSelection": @(Roots.instance.needsInitialRootSelection),
                                              @"defaultRoot": Roots.instance.defaultRoot ?: @""}];
-    if (!Roots.instance.needsInitialRootSelection) {
+    // Held back when there is a saved session to choose between, because the
+    // choice decides whether this boots at all or is rebuilt from an image, and
+    // ensureBooted is dispatch_once -- whoever calls it first settles it.
+    // TerminalViewController asks, then boots.
+    //
+    // Launching WITHOUT booting is already a path the app takes: it is what
+    // happens on a first run, while the root picker is up (the condition right
+    // here). This is the second reason to take it.
+    if (!Roots.instance.needsInitialRootSelection && ISHSessionResumeChoicePending()) {
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.deferred.sessionChoice"];
+    } else if (!Roots.instance.needsInitialRootSelection) {
         bootError = [AppDelegate ensureBooted];
         NSMutableDictionary<NSString *, id> *bootCheckDetails = [NSMutableDictionary dictionaryWithObject:@(bootError)
                                                                                                     forKey:@"bootError"];

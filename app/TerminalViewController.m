@@ -221,6 +221,7 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 @property (strong, nonatomic) UIButton *workspaceButton;
 @property (strong, nonatomic) UIButton *saveSessionButton;
 @property (weak, nonatomic) UIAlertController *saveProgressHUD;
+@property (nonatomic) BOOL awaitingSessionChoice;
 @property (nonatomic) BOOL saveSessionInProgress;
 @property (strong, nonatomic) UIButton *terminalSwitcherButton;
 @property (strong, nonatomic) BarButton *dotKey;
@@ -361,11 +362,109 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     [self.termView becomeFirstResponder];
 }
 
+// Resume which session, or none.
+//
+// Presented BEFORE the guest boots, because the answer decides whether it
+// boots at all or is rebuilt from an image -- there is no undoing that once
+// ensureBooted has run.
+- (void)_presentSessionResumePicker {
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Resume a session?"
+                         message:slots.count == 1
+                                 ? @"iSH-AOK saved this session. Pick it up, or start fresh."
+                                 : @"iSH-AOK has saved sessions. Pick one up, or start fresh."
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    NSDateFormatter *when = [[NSDateFormatter alloc] init];
+    when.dateStyle = NSDateFormatterShortStyle;
+    when.timeStyle = NSDateFormatterShortStyle;
+
+    for (NSDictionary *slot in slots) {
+        // An image this build cannot load is offered as nothing but a deletion:
+        // choosing it would boot instead, which looks like the resume silently
+        // failing.
+        BOOL loadable = [slot[@"loadable"] boolValue];
+        NSString *title;
+        if (loadable) {
+            title = [NSString stringWithFormat:@"%@ — %@ process%@, %@",
+                     slot[@"hostname"], slot[@"tasks"],
+                     [slot[@"tasks"] unsignedLongValue] == 1 ? @"" : @"es",
+                     [when stringFromDate:slot[@"date"]]];
+        } else {
+            title = [NSString stringWithFormat:@"%@ (saved by a different build)",
+                     [when stringFromDate:slot[@"date"]]];
+        }
+        UIAlertAction *action =
+            [UIAlertAction actionWithTitle:title
+                                     style:UIAlertActionStyleDefault
+                                   handler:^(__unused UIAlertAction *a) {
+            ISHSessionSetResumeChoice(loadable ? slot[@"path"] : nil);
+            if (!loadable)
+                [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
+            [self _bootAfterSessionChoice];
+        }];
+        action.enabled = YES;
+        [sheet addAction:action];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Start a New Session"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        // The images are KEPT. "New session" is about this launch, not about
+        // throwing away what is on disk -- deleting somebody's saved work
+        // because they wanted a fresh prompt is not a thing to do quietly.
+        ISHSessionSetResumeChoice(nil);
+        [self _bootAfterSessionChoice];
+    }]];
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)_bootAfterSessionChoice {
+    intptr_t bootError = [AppDelegate ensureBooted];
+    if (bootError < 0) {
+        NSString *message = [AppDelegate bootFailureTitle] ?: @"Could not boot iSH-AOK";
+        NSString *subtitle = [AppDelegate bootFailureMessage] ?: [AppDelegate descriptionForISHErrno:bootError];
+        NSString *overlayText = [AppDelegate bootFailureOverlayText] ?: @"Could not boot iSH-AOK.";
+        [self _showTerminalStartupFailureOverlayWithText:overlayText];
+        [self showMessage:message subtitle:subtitle];
+        NSLog(@"boot failed: %@", subtitle);
+        return;
+    }
+    // The scene asked for a session while the choice was pending and was told
+    // to wait (startNewSession). This is where it gets one: the restored
+    // session if a slot was chosen, a fresh shell if not.
+    [self startNewSession];
+    // What the boot block in viewDidLoad is followed by: the terminal cannot be
+    // attached to the view until there IS a guest.
+    [self _applyCurrentTerminalToViewIfPossible];
+    if (UserPreferences.shared.autoShowKeyboard)
+        [self.termView becomeFirstResponder];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self _installTerminalStartupOverlay];
 
-    if (!Roots.instance.needsInitialRootSelection) {
+    // A saved session to choose between, and somebody here to choose: hold the
+    // boot until they answer, the way the first-run root picker already does.
+    // ensureBooted is dispatch_once, so whoever calls it first settles the
+    // question and asking afterwards would be asking about a decision already
+    // made.
+    //
+    // The rest of viewDidLoad still runs -- only the BOOT waits. Returning
+    // early here would skip the terminal view, the keyboard and every observer
+    // below, and the picker is presented from viewDidAppear because a view
+    // controller has no window yet at this point.
+    //
+    // Only on this path. A Shortcut or a background entry point also boots the
+    // guest, and there is nobody looking at a dialog there, so those resume the
+    // newest session as a single suspend.img always did.
+    self.awaitingSessionChoice =
+        !Roots.instance.needsInitialRootSelection && ISHSessionResumeChoicePending();
+
+    if (!Roots.instance.needsInitialRootSelection && !self.awaitingSessionChoice) {
         intptr_t bootError = [AppDelegate ensureBooted];
         if (bootError < 0) {
             NSString *message = [AppDelegate bootFailureTitle] ?: @"Could not boot iSH-AOK";
@@ -377,9 +476,15 @@ static const NSInteger kMaximumTerminalFontSize = 72;
         }
     }
 
-    [self _applyCurrentTerminalToViewIfPossible];
-    if (UserPreferences.shared.autoShowKeyboard)
-        [self.termView becomeFirstResponder];
+    // Both of these reach startSession, which calls ensureBooted itself -- so
+    // skipping only the explicit boot above would have booted anyway, by the
+    // back door, and consumed the very image the picker is about to offer.
+    // _bootAfterSessionChoice does them once the answer is in.
+    if (!self.awaitingSessionChoice) {
+        [self _applyCurrentTerminalToViewIfPossible];
+        if (UserPreferences.shared.autoShowKeyboard)
+            [self.termView becomeFirstResponder];
+    }
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
@@ -1496,6 +1601,10 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 - (void)viewDidAppear:(BOOL)animated {
     [AppDelegate maybePresentStartupMessageOnViewController:self];
     [super viewDidAppear:animated];
+    if (self.awaitingSessionChoice && self.presentedViewController == nil) {
+        self.awaitingSessionChoice = NO;
+        [self _presentSessionResumePicker];
+    }
     // Re-sync against the live hardware state: a keyboard connect/disconnect notification
     // could have been missed while this view wasn't visible (e.g. it was posted to a
     // different scene, or arrived during app launch before observers were registered).
@@ -1511,6 +1620,24 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 }
 
 - (void)startNewSession {
+    // Declined while the launch is still asking which saved session to resume.
+    //
+    // Scene restoration starts a session DIRECTLY -- SceneDelegate's
+    // ConfigureTerminalViewController calls this, and a reconnect whose
+    // terminal did not survive the process falls through to it -- so guarding
+    // only viewDidLoad's boot left a back door: this went on into startSession
+    // -> ensureBooted, the restore ran, and the image the picker was about to
+    // offer was consumed before the picker could list it. Found with a
+    // breakpoint on checkpoint_restore, 2026-09-11. _bootAfterSessionChoice
+    // calls this again once the answer is in.
+    //
+    // Declined here and not in startSession, because this method reads any
+    // error from startSession as a failed start and destroys the terminal.
+    if (ISHSessionResumeChoicePending()) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.deferred"
+                                      details:@{@"reason": @"awaiting-session-choice"}];
+        return;
+    }
     if (self.sessionStartInProgress) {
         [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.ignored"
                                       details:@{@"reason": @"already-starting"}];
