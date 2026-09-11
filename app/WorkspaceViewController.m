@@ -49,6 +49,7 @@
 @property (nonatomic) NSInteger desktopCount;
 @property (nonatomic, strong) NSMutableIndexSet *lockedDesktopIndices;
 @property (nonatomic, weak) UILabel *desktopIndicatorLabel;
+@property (nonatomic) BOOL rootMenuSaveInProgress;
 @property (nonatomic) NSInteger desktopWindowCascadeIndex;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dashboardWindow;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dockWindow;
@@ -4718,6 +4719,25 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 // A brief "Desktop N / M" toast so the swipe-only switch stays oriented.
 - (void)showDesktopIndicator {
+    [self showDesktopToastWithText:
+        [NSString stringWithFormat:@"  Desktop %ld / %ld  ",
+         (long)(self.activeDesktopIndex + 1), (long)self.desktopCount]
+                           holdFor:0.7];
+}
+
+// The same transient label the desktop switch uses, for anything that needs to
+// say one short thing and get out of the way. `holdFor` is how long it stays at
+// full strength before fading; a NEGATIVE hold keeps it there, for "doing
+// something slow", where the fade has to wait for the something to finish.
+//
+// The desktop switch keeps the 0.7s it was tuned with -- it says two numbers
+// you already expected. A message you have to READ needs longer.
+- (void)hideDesktopToast {
+    self.desktopIndicatorLabel.hidden = YES;
+    self.desktopIndicatorLabel.alpha = 0.0;
+}
+
+- (void)showDesktopToastWithText:(NSString *)text holdFor:(NSTimeInterval)holdFor {
     if (self.desktopIndicatorLabel == nil) {
         UILabel *label = [UILabel new];
         label.translatesAutoresizingMaskIntoConstraints = NO;
@@ -4737,14 +4757,70 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         ]];
         self.desktopIndicatorLabel = label;
     }
-    self.desktopIndicatorLabel.text =
-        [NSString stringWithFormat:@"  Desktop %ld / %ld  ", (long)(self.activeDesktopIndex + 1), (long)self.desktopCount];
+    self.desktopIndicatorLabel.text = text;
     [self.view bringSubviewToFront:self.desktopIndicatorLabel];
     self.desktopIndicatorLabel.hidden = NO;
+    [self.desktopIndicatorLabel.layer removeAllAnimations];
     self.desktopIndicatorLabel.alpha = 1.0;
-    [UIView animateWithDuration:0.3 delay:0.7 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+    if (holdFor < 0.0)
+        return;
+    [UIView animateWithDuration:0.3 delay:holdFor options:UIViewAnimationOptionBeginFromCurrentState animations:^{
         self.desktopIndicatorLabel.alpha = 0.0;
     } completion:nil];
+}
+
+// The root menu's "Save Session". Shares suspendSessionShortcut's save, and
+// adds the explanation the Sessions card gets from its own body text: from a
+// menu item there is nowhere else to say why nothing happened.
+- (void)saveSessionFromRootMenu {
+    if (!UserPreferences.shared.shouldSuspendToDisk) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Suspend to Disk is off"
+                             message:@"Turn on Suspend to Disk in the iOS Settings app, under "
+                                     @"iSH-AOK, and this session is saved whenever iSH-AOK goes "
+                                     @"to the background -- and comes back on the next launch."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Open Settings"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Not Now"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    if (self.rootMenuSaveInProgress)
+        return;
+    self.rootMenuSaveInProgress = YES;
+    [self showDesktopToastWithText:@"  Saving session…  " holdFor:-1.0];
+    // Off the main thread; see suspendSessionShortcut for why.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int err = ISHSuspendSessionSaveNow();
+        struct checkpoint_status ck;
+        checkpoint_get_status(&ck);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.rootMenuSaveInProgress = NO;
+            if (err == 0) {
+                [self showDesktopToastWithText:
+                    [NSString stringWithFormat:@"  Session saved — %lu processes  ", ck.tasks]
+                                       holdFor:2.5];
+                return;
+            }
+            [self hideDesktopToast];
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Session not saved"
+                                 message:ck.last_refusal[0] != '\0'
+                                         ? @(ck.last_refusal)
+                                         : @"iSH-AOK could not write the session."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+    });
 }
 
 - (void)presentDesktopRootMenuFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
@@ -4797,6 +4873,18 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                             handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
+        });
+    }]];
+    // Suspend to disk, one tap from the root menu. It lives in the Sessions
+    // utility as well, but that is five taps deep and nobody found it -- and a
+    // feature whose whole job is to be used BEFORE iOS kills the app is not
+    // one to go looking for. Always offered, including when the preference is
+    // off: that is the only way the menu can say the feature exists.
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self saveSessionFromRootMenu];
         });
     }]];
     BOOL autoShowKeyboard = UserPreferences.shared.autoShowKeyboard;

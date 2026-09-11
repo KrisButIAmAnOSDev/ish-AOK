@@ -15,7 +15,15 @@ it will not save, so it is not something to switch on for somebody.
 Nothing to do. The session is saved when the app goes to the background and
 comes back on the next launch.
 
-To save one *now*, from the shell:
+To save one *now*, without waiting to be backgrounded:
+
+- **Workspace**: the ☰ menu, **Save Session**.
+- **iPad**, anywhere: the ⤓ button on the accessory bar above the keyboard. It
+  turns into a checkmark when the session is on disk. It appears only while
+  Suspend to Disk is on.
+- **Workspace → Utilities… → Workspace → Sessions** has the same thing on a
+  card, with the last save's size and process count.
+- From the shell:
 
     /AOK/tools/suspend.sh
 

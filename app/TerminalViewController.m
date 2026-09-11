@@ -218,6 +218,8 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 
 @property (weak, nonatomic) IBOutlet UIButton *infoButton;
 @property (strong, nonatomic) UIButton *workspaceButton;
+@property (strong, nonatomic) UIButton *saveSessionButton;
+@property (nonatomic) BOOL saveSessionInProgress;
 @property (strong, nonatomic) UIButton *terminalSwitcherButton;
 @property (strong, nonatomic) BarButton *dotKey;
 @property (strong, nonatomic) BarButton *slashKey;
@@ -420,6 +422,7 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     [self _installFloatingTerminalSwitcherButton];
     [self _installWorkspaceButton];
     [self _installTerminalSwitcherButton];
+    [self _installSaveSessionButton];
     [self _installCenterKeys];
     [self _installFindBar];
 
@@ -857,6 +860,114 @@ static const CGFloat kFindBarHeight = 44;
 
     self.terminalSwitcherButton = button;
     [self _installTerminalSwitcherGestureOnView:button];
+}
+
+// Suspend to disk, on the accessory bar.
+//
+// iPad only, and hidden unless the preference is on. The bar is tight enough
+// that desktop switching was given to a long-press rather than a key of its own
+// (see the arrowKey handler), so it does not get a permanent button for a
+// feature that is off by default -- the Workspace root menu carries the always
+// present entry, which is where someone LEARNS the feature exists. This is the
+// other half: once you have opted in, saving before you put the iPad down is
+// one tap instead of five.
+- (void)_installSaveSessionButton {
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone)
+        return;
+
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    button.accessibilityLabel = @"Save Session";
+    button.accessibilityHint = @"Writes this session to disk so the next launch resumes it.";
+    if (@available(iOS 13, *)) {
+        [button setImage:[UIImage systemImageNamed:@"arrow.down.doc"] forState:UIControlStateNormal];
+    } else {
+        [button setTitle:@"Save" forState:UIControlStateNormal];
+    }
+    [button addTarget:self
+               action:@selector(saveSessionFromBar:)
+     forControlEvents:UIControlEventPrimaryActionTriggered];
+
+    UIView *infoContainer = self.infoButton.superview;
+    NSUInteger infoIndex = [self.bar.arrangedSubviews indexOfObject:infoContainer];
+    if (infoIndex == NSNotFound)
+        infoIndex = self.bar.arrangedSubviews.count;
+    [self.bar insertArrangedSubview:button atIndex:infoIndex];
+    [button.widthAnchor constraintEqualToAnchor:self.infoButton.widthAnchor].active = YES;
+    self.saveSessionButton = button;
+
+    // Follows the Settings switch live, so turning it on does not need a
+    // relaunch to put the button there -- and turning it off takes it away.
+    [UserPreferences.shared observe:@[@"shouldSuspendToDisk"]
+                            options:NSKeyValueObservingOptionInitial
+                              owner:self
+                         usingBlock:^(typeof(self) self) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.saveSessionButton.hidden = !UserPreferences.shared.shouldSuspendToDisk;
+        });
+    }];
+}
+
+- (void)saveSessionFromBar:(__unused id)sender {
+    if (self.saveSessionInProgress)
+        return;
+    self.saveSessionInProgress = YES;
+    self.saveSessionButton.enabled = NO;
+
+    // OFF the main thread: the save freezes every guest task, writes the image
+    // and thaws before it returns. The guest is stopped for that time either
+    // way -- it is the UI that must not be. Measured at ~260ms for a nine
+    // process session, which is why the confirmation below has to linger: the
+    // work is over before a spinner would have finished appearing.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int err = ISHSuspendSessionSaveNow();
+        struct checkpoint_status ck;
+        checkpoint_get_status(&ck);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.saveSessionInProgress = NO;
+            self.saveSessionButton.enabled = YES;
+            if (err == 0) {
+                [self flashSaveSessionConfirmation];
+                return;
+            }
+            [self showMessage:@"Session not saved"
+                     subtitle:ck.last_refusal[0] != '\0'
+                              ? @(ck.last_refusal)
+                              : @"iSH-AOK could not write the session."];
+        });
+    });
+}
+
+// Confirm in the button itself: it turns into a checkmark for a moment and goes
+// back. A floating label was tried first and never drew -- something in this
+// view composites above anything added to it -- and chasing that was not worth
+// it when the better answer is to put the feedback where the finger already is.
+// An alert for "it worked" would be worse than saying nothing at all.
+- (void)flashSaveSessionConfirmation {
+    UIButton *button = self.saveSessionButton;
+    if (button == nil)
+        return;
+    if (@available(iOS 13, *)) {
+        [button setImage:[UIImage systemImageNamed:@"checkmark"] forState:UIControlStateNormal];
+    } else {
+        [button setTitle:@"✓" forState:UIControlStateNormal];
+    }
+    button.accessibilityLabel = @"Session saved";
+    // Announce it too: the icon swap is invisible to VoiceOver on its own.
+    if (@available(iOS 11.0, *)) {
+        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"Session saved");
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.saveSessionButton != button || self.saveSessionInProgress)
+            return;
+        if (@available(iOS 13, *)) {
+            [button setImage:[UIImage systemImageNamed:@"arrow.down.doc"] forState:UIControlStateNormal];
+        } else {
+            [button setTitle:@"Save" forState:UIControlStateNormal];
+        }
+        button.accessibilityLabel = @"Save Session";
+    });
 }
 
 - (BarButton *)_makeCenterKeyWithTitle:(NSString *)title action:(SEL)action {
@@ -1514,6 +1625,10 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
         self.terminalSwitcherButton.backgroundColor = controlBackground;
         self.terminalSwitcherButton.layer.cornerRadius = 6;
         self.terminalSwitcherButton.layer.masksToBounds = YES;
+        self.saveSessionButton.tintColor = tintColor;
+        self.saveSessionButton.backgroundColor = controlBackground;
+        self.saveSessionButton.layer.cornerRadius = 6;
+        self.saveSessionButton.layer.masksToBounds = YES;
         self.floatingTerminalSwitcherButton.tintColor = tintColor;
         self.floatingTerminalSwitcherButton.backgroundColor = keyAppearance == UIKeyboardAppearanceLight ?
             [UIColor colorWithWhite:1 alpha:0.78] :
