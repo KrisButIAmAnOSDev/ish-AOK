@@ -19,42 +19,6 @@ Started 2026-08-19, after the 549 release run. Closed entries from the 549 and
 
 ## Diagnosed, not fixed
 
-### A resumed native zsh comes back with stdout on `/dev/tty`, and it is dead
-
-A session suspended while `/AOK/native/zsh` is the foreground program resumes,
-but the shell cannot write to fd 1: every builtin reports `write error: invalid
-argument`. Measured on the simulator, 2026-09-11:
-
-```
-0  -> /dev/pts/1
-1  -> /dev/tty      <-- and EINVAL on write
-2  -> /dev/pts/1
-```
-
-fd 2 works, and a *fresh* `> /dev/tty` from the same shell works, so the tty
-itself is fine and the controlling terminal is correctly attached. It is fd 1
-specifically that came back as something unusable.
-
-**The negative control is clean, and it is what narrows this.** The same
-suspend/resume from the ordinary emulated session shell gives `0`, `1` and `2`
-all on `/dev/pts/1` and prints normally. So the general restore path -- the
-per-terminal stdio sets, session, foreground group, termios -- is healthy, and
-this is about the RE-LAUNCH of a native program, which is a different mechanism:
-the program is not photographed, it is started again and told to rebuild itself
-from a state blob (`ckpt_dispatch_native`).
-
-**Why it matters more than its size suggests**: zsh and `zsh-multio` are the
-only entries in the native program table with a `ckpt_dump`, so native zsh is
-the shell the checkpoint refusal now TELLS people to switch to. Recommending it
-and then handing back a session with no stdout is worse than refusing.
-
-**Next step**: `kernel/zsh_glue.c` does not touch stdio, so the redirection is
-either zsh's own startup (it opens `/dev/tty` for `SHTTY`) or the fd table the
-re-launched program is dispatched onto. Capture the restore with
-`SIMCTL_CHILD_ISH_CHECKPOINT_DEBUG=1 xcrun simctl launch --console-pty` and
-read what fd 1 is installed as before zsh starts -- that separates the two in
-one run.
-
 ### A native bash ignored SIGKILL (unconfirmed, seen once)
 
 While reproducing the above, a `/AOK/native/bash` at pid 16 survived
