@@ -883,7 +883,25 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                     // buys back nothing but latency: on expiry the loop rescans,
                     // re-reads the pending set (which is where a lost wake is
                     // actually noticed -- see the err == 0 arm) and waits again.
-                    if (wait_timeout == NULL) {
+                    // A LONG timeout is as unbounded as no timeout, for
+                    // every reason listed above: the ways out of the host wait
+                    // are the notify pipe and a poke, and a poke that is
+                    // swallowed leaves the wait running for as long as the
+                    // guest asked. A daemon sitting in select() with a 30s
+                    // timeout therefore could not be frozen inside the
+                    // checkpoint's 5s, and that is exactly what happened --
+                    // rsyslogd and chronyd on an M4 iPad, parked in kevent
+                    // here, while every shape reproducible on macOS (where the
+                    // poke lands) parked correctly.
+                    //
+                    // Capping it costs the same one wakeup per second the NULL
+                    // case already pays, and the guest cannot tell: the loop
+                    // recomputes the remaining deadline at the top and only
+                    // reports a timeout once it has really passed.
+                    if (wait_timeout == NULL ||
+                            wait_timeout->tv_sec > wake_recheck_timeout.tv_sec ||
+                            (wait_timeout->tv_sec == wake_recheck_timeout.tv_sec &&
+                             wait_timeout->tv_nsec > wake_recheck_timeout.tv_nsec)) {
                         wait_timeout = &wake_recheck_timeout;
                         atomic_fetch_add_explicit(&poll_capped_waits, 1,
                                 memory_order_relaxed);

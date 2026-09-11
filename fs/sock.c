@@ -2132,8 +2132,17 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         // the instant it arrives -- there is a real fd in the set here, unlike
         // the no-fd case that wedged every shell on a device -- so the cap only
         // ever costs a re-poll on a connection that is genuinely idle.
-        if (timeout < 0)
-            timeout = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+        // Bounded the same way fs/poll.c bounds its wait, and for the same
+        // reason: a long guest timeout is as unbounded as none when the poke
+        // that would end it early can be lost. `capped` keeps the guest's own
+        // deadline honest -- without it the arm below reads this cap expiring
+        // as the guest's timeout expiring and returns EAGAIN early.
+        bool capped = false;
+        int cap_ms = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+        if (timeout < 0 || timeout > cap_ms) {
+            timeout = cap_ms;
+            capped = true;
+        }
         if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
             fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
             fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
@@ -2177,7 +2186,7 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         if (wait_res > 0 && pfd[0].revents != 0)
             break; // ready (or error/hangup): the caller retries the I/O
         if (wait_res == 0) {
-            if (wait != NULL && wait->has_deadline) {
+            if (wait != NULL && wait->has_deadline && !capped) {
                 err = _EAGAIN;
                 break;
             }
