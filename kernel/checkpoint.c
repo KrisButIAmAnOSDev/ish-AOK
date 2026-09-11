@@ -546,35 +546,49 @@ static int ckpt_check_scope(void) {
         ckpt_refuse("there is no guest running");
         return _ESRCH;
     }
-    for (unsigned i = 0; i < snap.count; i++) {
-        struct task *t = snap.tasks[i];
-        // A native program is a C function on a HOST thread -- there is no
-        // serialising that stack, and it never returns to task_run_current's
-        // loop, so it can neither be frozen nor described. The project's rule
-        // is that it either dumps its own state or the checkpoint refuses;
-        // this is the refusing half, and it names the program so the limit is
-        // reportable rather than mysterious.
-        if (t->native_exec != NULL || t->native_cmdline != NULL) {
-            const struct native_program *prog = native_program_running(t);
-            if (prog != NULL && prog->ckpt_dump != NULL)
-                continue;   // it can describe itself; see checkpoint_native_park
-            // Say what to DO as well as why. The message is most often read
-            // by someone whose LOGIN shell is native bash, who cannot simply
-            // quit it, and for whom the fix is a different native shell --
-            // native zsh does have a ckpt_dump and is saved rather than
-            // refused. Kept short enough that last_refusal cannot truncate it.
-            ckpt_refuse("pid %d is running the native program %s, whose C stack "
-                        "on a host thread cannot be serialised. Exit it and save "
-                        "again -- or, if it is your login shell, switch with "
-                        "/AOK/tools/native-links.sh --shell zsh", t->pid,
-                        prog != NULL ? prog->name :
-                        (t->comm[0] ? t->comm : "?"));
-            err = _EOPNOTSUPP;
-            break;
-        }
-    }
+    // A native program used to refuse the whole checkpoint here, because its
+    // C stack on a host thread cannot be serialised and only zsh knows how to
+    // describe itself. That was the wrong trade, and it is worth being plain
+    // about why: the alternative to a degraded restore is NOT a perfect one,
+    // it is no restore at all. iOS kills the app either way. Refusing bought
+    // "nothing came back looking wrong" at the price of nothing coming back.
+    //
+    // Nothing technical required it. The freezer already parks a native
+    // program whether or not it has a ckpt_dump (checkpoint_native_park), the
+    // image already carries its name, argv, environment and descriptors, and
+    // ckpt_dispatch_native already starts a program with no state -- it only
+    // attaches the state pipe when there IS one. So the pieces for saving
+    // these were all present; the refusal was policy sitting on top of them.
+    //
+    // What is genuinely lost is the program's own place: a re-launched
+    // program starts from its command line again, not from where it was. For
+    // a shell at a prompt that is exactly right. For one part way through a
+    // script it means the script runs again from the top, which is why this
+    // is REPORTED (ckpt_status.natives_note) rather than done quietly.
     task_snapshot_release(&snap);
     return err;
+}
+
+// Native programs in the save being written that had no state to give, so the
+// restore will start them again from their command line. Accumulated as the
+// task records are written and published into ckpt_status when the image
+// lands. Guarded by ckpt_lock like the rest of the status.
+static unsigned long ckpt_natives_restarted;
+static char ckpt_natives_note[192];
+
+static void ckpt_note_restarted_native(const char *name) {
+    ckpt_natives_restarted++;
+    // Names, deduplicated: four shells all called bash should read "bash",
+    // not "bash, bash, bash, bash".
+    size_t len = strlen(ckpt_natives_note);
+    if (len != 0) {
+        if (strstr(ckpt_natives_note, name) != NULL)
+            return;
+        if (len + 2 < sizeof(ckpt_natives_note))
+            len += (size_t) snprintf(ckpt_natives_note + len,
+                                     sizeof(ckpt_natives_note) - len, ", ");
+    }
+    snprintf(ckpt_natives_note + len, sizeof(ckpt_natives_note) - len, "%s", name);
 }
 
 // What is still in a pipe, taken out and PUT BACK.
@@ -1035,6 +1049,8 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         // freeze parked it (checkpoint_native_park runs on its own thread,
         // which is the only place its state exists).
         native_state = task->ckpt_native_state != NULL ? task->ckpt_native_state : "";
+        if (native_state[0] == '\0')
+            ckpt_note_restarted_native(prog->name);
         native_argv = task->native_cmdline != NULL ? task->native_cmdline : "";
         rec.native = 1;
         rec.native_name_len = (uint32_t) strlen(prog->name);
@@ -1228,6 +1244,10 @@ int checkpoint_save(const char *host_path) {
     if (err < 0)
         return err;
 
+    // Per-image, not cumulative: this describes the save about to be written.
+    ckpt_natives_restarted = 0;
+    ckpt_natives_note[0] = '\0';
+
     // STOP THE MACHINE. Everything below describes tasks that are not running,
     // which is the whole difference between a checkpoint and a photograph of a
     // moving object.
@@ -1327,6 +1347,9 @@ int checkpoint_save(const char *host_path) {
     snprintf(ckpt_status.last_path, sizeof(ckpt_status.last_path), "%s", host_path);
     ckpt_status.pages = (unsigned long) pages;
     ckpt_status.tasks = h.n_tasks;
+    ckpt_status.natives_restarted = ckpt_natives_restarted;
+    snprintf(ckpt_status.natives_note, sizeof(ckpt_status.natives_note),
+             "%s", ckpt_natives_note);
     ckpt_status.fds = nfds_total;
     ckpt_status.bytes = (unsigned long long) pages * PAGE_SIZE;
     unlock(&ckpt_lock);

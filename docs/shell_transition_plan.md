@@ -17,8 +17,15 @@ bash and native zsh both exist; only one needs to survive; the licence picks it.
 ## The decisions
 
 1. **Native bash is not getting checkpoint support.** It is being removed, so
-   the work would be thrown away. A checkpoint refuses while native bash is on
-   any task stack, and says why.
+   the work would be thrown away.
+
+   **Superseded 2026-09-11 in the part that mattered.** This used to mean a
+   checkpoint REFUSED while native bash was on any task stack, which turned a
+   bash login shell into "you cannot suspend at all". It no longer does: a
+   native program with no `ckpt_dump` is saved and re-launched from its command
+   line, and the save reports which programs those were. bash still does not
+   describe itself and still comes back at a fresh prompt -- that part of the
+   decision stands -- but it no longer costs the whole session.
 2. **Native bash is removed in 556**, announced in the 555 release notes so the
    removal is not a surprise to anyone whose login shell it is.
 3. **`/etc/passwd` entries naming native bash are converted to the guest's own
@@ -152,10 +159,14 @@ not the usual one-command path.
 
 ## Order of work
 
-1. ~~Checkpoint refuses on native bash, and names it.~~ **DONE** --
-   `/proc/ish/checkpoint` now names each native program on a stack and gives its
-   verdict: zsh "can describe itself", bash "cannot, and will not be taught to
-   ... a refusal, not a wait". Verified under both shells.
+1. ~~Checkpoint refuses on native bash, and names it.~~ **DONE, then
+   REVERSED 2026-09-11.** `/proc/ish/checkpoint` still names each native
+   program on a stack and gives its verdict, but the verdict for one that
+   cannot describe itself is now "re-launched from its command line", not
+   "refused". Measured: with a native bash alive, a checkpoint writes a 4.5 MB
+   image and the restore starts bash again (a marker file the child appends to
+   holds two lines after the round trip, where the save used to be refused
+   outright).
 2. ~~`/etc/passwd` conversion.~~ **DONE** -- `convert_native_bash_shells` in
    `native-links.sh`, matching BOTH spellings (`/AOK/native/bash` and
    `/usr/local/native-bin/bash`) for EVERY entry rather than uid 1000. Verified:

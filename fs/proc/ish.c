@@ -597,6 +597,11 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
         proc_printf(buf, "last_err        %d\n", ck.last_err);
     if (ck.last_refusal[0] != '\0')
         proc_printf(buf, "last_refusal    %s\n", ck.last_refusal);
+    // Not an error, and deliberately not called one: these were saved, they
+    // just come back started again rather than where they were.
+    if (ck.natives_restarted != 0)
+        proc_printf(buf, "restarted       %lu native program(s) re-launched: %s\n",
+                    ck.natives_restarted, ck.natives_note);
     proc_printf(buf, "\n  echo save /host/path > /proc/ish/checkpoint\n");
     proc_printf(buf, "  ISH_RESTORE=/host/path ish -f <root>   # brings it back\n");
 
@@ -636,10 +641,10 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
         proc_printf(buf, "  no descriptors open\n");
     }
 
-    proc_printf(buf, "\nwhat would refuse a checkpoint right now:\n");
+    proc_printf(buf, "\nwhat a checkpoint would do with native programs:\n");
     proc_printf(buf, "  native programs on a task stack   %u\n", native_on_stack);
     if (native_on_stack == 0) {
-        proc_printf(buf, "  nothing -- every task is running guest code, whose whole\n"
+        proc_printf(buf, "  none -- every task is running guest code, whose whole\n"
                     "  state is AOK's own and can simply be written out\n");
         return 0;
     }
@@ -648,19 +653,23 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
     proc_printf(buf,
         "\n  A native program is host code on a host C stack, so there is no\n"
         "  guest PC to resume from -- stopping the scheduler does not reach it.\n"
-        "  The rule is that a native program either describes its own state and\n"
-        "  re-launches, or the checkpoint refuses while it is running.\n");
+        "  It is saved either way: the image carries its name, its command line,\n"
+        "  its environment and its descriptors.\n");
     if (native_can_dump > 0)
         proc_printf(buf,
-            "\n  %u can describe itself (zsh: deps/zsh/Src/aok_fork.c). At a prompt\n"
-            "  that is a quiet point -- the C stack holds only \"waiting for input\"\n"
-            "  and everything else is already dumpable. Mid-command it is not.\n",
+            "\n  %u can describe itself (zsh: deps/zsh/Src/aok_fork.c) and comes\n"
+            "  back where it was. At a prompt that is a quiet point -- the C stack\n"
+            "  holds only \"waiting for input\" and everything else is already\n"
+            "  dumpable. Mid-command it is not.\n",
             native_can_dump);
     if (native_cannot > 0)
         proc_printf(buf,
-            "\n  %u cannot, and will not be taught to. bash is GPLv3, so an App\n"
-            "  Store build cannot contain it; it is being removed in 556\n"
-            "  (docs/shell_transition_plan.md). This is a refusal, not a wait.\n",
+            "\n  %u cannot, and are RE-LAUNCHED from their command line instead --\n"
+            "  which for a shell at a prompt is the same thing, and for one part\n"
+            "  way through a script means the script runs again from the top.\n"
+            "  This used to refuse the whole checkpoint. It no longer does: the\n"
+            "  alternative to a degraded restore is not a perfect one, it is no\n"
+            "  restore at all.\n",
             native_cannot);
     return 0;
 }

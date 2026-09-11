@@ -947,6 +947,10 @@ static const CGFloat kFindBarHeight = 44;
         subtitle = @"Suspend to Disk is off, so nothing is being saved.";
     } else if (ck.last_refusal[0] != '\0') {
         subtitle = @"The last attempt was refused.";
+    } else if (ck.saves > 0 && ck.natives_restarted != 0) {
+        subtitle = [NSString stringWithFormat:
+                    @"%lu saved so far; %lu process(es) will start again rather than resume.",
+                    ck.saves, ck.natives_restarted];
     } else if (ck.saves > 0) {
         subtitle = [NSString stringWithFormat:@"%lu saved so far; the last held %lu processes.",
                     ck.saves, ck.tasks];
@@ -1002,6 +1006,9 @@ static const CGFloat kFindBarHeight = 44;
         if (now.saves > 0) {
             [body appendFormat:@"Last image: %lu processes, %lu descriptors, %lu pages\n",
                                now.tasks, now.fds, now.pages];
+        }
+        if (now.natives_restarted != 0) {
+            [body appendFormat:@"Started again rather than resumed: %s\n", now.natives_note];
         }
         [body appendFormat:@"This launch resumed a saved session: %@", now.restored ? @"yes" : @"no"];
         UIAlertController *alert =
@@ -1096,9 +1103,15 @@ static const CGFloat kFindBarHeight = 44;
     if (button == nil || button.hidden || button.window == nil) {
         struct checkpoint_status ck;
         checkpoint_get_status(&ck);
-        [self showMessage:@"Session saved"
-                 subtitle:[NSString stringWithFormat:
-                           @"%lu processes written. The next launch resumes here.", ck.tasks]];
+        NSMutableString *detail = [NSMutableString stringWithFormat:
+            @"%lu processes written. The next launch resumes here.", ck.tasks];
+        // Named, because a restart is the one difference between what was
+        // saved and what comes back.
+        if (ck.natives_restarted != 0) {
+            [detail appendFormat:@" %lu will start again rather than resume: %s.",
+                                 ck.natives_restarted, ck.natives_note];
+        }
+        [self showMessage:@"Session saved" subtitle:detail];
         return;
     }
     if (@available(iOS 13, *)) {

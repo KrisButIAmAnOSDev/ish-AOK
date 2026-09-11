@@ -323,10 +323,31 @@ READ_REFUSAL='while read -r l; do case $l in last_refusal*) echo "$l";; esac; do
 
 # dash is native too, and unlike zsh it has no way to emit its shell functions
 # as text -- jobs.c's commandtext() is display-only and drops CTLESC. So it
-# cannot describe itself, and the checkpoint says which program and why rather
-# than writing an image that would come back missing things.
-refuse "a native program that cannot describe itself" /AOK/native/dash \
-    "echo save $IMG > /proc/ish/checkpoint 2>/dev/null; $READ_REFUSAL" \
-    "cannot describe its own state"
+# cannot describe itself.
+#
+# That used to REFUSE the checkpoint, and this leg asserted the refusal. It no
+# longer does (2026-09-11): the program is saved and re-launched from its
+# command line, because the alternative to a degraded restore is not a perfect
+# one, it is no restore at all. So the assertion is inverted -- the save must
+# SUCCEED, and must say which program will start again rather than resume.
+#
+# Guarded against passing trivially: a run that never reached the checkpoint
+# would print neither line.
+echo "  ---- a native program that cannot describe itself ----"
+nat_out=$(ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" /AOK/native/dash -c \
+    "echo save $IMG > /proc/ish/checkpoint && echo SAVE-OK; \
+     while read -r l; do case \$l in saves*|restarted*) echo \"\$l\";; esac; done \
+        < /proc/ish/checkpoint" 2>&1 || true)
+case $nat_out in
+    *SAVE-OK*) echo "  native  | the save was not refused" ;;
+    *) echo "FAIL: a native program still refuses the checkpoint"; echo "  got: $nat_out"; exit 1;;
+esac
+case $nat_out in
+    *"re-launched"*dash*) echo "  native  | reported as re-launched: dash" ;;
+    *) echo "FAIL: the restart was not reported"; echo "  got: $nat_out"; exit 1;;
+esac
+[ -s "$IMG" ] || { echo "FAIL: no image written for a native program"; exit 1; }
+echo "  native  | image $(wc -c < "$IMG") bytes"
+rm -f "$IMG"
 
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"

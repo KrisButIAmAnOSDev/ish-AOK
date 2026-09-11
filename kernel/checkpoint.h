@@ -143,6 +143,14 @@ struct checkpoint_status {
     unsigned long pages;      // guest pages in it
     unsigned long fds;        // descriptors in it
     unsigned long tasks;      // processes in it
+    // Native programs in the last image that could not describe themselves.
+    // They are SAVED and re-launched, not refused -- see ckpt_check_scope --
+    // so the session comes back with these programs started again from their
+    // command line rather than from where they were. Reported because a
+    // restart is a real difference the person should hear about, not because
+    // it is an error.
+    unsigned long natives_restarted;
+    char natives_note[192];   // their names, comma separated
 };
 void checkpoint_get_status(struct checkpoint_status *out);
 

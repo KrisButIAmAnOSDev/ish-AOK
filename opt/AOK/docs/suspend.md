@@ -68,13 +68,20 @@ The system consoles are re-attached the same way, each to its own: a getty on
 
 ## What it will not save, and how it tells you
 
-It refuses rather than writing something that will not come back. Every refusal
-names the process and the reason, in `/proc/ish/checkpoint`:
+**A native program does not stop a save.** `/AOK/native/zsh` can describe
+itself and comes back exactly where it was. The others — bash, dash, the
+editors — cannot, so they are **re-launched from their command line** instead.
+For a shell sitting at a prompt that is the same thing. For one part way
+through a script it means the script runs again from the top, so the save says
+which programs those were, in `/proc/ish/checkpoint` and in the confirmation.
 
-- **A native program that cannot describe itself.** `/AOK/native/zsh` can.
-  `/AOK/native/dash` cannot — it has no way to write its shell functions back
-  out as text — so a save refuses while one is running. Nothing reaches native
-  dash unless you ask for it; it is not `/bin/sh`.
+This used to be a refusal, and it was the wrong trade: the alternative to a
+degraded restore is not a perfect one, it is no restore at all, because iOS
+kills the app either way.
+
+It still refuses rather than writing something that will not come back. Every
+refusal names the process and the reason, in `/proc/ish/checkpoint`:
+
 - **A socket**, or any other descriptor with no rule for rebuilding it. Regular
   files, directories, terminals, pipes and the standard streams all have one.
 - **A native program that is not making any system calls**, because there is
