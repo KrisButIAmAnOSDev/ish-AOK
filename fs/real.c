@@ -16,6 +16,7 @@
 
 #include "debug.h"
 #include "kernel/errno.h"
+#include "kernel/checkpoint.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "kernel/native.h"
@@ -61,6 +62,18 @@ static inline void realfs_count_write(ssize_t res) {
 // full pipe still fails its callback, unwinds stdio and dies -- the behaviour
 // the deferral was built around.
 static bool realfs_guest_signal_pending(void) {
+    // A CHECKPOINT FREEZE ends a wait on a host descriptor as a signal does --
+    // the twin of the same change in fs/sock.c's socket_guest_signal_pending,
+    // and for fs/poll.c's reason: these callers exist to IGNORE a bare poke,
+    // and a freeze is the one poke that must end the wait, because the syscall
+    // has to return for the dispatcher to rewind over it and the task to park.
+    //
+    // AOK's pipes are host pipes read through here (fs/pipe.c hands them
+    // realfs_fdops), so without this anything blocked reading one -- a
+    // `while read` loop at the end of a pipeline, a `cat` -- never parked, and
+    // the checkpoint refused on "did not reach a syscall boundary".
+    if (checkpoint_freeze_pending())
+        return true;
     lock(&current->sighand->lock, 0);
     sigset_t_ pending = (current->pending | current->sighand->pending) &
             ~task_wake_blocked(current);

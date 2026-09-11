@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/native.h"
 #include "kernel/inotify.h"
 #include "kernel/task.h"
@@ -1922,6 +1923,21 @@ static void sock_trace_tcp_info(const char *label, struct fd *sock) {
 // so the "a transfer that could not block was failed anyway" half of that bug
 // never existed here.
 static bool socket_guest_signal_pending(void) {
+    // A CHECKPOINT FREEZE ends a socket wait as a signal does, for the reason
+    // fs/poll.c spells out where it made the same change: every caller of this
+    // exists to IGNORE a bare poke (a TLB shootdown, a notify for a signal the
+    // task has blocked), which is right for those and wrong for a freeze -- a
+    // freeze needs the syscall to RETURN so the dispatcher can rewind over it
+    // and the task can park. The EINTR never reaches the guest: while the
+    // freeze is on, syscall_result_should_restart turns it into a restart.
+    //
+    // Without this a process blocked in recv() was woken by every freeze poke,
+    // found no signal, and went straight back to sleep, so the checkpoint
+    // refused on "did not reach a syscall boundary". Measured on the CLI
+    // 2026-09-11: a child blocked in recv() on a UDP socket refused the save
+    // before this change and parks after it.
+    if (checkpoint_freeze_pending())
+        return true;
     lock(&current->sighand->lock, 0);
     sigset_t_ pending = (current->pending | current->sighand->pending) &
             ~task_wake_blocked(current);
