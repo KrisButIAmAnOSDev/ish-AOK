@@ -2220,6 +2220,27 @@ static const struct syscall_abi_dispatch *syscall_dispatch_for_abi(enum guest_ab
     }
 }
 
+// The syscall a task is blocked in, read from its own register file.
+//
+// While a task sits inside a syscall its registers still hold the number it
+// entered with (x8 on arm64, rax on amd64, eax on i386, a7 on riscv64), and
+// nothing it does while blocked changes that. For the checkpoint freezer, so
+// a refusal can say WHICH syscall a task would not come out of: without it,
+// "did not reach a syscall boundary" sent an investigation after the wrong
+// culprit -- a chronyd process on a device was guessed to be in a socket read,
+// and teaching socket reads to stop changed nothing.
+//
+// Meaningless for a native program, which has no guest register file, and for
+// a task that is not in a syscall; the caller decides whether to ask.
+long task_blocked_syscall(struct task *task, const char **abi_name) {
+    const struct syscall_abi_dispatch *dispatch = syscall_dispatch_for_abi(task->abi);
+    if (abi_name != NULL)
+        *abi_name = dispatch != NULL && dispatch->name != NULL ? dispatch->name : "?";
+    if (dispatch == NULL || dispatch->syscall_number == NULL)
+        return -1;
+    return (long) dispatch->syscall_number(&task->cpu);
+}
+
 void dump_stack(int lines);
 
 static bool syscall_is_logged_stub(syscall_t syscall) {

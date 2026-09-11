@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Written from the guest's own thread, at the top of task_run_current's loop,
 // where the task is at a clean boundary: the syscall that asked for the
@@ -153,5 +154,31 @@ struct checkpoint_status {
     char natives_note[192];   // their names, comma separated
 };
 void checkpoint_get_status(struct checkpoint_status *out);
+
+// ---- reading an image WITHOUT loading it --------------------------------
+//
+// What a session picker has to show: which machine, how big, and whether this
+// build can still load it. Answered from the header alone -- the first ~200
+// bytes -- so listing ten slots costs ten small reads rather than ten restores.
+//
+// Deliberately not a sidecar file written alongside the image: an image can be
+// written by the app OR by the guest itself (/AOK/tools/suspend.sh), and a
+// description that only one of those two updates is a description that lies.
+// The image is the only thing that always knows.
+#define CKPT_PEEK_HOSTNAME 65
+struct checkpoint_image_info {
+    bool loadable;          // magic, version and page size match THIS build
+    uint32_t version;       // what it actually is, for "saved by an older build"
+    uint32_t abi;
+    uint32_t tasks;
+    uint64_t pages;
+    char hostname[CKPT_PEEK_HOSTNAME];
+};
+
+// 0 and fills `out`, or a guest _E* code if the file cannot be read at all.
+// A file that is readable but not loadable is NOT an error: out->loadable is
+// false and the rest is filled in as far as it could be, so the picker can say
+// "saved by a different build" rather than showing nothing.
+int checkpoint_peek(const char *host_path, struct checkpoint_image_info *out);
 
 #endif

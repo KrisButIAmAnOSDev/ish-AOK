@@ -639,4 +639,8 @@ void sysv_sem_exit(struct tgroup *group);
 // numbers and a different register ABI.
 typedef dword_t (*syscall_t)(dword_t, dword_t, dword_t, dword_t, dword_t, dword_t);
 
+// The syscall number a blocked task entered with, or -1. See kernel/calls.c.
+struct task;
+long task_blocked_syscall(struct task *task, const char **abi_name);
+
 #endif

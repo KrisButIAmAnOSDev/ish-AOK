@@ -290,6 +290,34 @@ static bool ckpt_pending;
 static bool ckpt_pending_halt;
 static char ckpt_session_path[PATH_MAX];
 
+int checkpoint_peek(const char *host_path, struct checkpoint_image_info *out) {
+    memset(out, 0, sizeof(*out));
+    FILE *f = fopen(host_path, "rb");
+    if (f == NULL)
+        return errno_map();
+    // fread directly rather than this file's rd(): peek sits above it, and a
+    // header short read is simply "not an image" rather than an I/O policy.
+    struct ckpt_header h;
+    size_t got = fread(&h, 1, sizeof(h), f);
+    fclose(f);
+    if (got != sizeof(h))
+        return _EINVAL;
+    if (memcmp(h.magic, CKPT_MAGIC, sizeof(h.magic)) != 0)
+        return _EINVAL;   // not one of ours at all
+    out->version = h.version;
+    out->abi = h.abi;
+    out->tasks = h.n_tasks;
+    out->pages = h.total_pages;
+    // The header's hostname is not required to be terminated; the picker is
+    // going to hand this straight to a string API.
+    size_t n = sizeof(h.hostname) < sizeof(out->hostname) - 1
+             ? sizeof(h.hostname) : sizeof(out->hostname) - 1;
+    memcpy(out->hostname, h.hostname, n);
+    out->hostname[n] = '\0';
+    out->loadable = h.version == CKPT_VERSION && h.page_size == PAGE_SIZE;
+    return 0;
+}
+
 void checkpoint_get_status(struct checkpoint_status *out) {
     lock(&ckpt_lock, 0);
     *out = ckpt_status;
@@ -302,6 +330,13 @@ static void ckpt_refuse(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(ckpt_status.last_refusal, sizeof(ckpt_status.last_refusal), fmt, ap);
     va_end(ap);
+    // Traced as well as recorded. Under ISH_CHECKPOINT_DEBUG a refusal was the
+    // one thing the checkpoint did NOT say: last_refusal is readable only from
+    // inside the guest or from the app's own UI, and a device whose save runs
+    // as the app is backgrounded has neither -- the reason went nowhere a
+    // console capture could see it, and a refused save looked like a save that
+    // had simply stopped.
+    CKPT_TRACE("refused: %s\n", ckpt_status.last_refusal);
     unlock(&ckpt_lock);
 }
 
@@ -480,9 +515,22 @@ static int ckpt_freeze_all(unsigned timeout_ms, char *blame, size_t blame_size) 
         nanosleep(&ts, NULL);
     }
 
-    if (err != 0 && stuck != NULL && blame != NULL)
-        snprintf(blame, blame_size, "pid %d (%s) did not reach a syscall "
-                 "boundary within %ums", stuck->pid, stuck->comm, timeout_ms);
+    if (err != 0 && stuck != NULL && blame != NULL) {
+        // WHICH syscall, when there is a guest register file to read it from.
+        // The pid alone is not enough to act on: every untaught blocking path
+        // looks identical from here, and the fix for each is in a different
+        // file (kernel/calls.c task_blocked_syscall has the story).
+        bool native = stuck->native_exec != NULL || stuck->native_cmdline != NULL;
+        const char *abi = NULL;
+        long nr = native ? -1 : task_blocked_syscall(stuck, &abi);
+        if (nr >= 0)
+            snprintf(blame, blame_size, "pid %d (%s) did not reach a syscall "
+                     "boundary within %ums (blocked in %s syscall %ld)",
+                     stuck->pid, stuck->comm, timeout_ms, abi, nr);
+        else
+            snprintf(blame, blame_size, "pid %d (%s) did not reach a syscall "
+                     "boundary within %ums", stuck->pid, stuck->comm, timeout_ms);
+    }
     if (err != 0) {
         for (unsigned i = 0; i < snap.count; i++)
             atomic_store_explicit(&snap.tasks[i]->ckpt_freeze_wanted, false,
