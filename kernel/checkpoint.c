@@ -702,7 +702,7 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
     // /dev/console, and a session that came back on the wrong one would be
     // talking to a terminal nobody is looking at.
     if ((fd->ops != NULL && fd->ops->name != NULL &&
-                strcmp(fd->ops->name, "devpts") == 0) || fd->tty != NULL) {
+                strcmp(fd->ops->name, "devpts") == 0) || fd_tty(fd) != NULL) {
         if (generic_getpath(fd, path) < 0 || path[0] != '/')
             path[0] = '\0';
         return CKPT_FD_TTY;
@@ -957,23 +957,28 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         // having no terminal, which put them all back on the console. The
         // question here is not "what does this descriptor need in order to
         // come back", it is "what was this process looking at".
-        if (s->num <= 2 && s->fd->tty != NULL) {
+        // fd_tty, not s->fd->tty: the field is a union arm and is only a tty
+        // pointer on a descriptor that IS one. A daemon with its standard
+        // streams on /dev/null or a socket read as having a terminal and this
+        // locked whatever the arm held (see fs/tty.h).
+        struct tty *fd_terminal = fd_tty(s->fd);
+        if (s->num <= 2 && fd_terminal != NULL) {
             // tty->type is the driver's major, which is what pty_open_fake
             // set; the device node's rdev is a second-hand copy of it.
-            int major = s->fd->tty->type;
+            int major = fd_terminal->type;
             bool pts = major == TTY_PSEUDO_SLAVE_MAJOR;
             // A pty always wins over a console: it is the terminal a person is
             // looking at, and a process holding both is one that opened the
             // console for logging.
             if (pts ? tty_kind != CKPT_TTY_PTS : tty_kind == CKPT_TTY_NONE) {
                 tty_kind = pts ? CKPT_TTY_PTS : CKPT_TTY_CONSOLE;
-                tty_num = s->fd->tty->num;
-                lock(&s->fd->tty->lock, 0);
-                tty_session = s->fd->tty->session;
-                tty_fg_group = s->fd->tty->fg_group;
-                tty_termios = s->fd->tty->termios;
-                tty_winsize = s->fd->tty->winsize;
-                unlock(&s->fd->tty->lock);
+                tty_num = fd_terminal->num;
+                lock(&fd_terminal->lock, 0);
+                tty_session = fd_terminal->session;
+                tty_fg_group = fd_terminal->fg_group;
+                tty_termios = fd_terminal->termios;
+                tty_winsize = fd_terminal->winsize;
+                unlock(&fd_terminal->lock);
                 char p[MAX_PATH + 1];
                 if (generic_getpath(s->fd, p) >= 0 && p[0] == '/')
                     snprintf(tty_path, sizeof(tty_path), "%s", p);

@@ -218,11 +218,14 @@ static struct tty *amd64_tty_stdio_trace_tty(fd_t fd_no) {
     if (strcmp(current->comm, "sh") != 0)
         return NULL;
     struct fd *fd = f_get(fd_no);
-    if (fd == NULL || fd->tty == NULL)
+    // Same union hazard as the checkpoint had: ->tty is only a tty on a
+    // descriptor that is one (fs/tty.h).
+    struct tty *tty = fd_tty(fd);
+    if (tty == NULL)
         return NULL;
-    if (fd->tty->type != TTY_CONSOLE_MAJOR || fd->tty->num != 2)
+    if (tty->type != TTY_CONSOLE_MAJOR || tty->num != 2)
         return NULL;
-    return fd->tty;
+    return tty;
 }
 
 static void amd64_tty_stdio_trace(const char *op, fd_t fd_no, guest_addr_t addr,

@@ -278,6 +278,25 @@ struct tty *tty_lookup_ref(int type, int num, struct tty *expected);
 void tty_put(struct tty *tty);
 
 extern struct dev_ops tty_dev;
+
+// The tty behind a descriptor, or NULL if this descriptor is not one.
+//
+// `fd->tty` lives in a UNION with the other per-driver arms (epoll's poll, the
+// socket, the fifo links), so reading it on a descriptor that is not a tty
+// does not give NULL -- it gives whichever pointer that arm happens to hold.
+// A daemon with its standard streams on /dev/null or a socket therefore looked
+// like it had a terminal, and the checkpoint locked the address it found:
+// EXC_BAD_ACCESS in ckpt_save_task, reported from a device 2026-09-11.
+//
+// Every descriptor with a valid ->tty is opened through dev_open, which sets
+// ops from the driver, so the ops ARE the discriminator. kernel/poll.c already
+// tested it this way; this is that test, named, so the next caller does not
+// have to know.
+static inline struct tty *fd_tty(struct fd *fd) {
+    if (fd == NULL || fd->ops != &tty_dev.fd)
+        return NULL;
+    return fd->tty;
+}
 extern struct dev_ops ptmx_dev;
 
 int ptmx_open(struct fd *fd);

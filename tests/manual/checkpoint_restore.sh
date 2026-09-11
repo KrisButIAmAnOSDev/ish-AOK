@@ -350,4 +350,38 @@ esac
 echo "  native  | image $(wc -c < "$IMG") bytes"
 rm -f "$IMG"
 
+# ---- a descriptor that is NOT a tty, on fd 0/1/2 --------------------------
+#
+# `fd->tty` is a union arm (fs/fd.h), so on a descriptor that is not a terminal
+# it holds whichever pointer the other arms left there -- not NULL. ckpt_save_task
+# read it for every fd 0/1/2 and locked what it found, which on a daemon whose
+# standard streams are a socket is a wild pointer: EXC_BAD_ACCESS, reported from
+# a device 2026-09-11 and reproduced here as SIGSEGV (exit 139).
+#
+# The save is EXPECTED to refuse -- a socket has no restore rule -- but it has to
+# refuse rather than die, and the refusal has to name the socket.
+echo "  ---- a socket on fd 0/1/2 ----"
+sock_prog='
+perl -e "use Socket; socketpair(A,B,AF_UNIX,SOCK_STREAM,PF_UNSPEC) or die; open(STDIN,q{<&},A); open(STDOUT,q{>&},A); open(STDERR,q{>&},A); sleep 40" &
+sleep 3
+echo save '"$IMG"' > /proc/ish/checkpoint
+sleep 3
+echo STILL-ALIVE
+while read -r l; do case $l in last_refusal*) echo "$l";; esac; done < /proc/ish/checkpoint
+'
+sock_out=$(ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" /bin/dash -c "$sock_prog" 2>&1)
+sock_rc=$?
+if [ "$sock_rc" -ge 128 ]; then
+    echo "FAIL: the save died on a non-tty descriptor (exit $sock_rc)"; echo "  got: $sock_out"; exit 1
+fi
+case $sock_out in
+    *STILL-ALIVE*) echo "  socket  | the guest survived the save" ;;
+    *) echo "FAIL: the guest did not survive a save with a socket on stdio"; echo "  got: $sock_out"; exit 1;;
+esac
+case $sock_out in
+    *"is a socket"*) echo "  socket  | refused, and named the socket" ;;
+    *) echo "FAIL: no socket refusal"; echo "  got: $sock_out"; exit 1;;
+esac
+rm -f "$IMG"
+
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"
