@@ -939,10 +939,13 @@ static CGSize ISHWorkspaceWorkspacesContentSize(NSUInteger count) {
     CGFloat spacing = phone ? 5.0 : 6.0;
     CGFloat cardPadding = phone ? 12.0 : 16.0;
     CGFloat actionsHeight = phone ? 36.0 : 44.0;
+    // The Session button is a row of its own, in both styles -- counted here or
+    // the window is a row too short and it is the one that gets clipped.
+    CGFloat sessionHeight = (phone ? 30.0 : 40.0) + spacing;
     CGFloat chrome = phone ? 24.0 : 32.0;
     CGFloat width = phone ? 214.0 : 254.0;
     CGFloat rowsHeight = n * rowHeight + n * spacing + newDesktopHeight;
-    CGFloat height = rowsHeight + cardPadding + actionsHeight + chrome;
+    CGFloat height = rowsHeight + cardPadding + actionsHeight + sessionHeight + chrome;
     return CGSizeMake(width, height);
 }
 
@@ -11478,6 +11481,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 }
 
 @implementation WorkspaceWorkspacesToolViewController {
+    UIButton *_sessionButton;
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UIStackView *_rowsStack;
@@ -11534,6 +11538,174 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)restoreLayoutFromApplet:(id)sender {
     (void) sender;
     [(id)self.workspaceHostViewController restoreWorkspaceLayout:nil];
+}
+
+// Suspend/checkpoint, reachable from Workspace mode.
+//
+// The same menu the terminal's bar button offers on a long press, but it does
+// NOT go through TerminalViewController: the session is the whole machine, not
+// one window, and Workspace mode may have no terminal window open at all.
+// Everything here is the public C surface in AppDelegate.h plus
+// checkpoint_get_status, so this works whatever is (or is not) on screen.
+- (void)sessionActionsFromApplet:(id)sender {
+    UIView *sourceView = [sender isKindOfClass:UIView.class] ? (UIView *) sender : _sessionButton;
+    UIViewController *presenter = (UIViewController *) self.workspaceHostViewController ?: self;
+    if (presenter.presentedViewController != nil)
+        return;
+
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    BOOL enabled = UserPreferences.shared.shouldSuspendToDisk;
+
+    NSString *subtitle;
+    if (!enabled) {
+        subtitle = @"Suspend to Disk is off, so nothing is being saved.";
+    } else if (ck.last_refusal[0] != '\0') {
+        subtitle = @"The last attempt was refused.";
+    } else if (ck.saves > 0 && ck.natives_restarted != 0) {
+        subtitle = [NSString stringWithFormat:
+                    @"%lu saved so far; %lu process(es) will start again rather than resume.",
+                    ck.saves, ck.natives_restarted];
+    } else if (ck.saves > 0) {
+        subtitle = [NSString stringWithFormat:@"%lu saved so far; the last held %lu processes.",
+                    ck.saves, ck.tasks];
+    } else {
+        subtitle = @"Nothing saved yet this run.";
+    }
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Session"
+                                            message:subtitle
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    if (enabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session Now"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                int err = ISHSuspendSessionSaveNow();
+                struct checkpoint_status after;
+                checkpoint_get_status(&after);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (err == 0)
+                        return;   // the confirmation is the absence of a complaint
+                    UIAlertController *alert =
+                        [UIAlertController alertControllerWithTitle:@"Session not saved"
+                                                            message:after.last_refusal[0] != '\0'
+                                                                    ? @(after.last_refusal)
+                                                                    : @"iSH-AOK could not write the session."
+                                                     preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                              style:UIAlertActionStyleCancel
+                                                            handler:nil]];
+                    if (presenter.presentedViewController == nil)
+                        [presenter presentViewController:alert animated:YES completion:nil];
+                });
+            });
+        }]];
+    } else {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Turn On Suspend to Disk\u2026"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }]];
+    }
+
+    // Only when there is one -- an empty "why it refused" implies something
+    // went wrong when nothing did.
+    if (ck.last_refusal[0] != '\0') {
+        NSString *why = @(ck.last_refusal);
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Why It Was Not Saved"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            UIAlertController *alert =
+                [UIAlertController alertControllerWithTitle:@"Session not saved"
+                                                    message:why
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+            if (presenter.presentedViewController == nil)
+                [presenter presentViewController:alert animated:YES completion:nil];
+        }]];
+    }
+
+    // Confirmed rather than immediate: this one quits the app, and it sits
+    // next to one that does not.
+    if (enabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            UIAlertController *confirm = [UIAlertController
+                alertControllerWithTitle:@"Suspend and exit?"
+                                 message:@"iSH-AOK writes this session to disk and quits. "
+                                         @"The next launch picks it up where you left it."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [confirm addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(__unused UIAlertAction *go) {
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    // Returns only on FAILURE: on success the process is gone.
+                    int err = ISHSuspendSessionSuspendAndExit();
+                    (void) err;
+                    struct checkpoint_status after;
+                    checkpoint_get_status(&after);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        UIAlertController *alert =
+                            [UIAlertController alertControllerWithTitle:@"Session not suspended"
+                                                                message:after.last_refusal[0] != '\0'
+                                                                        ? @(after.last_refusal)
+                                                                        : @"iSH-AOK could not write the session."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                                  style:UIAlertActionStyleCancel
+                                                                handler:nil]];
+                        if (presenter.presentedViewController == nil)
+                            [presenter presentViewController:alert animated:YES completion:nil];
+                    });
+                });
+            }]];
+            [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                        style:UIAlertActionStyleCancel
+                                                      handler:nil]];
+            if (presenter.presentedViewController == nil)
+                [presenter presentViewController:confirm animated:YES completion:nil];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"What Would Be Saved"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        struct checkpoint_status now;
+        checkpoint_get_status(&now);
+        NSMutableString *body = [NSMutableString string];
+        [body appendFormat:@"Saves this run: %lu\n", now.saves];
+        if (now.saves > 0) {
+            [body appendFormat:@"Last image: %lu processes, %lu descriptors, %lu pages\n",
+                               now.tasks, now.fds, now.pages];
+        }
+        if (now.natives_restarted != 0)
+            [body appendFormat:@"Started again rather than resumed: %s\n", now.natives_note];
+        [body appendFormat:@"This launch resumed a saved session: %@", now.restored ? @"yes" : @"no"];
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"Session"
+                                                message:body
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        if (presenter.presentedViewController == nil)
+            [presenter presentViewController:alert animated:YES completion:nil];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    // An action sheet on iPad is a popover and needs somewhere to point.
+    sheet.popoverPresentationController.sourceView = sourceView;
+    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
+    [presenter presentViewController:sheet animated:YES completion:nil];
 }
 
 - (UIImage *)scenePreviewImageForDescriptor:(NSDictionary<NSString *, id> *)descriptor size:(CGSize)size {
@@ -11807,6 +11979,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [_contentStack addArrangedSubview:_newWorkspaceButton];
         _closeHiddenButton = [self workspacesActionButtonWithTitle:@"Close Hidden Windows" action:@selector(confirmCloseHiddenWindows:)];
         [_contentStack addArrangedSubview:_closeHiddenButton];
+        _sessionButton = [self workspacesActionButtonWithTitle:@"Session\u2026" action:@selector(sessionActionsFromApplet:)];
+        [_contentStack addArrangedSubview:_sessionButton];
     } else {
         // Modern folds the Layout Manager into this applet as two icons.
         UIStackView *layoutRow = [UIStackView new];
@@ -11816,6 +11990,13 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"square.and.arrow.down" fallback:@"Save" action:@selector(saveLayoutFromApplet:)]];
         [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:@"Restore" action:@selector(restoreLayoutFromApplet:)]];
         [_contentStack addArrangedSubview:layoutRow];
+        // A TITLED button, not a third icon in the row above: that row is the
+        // Layout Manager, where "Save" means the window layout. A session save
+        // sitting beside it as another icon would read as the same kind of
+        // thing, and the two are not remotely the same -- one remembers where
+        // your windows are, the other writes the running machine to disk.
+        _sessionButton = [self workspacesActionButtonWithTitle:@"Session\u2026" action:@selector(sessionActionsFromApplet:)];
+        [_contentStack addArrangedSubview:_sessionButton];
     }
     CGFloat listInset = ISHWorkspaceUsesPhoneLayout() ? 6.0 : 8.0;
     [NSLayoutConstraint activateConstraints:@[
