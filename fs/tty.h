@@ -240,6 +240,9 @@ void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
 // Signal this terminal's foreground process group. Used by the checkpoint
 // restore to nudge a resumed shell into redrawing its prompt; see fs/tty.c.
 void tty_signal_fg_group(struct tty *tty, int sig);
+// Put a terminal back to the state a freshly created one is in. A checkpoint
+// restore does this before re-launching a native program.
+void tty_reset_termios_to_default(struct tty *tty);
 // Who to signal for a hangup. Captured while tty->lock is held (tty_hangup),
 // then handed to tty_hangup_notify once every tty lock has been dropped --
 // sending a signal takes pids_lock, and fs/tty.c's input path already

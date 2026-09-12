@@ -21,6 +21,33 @@ struct tty_driver *tty_drivers[256] = {
 // lock this before locking a tty
 lock_t ttys_lock = LOCK_INITIALIZER;
 
+// The line discipline a terminal starts life with.
+//
+// Factored out of tty_alloc because a RE-LAUNCHED native program has to be
+// handed exactly this and nothing else. Such a program starts from scratch
+// and captures whatever mode it finds as the one to restore when it exits --
+// so if it is handed back the raw mode its previous incarnation left behind,
+// it saves raw, sets raw, and on exit restores RAW, leaving the shell on a
+// terminal with no echo and no line discipline. That is not a lockup but it
+// is indistinguishable from one. See kernel/checkpoint.c's dispatch.
+static void tty_init_termios(struct tty *tty, int type) {
+    tty->termios.iflags = ICRNL_ | IXON_;
+    tty->termios.oflags = OPOST_ | ONLCR_;
+    // Linux keeps this per driver rather than using one value everywhere:
+    // drivers/tty/vt/vt.c takes tty_std_termios as-is for the console, which
+    // includes HUPCL, while drivers/tty/pty.c overrides c_cflag to
+    // B38400|CS8|CREAD for both the master and the slave. Key off the device
+    // type rather than the driver identity: the app drives its terminals
+    // through a tty_driver of its own, but pty_open_fake registers them under
+    // TTY_PSEUDO_SLAVE_MAJOR, so to the guest they are pty slaves.
+    tty->termios.cflags = B38400_ | CS8_ | CREAD_;
+    if (type != TTY_PSEUDO_MASTER_MAJOR && type != TTY_PSEUDO_SLAVE_MAJOR)
+        tty->termios.cflags |= HUPCL_;
+    tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
+    // from include/asm-generic/termios.h
+    memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
+}
+
 struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     // Zero everything: the driver-specific union at the end (real tty thread,
     // pty state) is only partly filled in by the per-driver init hooks, so a
@@ -45,21 +72,7 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->fg_group = 0;
     list_init(&tty->fds);
 
-    tty->termios.iflags = ICRNL_ | IXON_;
-    tty->termios.oflags = OPOST_ | ONLCR_;
-    // Linux keeps this per driver rather than using one value everywhere:
-    // drivers/tty/vt/vt.c takes tty_std_termios as-is for the console, which
-    // includes HUPCL, while drivers/tty/pty.c overrides c_cflag to
-    // B38400|CS8|CREAD for both the master and the slave. Key off the device
-    // type rather than the driver identity: the app drives its terminals
-    // through a tty_driver of its own, but pty_open_fake registers them under
-    // TTY_PSEUDO_SLAVE_MAJOR, so to the guest they are pty slaves.
-    tty->termios.cflags = B38400_ | CS8_ | CREAD_;
-    if (type != TTY_PSEUDO_MASTER_MAJOR && type != TTY_PSEUDO_SLAVE_MAJOR)
-        tty->termios.cflags |= HUPCL_;
-    tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
-    // from include/asm-generic/termios.h
-    memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
+    tty_init_termios(tty, type);
     tty->winsize = (struct winsize_) {.row = 24, .col = 80};
 
     lock_init(&tty->lock, "tty_alloc\0");
@@ -1793,3 +1806,16 @@ struct dev_ops tty_dev = {
     .fd.ioctl_size = tty_ioctl_size,
     .fd.ioctl = tty_ioctl,
 };
+
+// Put a terminal back to the state a freshly created one is in.
+//
+// Used by a checkpoint restore before it re-launches a native program: see
+// tty_init_termios above for why a re-launched program must not inherit the
+// mode its previous incarnation left behind.
+void tty_reset_termios_to_default(struct tty *tty) {
+    if (tty == NULL)
+        return;
+    lock(&tty->lock, 0);
+    tty_init_termios(tty, tty->type);
+    unlock(&tty->lock);
+}

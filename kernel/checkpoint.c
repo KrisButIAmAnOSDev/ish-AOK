@@ -2249,6 +2249,26 @@ static int ckpt_dispatch_native(struct task *task, struct ckpt_restore_state *st
     }
     envp[m] = NULL;
 
+    // Hand it a terminal in the state a fresh one is in.
+    //
+    // A native program is RE-LAUNCHED, not resumed -- it starts from scratch
+    // and, like every full-screen program, saves the terminal mode it finds at
+    // startup so it can put it back on exit. The mode it finds here is the one
+    // its PREVIOUS incarnation left behind, which for anything full-screen is
+    // raw: the checkpoint faithfully saved `tty->termios` mid-ktop, and the
+    // restore faithfully applied it. So the re-launched program saved raw as
+    // "original", set raw, and on exit restored raw -- leaving the shell on a
+    // terminal with no echo and no line discipline. Reported as "the terminal
+    // locked up" after exiting ktop across a suspend; it was not locked, it
+    // was deaf.
+    //
+    // Before native_exec_set_pending, which only RECORDS the program --
+    // task_run_current starts it later -- so this lands before it runs and
+    // reads the mode. Emulated programs are untouched: those are resumed
+    // exactly, registers and all, so their raw mode is still theirs and still
+    // correct.
+    tty_reset_termios_to_default(task->group != NULL ? task->group->tty : NULL);
+
     // Recorded rather than run: task_run_current calls native_exec_run_pending
     // on the way in, which is exactly how a native program starts on a fresh
     // boot. The copies it makes are its own, so the blocks above may go.
