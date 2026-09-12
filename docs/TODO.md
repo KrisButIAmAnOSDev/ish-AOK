@@ -1014,9 +1014,35 @@ walk. `task_snapshot_collect` (kernel/task.c:182) does take `pids_lock` with
 removes from the same list too. So either a remover runs without the lock, or
 `complex_lockt` is not the same exclusion the removers take.
 
-**It fired on a guest ~6 seconds into boot**, with 20 daemons starting, when a
-save was triggered by backgrounding the app. The CLI does not reproduce it: an
-immediate save on a quiet guest writes its image in ~3s.
+**Not a boot-timing window -- corrected 2026-09-12.** The first filing said it
+fired ~6s into boot. A later run waited **120 seconds** after boot before
+backgrounding and crashed identically, so that claim was wrong.
+
+**What actually separates the runs.** Three device runs, same binary, same
+bundle version:
+
+| run | lines | tasks written | `swap:`/`zswap:` in log | outcome |
+|-----|-------|---------------|--------------------------|---------|
+| 1   | 882   | 20 (24 sockets) | present                | froze and described cleanly, no refusal |
+| 2   | 9     | 0               | absent                 | SIGSEGV |
+| 3   | 24    | 0               | absent                 | SIGSEGV |
+
+The run that worked had swap and zswap initialised and a native program parked
+(`native park: pid 17 described itself in 2349 bytes`); both crashing runs died
+before any of that reached the log. So the marker is **how far guest
+initialisation had got**, not how long the app had been up -- a save landing
+while tasks are still being created fits `task_snapshot_collect` walking
+`alive_pids_list` against `task_create_pid_`'s `list_add` (kernel/task.c:705).
+
+The CLI does not reproduce it: an immediate save on a quiet guest writes its
+image in ~3s.
+
+**Blame is NOT yet established.** It has only ever been observed on builds
+carrying the socket restore rule, because no device save was ever run on
+b694c3716. The reasoning for calling it pre-existing is that the faulting
+instruction is a plain list walk with nothing socket-shaped in it -- but that
+is an argument, not a measurement, and the commit message that called it
+pre-existing overstated what was known.
 
 **Next step.** Audit every `alive_pids_list` mutation for the lock it holds
 (`kernel/task.c:705`, `:737`, `kernel/exec.c:689`) against what
