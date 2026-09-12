@@ -79,6 +79,14 @@ This used to be a refusal, and it was the wrong trade: the alternative to a
 degraded restore is not a perfect one, it is no restore at all, because iOS
 kills the app either way.
 
+**A save never damages the session you already had.** The image is written to a
+temporary file beside the target and renamed into place only once it is whole,
+and fsynced before it becomes visible. So a save that is refused, or an app that
+is killed part way through one, leaves the previously saved session exactly as
+it was. That matters because the header is written first: a half-written file
+would otherwise still look like a real saved session in the picker, and then
+fail part way through resuming.
+
 It still refuses rather than writing something that will not come back. Every
 refusal names the process and the reason, in `/proc/ish/checkpoint`:
 

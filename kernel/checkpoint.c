@@ -1357,7 +1357,22 @@ int checkpoint_save(const char *host_path) {
     snap.count = live;
     ckpt_order_tasks(snap.tasks, snap.count);
 
-    FILE *f = fopen(host_path, "wb");
+    // Written to a temporary beside the target and renamed into place only when
+    // it is whole.
+    //
+    // The header goes first, so a file truncated by a kill mid-write still
+    // passes checkpoint_peek -- and the session picker then offers it as a real
+    // choice, which fails part way through restoring. Worse, opening the target
+    // directly meant a save that REFUSED had already destroyed the previous
+    // good session by truncating it. With one suspend.img that was bad; with
+    // slots it is somebody's other session.
+    char tmp_path[PATH_MAX];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.new", host_path) >= (int) sizeof(tmp_path)) {
+        task_snapshot_release(&snap);
+        ckpt_thaw_all();
+        return _ENAMETOOLONG;
+    }
+    FILE *f = fopen(tmp_path, "wb");
     if (f == NULL) {
         err = errno_map();
         task_snapshot_release(&snap);
@@ -1415,8 +1430,38 @@ int checkpoint_save(const char *host_path) {
     ckpt_thaw_all();
 
     if (err != 0) {
-        unlink(host_path);
+        unlink(tmp_path);   // whatever was already at host_path is untouched
         return err;
+    }
+
+    // Durable before it is visible, and both steps AFTER the thaw: the guest
+    // does not have to be stopped for an fsync, and on a session-sized image
+    // that is the longest part of the whole save.
+    int img_fd = open(tmp_path, O_RDONLY);
+    if (img_fd >= 0) {
+        fsync(img_fd);
+        close(img_fd);
+    }
+    if (rename(tmp_path, host_path) != 0) {
+        err = errno_map();
+        unlink(tmp_path);
+        return err;
+    }
+    // The rename itself has to survive a power cut, which means fsyncing the
+    // directory that now names the file.
+    char dir_path[PATH_MAX];
+    snprintf(dir_path, sizeof(dir_path), "%s", host_path);
+    char *slash = strrchr(dir_path, '/');
+    if (slash != NULL) {
+        if (slash == dir_path)
+            dir_path[1] = '\0';
+        else
+            *slash = '\0';
+        int dir_fd = open(dir_path, O_RDONLY);
+        if (dir_fd >= 0) {
+            fsync(dir_fd);
+            close(dir_fd);
+        }
     }
 
     lock(&ckpt_lock, 0);

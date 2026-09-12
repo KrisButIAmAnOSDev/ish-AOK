@@ -26,7 +26,16 @@ While reproducing the above, a `/AOK/native/bash` at pid 16 survived
 boot. Not chased and not confirmed -- the kill's own exit status was not
 checked -- and it may be the known shape of a native program blocked in a host
 read rather than a regression of the fix in [[native-spawn-unkillable-task]].
-Worth one deliberate attempt to reproduce before it is treated as real.
+
+**Retry it before believing it.** That observation predates the blocking-path
+work later the same day: a task blocked reading a pipe or a socket was deaf to
+the checkpoint freeze (fs/sock.c and fs/real.c asked only about guest signals,
+bfbefefc8), and a long guest timeout left the host wait unbounded (251465dba).
+A native bash sitting in a host read was in exactly that state, so "ignored
+SIGKILL" may simply have been the same deafness seen through a different lens.
+Reproduce on a current build first; if it still happens, the freezer's host
+backtrace (ISH_CHECKPOINT_DEBUG, [[stuck-task-host-backtrace]]) will say where
+it actually is rather than leaving it a mystery.
 
 ### The app's UI thread impersonates a guest process
 
@@ -989,6 +998,24 @@ any repeated HTTPS handshake will do.
 ---
 
 ## Deferred on purpose
+
+### Suspend and Exit terminates the app, which the HIG discourages
+
+`ISHSuspendSessionSuspendAndExit` ends in `exit(0)`, because iOS has no public
+"quit my app" API and the feature is, precisely, to put the machine down and
+leave. It is behind an explicit, confirmed, user-initiated action in the Session
+menu -- never automatic -- and the image is fsynced and renamed into place
+before the process goes, so the session is durable rather than merely written.
+
+**The decision to make before an App Store build**: keep it, or replace the exit
+with a "session suspended" screen that leaves closing the app to the person.
+Reviewers object to apps that appear to crash; an app that quits on a button the
+user just confirmed is a weaker case against, but it is not no case. Recorded
+here so the choice is made deliberately at submission rather than discovered.
+`/AOK/tools/suspend.sh` has always ended the same way and is unaffected either
+way, since a guest-initiated halt is not the app terminating itself.
+
+
 
 ### External display / AirPlay -- GH #540
 

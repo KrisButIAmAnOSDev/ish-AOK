@@ -20,6 +20,7 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 #import <SystemConfiguration/SystemConfiguration.h>
+#include <stdatomic.h>
 #if __has_include(<Network/Network.h>)
 #import <Network/Network.h>
 #endif
@@ -4075,6 +4076,9 @@ static const NSTimeInterval kISHQuiesceMaxHoldSeconds = 5.0;
 // Held rather than compared against UIBackgroundTaskInvalid, which is a const
 // variable and so cannot initialize a static.
 static UIBackgroundTaskIdentifier suspendGuardTask;
+// Set while the backgrounding save is still writing. The quiesce below
+// must not freeze the filesystem under it.
+static atomic_bool ishSessionSaveInFlight;
 static bool suspendGuardHeld = false;
 
 static void ISHEndSuspendGuard(void) {
@@ -4142,24 +4146,61 @@ void ISHSuspendGuardEnterBackground(void) {
     if (UserPreferences.shared.shouldSuspendToDisk) {
         NSString *image = ISHSuspendSessionImagePath();
         if (image != nil) {
-            int cerr = checkpoint_save_external(image.fileSystemRepresentation);
-            struct checkpoint_status ck;
-            checkpoint_get_status(&ck);
-            if (cerr == 0) {
-                os_log(ISHSuspendLog(),
-                       "session written: %{public}lu tasks, %{public}lu pages",
-                       ck.tasks, ck.pages);
-                [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspended"
-                                              details:@{@"tasks": @(ck.tasks),
-                                                        @"pages": @(ck.pages)}];
-            } else {
-                os_log_error(ISHSuspendLog(),
-                             "session not written (%{public}d): %{public}s",
-                             cerr, ck.last_refusal);
-                [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspendRefused"
-                                              details:@{@"err": @(cerr),
-                                                        @"why": @(ck.last_refusal)}];
-            }
+            // OFF this thread, under an assertion of its own.
+            //
+            // It used to run right here, synchronously, on the reasoning that
+            // the image should be on disk before iOS can freeze us. The
+            // reasoning was right; the thread was wrong. This is a scene
+            // delegate callback, and iOS kills an app that does not return from
+            // one promptly. The freeze alone may take CKPT_FREEZE_TIMEOUT_MS,
+            // and a real session writes tens of megabytes after that, so a big
+            // enough guest could not be saved without risking the watchdog.
+            //
+            // A background task assertion is the supported way to keep running
+            // after backgrounding -- but it does not extend the watchdog, so
+            // buying the time and leaving this thread are two separate things
+            // and both are needed.
+            atomic_store(&ishSessionSaveInFlight, true);
+            __block UIBackgroundTaskIdentifier saveTask = UIBackgroundTaskInvalid;
+            saveTask = [application beginBackgroundTaskWithName:@"session-save"
+                                             expirationHandler:^{
+                // Out of time. Nothing to unwind: the image is written to a
+                // temporary and renamed into place only once it is whole, so
+                // being killed here leaves the previous session intact.
+                os_log_error(ISHSuspendLog(), "session save ran out of background time");
+                atomic_store(&ishSessionSaveInFlight, false);
+                if (saveTask != UIBackgroundTaskInvalid) {
+                    [UIApplication.sharedApplication endBackgroundTask:saveTask];
+                    saveTask = UIBackgroundTaskInvalid;
+                }
+            }];
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                int cerr = checkpoint_save_external(image.fileSystemRepresentation);
+                struct checkpoint_status ck;
+                checkpoint_get_status(&ck);
+                if (cerr == 0) {
+                    os_log(ISHSuspendLog(),
+                           "session written: %{public}lu tasks, %{public}lu pages",
+                           ck.tasks, ck.pages);
+                    [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspended"
+                                                  details:@{@"tasks": @(ck.tasks),
+                                                            @"pages": @(ck.pages)}];
+                } else {
+                    os_log_error(ISHSuspendLog(),
+                                 "session not written (%{public}d): %{public}s",
+                                 cerr, ck.last_refusal);
+                    [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspendRefused"
+                                                  details:@{@"err": @(cerr),
+                                                            @"why": @(ck.last_refusal)}];
+                }
+                atomic_store(&ishSessionSaveInFlight, false);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (saveTask != UIBackgroundTaskInvalid) {
+                        [application endBackgroundTask:saveTask];
+                        saveTask = UIBackgroundTaskInvalid;
+                    }
+                });
+            });
         }
     }
     [ISHDiagnosticsStore recordBreadcrumb:@"application.sockrestartSaved"
@@ -4170,7 +4211,12 @@ void ISHSuspendGuardEnterBackground(void) {
         // be suspended, so freezing guest filesystem I/O here would stall
         // long-running background work for no reason -- and this assertion
         // expires on its own schedule regardless of that.
-        if (ISHLocationKeepsAppAlive()) {
+        if (atomic_load(&ishSessionSaveInFlight)) {
+            // Quiescing the filesystem under a save would stall the very work
+            // the other assertion is holding time open for. The save has its
+            // own deadline; let it finish.
+            os_log(ISHSuspendLog(), "assertion expired while the session save is still writing; not quiescing");
+        } else if (ISHLocationKeepsAppAlive()) {
             os_log(ISHSuspendLog(), "assertion expired, still kept alive by location updates; not quiescing");
         } else {
             unsigned stragglers = 0;
