@@ -1044,10 +1044,39 @@ instruction is a plain list walk with nothing socket-shaped in it -- but that
 is an argument, not a measurement, and the commit message that called it
 pre-existing overstated what was known.
 
-**Next step.** Audit every `alive_pids_list` mutation for the lock it holds
-(`kernel/task.c:705`, `:737`, `kernel/exec.c:689`) against what
-`complex_lockt(&pids_lock)` actually excludes. A save fired during boot is the
-reproducer to aim for.
+**The locking audit is DONE, and it came back clean.** Every mutation and every
+walk holds `pids_lock`: `task_create_pid_` (task.c:705), `task_unlink_locked`
+(task.c:737) via all three callers (`exit.c:692` inside do_exit's
+`complex_lockt` region, `fork.c:356`, `task.c:794`), `exec.c:689`, and both
+exit-path walkers (`pgrp_is_orphaned_locked` / `pgrp_has_stopped_member_locked`,
+reached from `do_exit` which takes the lock at its head). `complex_lockt` is a
+plain `pthread_mutex_lock` on the same mutex a bare `lock()` takes, so there is
+no exclusion gap between them. **So the NULL `->next` is NOT explained by a
+missing lock, and that hypothesis is spent.**
+
+**What the code does show.** `list_remove` (util/list.h:69) leaves a node
+**NULL/NULL**, while `list_init` leaves it pointing at itself, and
+`list_for_each_entry` stops only on `&item->member != (list)` -- it has **no
+NULL check**. Seven sites walk `alive_pids_list` with that macro. So any node
+reachable from the list with a NULL `next` faults the walk at
+`ldur x28, [x24, #-0x8]`. `task_unlink_locked` uses bare `list_remove` where
+the line above it uses `list_remove_safe`, and sets `pid->task = NULL` before
+the remove -- so `pid_empty` (which tests task/session/pgroup and never
+`alive`) already reports empty mid-unlink. That is a latent hazard worth
+hardening regardless of whether it is this crash.
+
+**No reproducer yet, and the obvious ones are exhausted.** `ISH_CHECKPOINT_AFTER=<delay>:<path>`
+(main.c:451) fires `checkpoint_save_external` from a **host thread** -- the
+app's exact path, and the one to use; driving it through
+`/proc/ish/checkpoint` exercises `checkpoint_save` instead and proves nothing
+about this. With that knob: 8/8 clean under heavy fork churn, 8/8 images
+written. The device differs by having ~20 daemons, swap and zswap up, native
+programs parked, and a real root -- one of those is the missing ingredient.
+
+**Next step.** Harden the walk rather than keep hunting: either give
+`list_for_each_entry` a NULL-safe form for these seven sites, or make
+`task_unlink_locked` re-init `pid->alive` instead of leaving it NULL. Both are
+cheap and neither needs the reproducer. Then re-test on device.
 
 ## Deferred on purpose
 
