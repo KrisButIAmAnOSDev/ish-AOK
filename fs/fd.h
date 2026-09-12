@@ -134,6 +134,15 @@ struct fd {
             // readable -- chronyd at 106% of one core, 47496 failing recvmmsg
             // in 12 seconds. A dead connection reports itself once.
             bool conn_dead;
+            // This socket was rebuilt by a checkpoint restore and has no peer
+            // and no address -- the host object it stands for died with the
+            // process that owned it. The descriptor underneath is a
+            // socketpair whose other end is already closed, so reads, writes
+            // and poll all behave the way a vanished peer behaves; this flag
+            // is what stops getsockname/getpeername from reporting THAT
+            // socket's AF_UNIX identity instead of the one the guest knows it
+            // by. See fs/sock_ckpt.h.
+            bool ckpt_hungup;
             dword_t ip_mtu_discover;
             dword_t ipv6_mtu_discover;
             dword_t ipv6_mtu;

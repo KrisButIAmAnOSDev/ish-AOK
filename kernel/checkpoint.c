@@ -81,12 +81,13 @@
 #include "kernel/uts.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
+#include "fs/sock_ckpt.h"
 #include "fs/devices.h"
 #include "emu/memory.h"
 #include "util/sync.h"
 
 #define CKPT_MAGIC "AOKCKPT"
-#define CKPT_VERSION 2
+#define CKPT_VERSION 3
 // How long the freezer waits for a task to reach a syscall boundary.
 //
 // Generous on purpose. Every wait in the guest is broken by the poke, so a
@@ -110,6 +111,7 @@ enum ckpt_fd_kind {
     CKPT_FD_CHR,          // /dev/null and friends: re-open the device by path
     CKPT_FD_PIPE,         // one end of a pipe, with whatever is still in it
     CKPT_FD_REF,          // the SAME struct fd as one already described
+    CKPT_FD_SOCKET,       // a socket: rebuilt from its description, not copied
 };
 
 // Which KIND of terminal a process's standard streams were on. The two are
@@ -153,6 +155,7 @@ static const char *ckpt_kind_name(uint32_t kind) {
         case CKPT_FD_PIPE: return "pipe";
         case CKPT_FD_REF: return "ref";
         case CKPT_FD_STDIO: return "stdio";
+        case CKPT_FD_SOCKET: return "sock";
         default: return "?";
     }
 }
@@ -712,6 +715,7 @@ struct ckpt_saved_fd {
     bool first;              // this record describes the object, not a ref to it
     char *pipe_bytes;        // CKPT_FD_PIPE read end: what was still in it
     uint64_t pipe_len;
+    struct sock_ckpt_desc sock;   // CKPT_FD_SOCKET: how to build it again
     char path[MAX_PATH + 1];
 };
 
@@ -810,6 +814,14 @@ static int ckpt_classify_fd(int num, struct fd *fd, char *path, size_t path_size
     // outlive the process that owns it.
     if (S_ISFIFO(fd->type) && fd->real_fd >= 0 && fd->stat.inode != 0)
         return CKPT_FD_PIPE;
+    // A socket. The host object belongs to this process and cannot outlive it
+    // -- on iOS it does not even outlive a suspension -- so what travels is a
+    // description complete enough to BUILD one again. That is sockrestart's
+    // model, and the only one available. fs/sock_ckpt.h carries the rules,
+    // including what becomes of a connection that cannot be resumed.
+    if (S_ISSOCK(fd->type) && fd->ops != NULL && fd->ops->name != NULL &&
+            strcmp(fd->ops->name, "socket") == 0)
+        return CKPT_FD_SOCKET;
     if (!S_ISREG(fd->type) && !S_ISDIR(fd->type)) {
         ckpt_refuse("fd %d is a %s on %s with no restore rule",
                     num, S_ISFIFO(fd->type) ? "named pipe" :
@@ -1021,6 +1033,12 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
                     goto out;
                 s->offset = s->pipe_len;
             }
+            // Asked while everything is frozen, which is the only moment the
+            // answer is stable: it reads the host socket's own name and
+            // whether it has a peer.
+            if (s->kind == CKPT_FD_SOCKET &&
+                    (ret = sock_ckpt_describe(s->fd, &s->sock)) < 0)
+                goto out;
         }
 
         // WHICH terminal this process's standard streams were on, asked of
@@ -1241,6 +1259,8 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         wr(w, s->path, cf.path_len);
         if (s->pipe_len != 0)
             wr(w, s->pipe_bytes, s->pipe_len);
+        if (s->kind == CKPT_FD_SOCKET)
+            wr(w, &s->sock, sizeof(s->sock));
     }
     ret = w->err;
 
@@ -1969,6 +1989,27 @@ descriptors:
                 goto fds_done;
             fd_retain(end);   // the process's own
             if ((err = fdtable_install_at(files, (fd_t) cf.fd, end,
+                                          cf.cloexec != 0)) < 0)
+                goto fds_done;
+            continue;
+        }
+
+        if (cf.kind == CKPT_FD_SOCKET) {
+            struct sock_ckpt_desc desc;
+            if ((err = rd(f, &desc, sizeof(desc))) < 0)
+                goto fds_done;
+            int sock_err = 0;
+            struct fd *sock = sock_ckpt_rebuild(&desc, &sock_err);
+            if (sock == NULL) {
+                err = sock_err != 0 ? sock_err : _EIO;
+                goto fds_done;
+            }
+            CKPT_TRACE("    socket %s domain %u type %u proto %u backlog %u\n",
+                       sock_ckpt_state_name(desc.state), desc.domain,
+                       desc.type, desc.protocol, desc.backlog);
+            if ((err = ckpt_id_put(st, cf.id, sock)) < 0)
+                goto fds_done;
+            if ((err = fdtable_install_at(files, (fd_t) cf.fd, sock,
                                           cf.cloexec != 0)) < 0)
                 goto fds_done;
             continue;

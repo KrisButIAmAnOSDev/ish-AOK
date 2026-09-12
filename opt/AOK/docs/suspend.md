@@ -90,14 +90,35 @@ fail part way through resuming.
 It still refuses rather than writing something that will not come back. Every
 refusal names the process and the reason, in `/proc/ish/checkpoint`:
 
-- **A socket**, or any other descriptor with no rule for rebuilding it. Regular
-  files, directories, terminals, pipes and the standard streams all have one.
+- **A descriptor with no rule for rebuilding it.** Regular files, directories,
+  terminals, pipes, sockets and the standard streams all have one.
 - **A native program that is not making any system calls**, because there is
   nowhere to stop it. A shell at a prompt is waiting on a read and is fine; a
   native program in a tight compute loop is not.
 
 A refusal costs nothing: the session carries on exactly as it was. A save is a
 copy, and the machine is stopped only for as long as it takes to write one.
+
+**Sockets are rebuilt, not copied.** A socket belongs to the process that owns
+it and cannot outlive it -- on iOS it does not even outlive a suspension, since
+the system tears connected sockets down while the app is frozen. So what
+travels is a description complete enough to build one again:
+
+- A **listening** socket comes back listening, on the same address and with the
+  same backlog. A guest running `sshd` could not be saved at all before this.
+- A **bound** socket comes back bound, and one that was never bound or
+  connected comes back as a plain new socket.
+- A **netlink** socket is rebuilt exactly, port id included. AOK emulates these
+  end to end, so there was never a host object to lose.
+- A **connected** socket comes back **hung up**: reading it gives end-of-file
+  and writing gives `EPIPE`, which is what every program already handles as
+  "the peer went away" -- and what did in fact happen. Unix-domain sockets come
+  back this way too for now, because putting a bound one back means recreating
+  its node in the filesystem.
+
+That is a session that resumes with some connections dropped, rather than no
+session at all; refusing never preserved a working connection, because iOS
+destroys it during the suspension regardless.
 
 An image from a **different build** is refused on the way back in. The register
 file travels as bytes, and reinterpreting one from another build would be worse

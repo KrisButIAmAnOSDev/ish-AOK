@@ -358,8 +358,11 @@ rm -f "$IMG"
 # standard streams are a socket is a wild pointer: EXC_BAD_ACCESS, reported from
 # a device 2026-09-11 and reproduced here as SIGSEGV (exit 139).
 #
-# The save is EXPECTED to refuse -- a socket has no restore rule -- but it has to
-# refuse rather than die, and the refusal has to name the socket.
+# The save must now SUCCEED. A socket is described rather than photographed
+# (fs/sock_ckpt.h): this one is a connected AF_UNIX pair, which cannot be
+# resumed, so it comes back hung up -- reads give EOF -- rather than costing the
+# whole session. Refusing preserved nothing, because iOS destroys these sockets
+# during the suspension anyway.
 echo "  ---- a socket on fd 0/1/2 ----"
 sock_prog='
 perl -e "use Socket; socketpair(A,B,AF_UNIX,SOCK_STREAM,PF_UNSPEC) or die; open(STDIN,q{<&},A); open(STDOUT,q{>&},A); open(STDERR,q{>&},A); sleep 40" &
@@ -379,9 +382,135 @@ case $sock_out in
     *) echo "FAIL: the guest did not survive a save with a socket on stdio"; echo "  got: $sock_out"; exit 1;;
 esac
 case $sock_out in
-    *"is a socket"*) echo "  socket  | refused, and named the socket" ;;
-    *) echo "FAIL: no socket refusal"; echo "  got: $sock_out"; exit 1;;
+    *"is a socket"*) echo "FAIL: a socket still refuses the save"; echo "  got: $sock_out"; exit 1;;
+    *) : ;;
 esac
+if [ ! -s "$IMG" ]; then
+    echo "FAIL: the save wrote no image for a guest holding a socket"; echo "  got: $sock_out"; exit 1
+fi
+echo "  socket  | saved, $(wc -c < "$IMG" | tr -d ' ') bytes"
+
 rm -f "$IMG"
+
+# A socket is not photographed, it is DESCRIBED and built again -- so the two
+# halves of that claim need separate proof, and the leg above only covers a
+# connected pair (which cannot be resumed and comes back hung up).
+#
+# 1. A LISTENING socket has to come back listening. This is the case the whole
+#    rule exists for: a guest running sshd could not be saved at all before.
+#    `$| = 1` is load-bearing -- with perl's stdout block-buffered, the
+#    pre-save line sits in the checkpointed userspace buffer and is flushed
+#    AGAIN by the restored process, which reads exactly like a guest that
+#    re-ran from the top.
+echo "  ---- a listening socket ----"
+LIMG=${TMPDIR:-/tmp}/aok-ckpt-listen-$$.img
+LPORT=34521
+rm -f "$LIMG"
+listen_prog="perl -e '
+\$| = 1;
+use Socket;
+socket(S, PF_INET, SOCK_STREAM, getprotobyname(\"tcp\")) or die \"socket: \$!\";
+setsockopt(S, SOL_SOCKET, SO_REUSEADDR, pack(\"l\",1));
+bind(S, sockaddr_in($LPORT, INADDR_LOOPBACK)) or die \"bind: \$!\";
+listen(S, 7) or die \"listen: \$!\";
+print \"A-BEFORE-SAVE\n\";
+open(C, \">\", \"/proc/ish/checkpoint\") or die; print C \"save $LIMG\n\"; close(C);
+print \"B-AFTER-SAVE\n\";
+my \$n = getsockname(S) or die \"getsockname: \$!\";
+my (\$p) = sockaddr_in(\$n);
+print \"C-STILL-BOUND-\$p\n\";
+socket(K, PF_INET, SOCK_STREAM, getprotobyname(\"tcp\")) or die;
+if (connect(K, sockaddr_in($LPORT, INADDR_LOOPBACK))) {
+  if (accept(A, S)) { print \"D-ACCEPTED\n\"; } else { print \"D-ACCEPT-FAILED\n\"; }
+} else { print \"D-CONNECT-FAILED\n\"; }
+'"
+lsave=$(ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" $SH -c "$listen_prog" 2>&1)
+[ -s "$LIMG" ] || { echo "FAIL: a guest with a listening socket wrote no image"; echo "  got: $lsave"; rm -f "$LIMG"; exit 1; }
+lrest=$(ISH_RESTORE="$LIMG" "$ISH" -f "$ROOT" 2>&1)
+rm -f "$LIMG"
+case $lrest in
+    *A-BEFORE-SAVE*) echo "FAIL: the restored guest re-ran rather than continued"; echo "  got: $lrest"; exit 1;;
+esac
+case $lrest in
+    *C-STILL-BOUND-$LPORT*) echo "  listen  | came back bound to port $LPORT" ;;
+    *) echo "FAIL: the restored listening socket lost its address"; echo "  got: $lrest"; exit 1;;
+esac
+case $lrest in
+    *D-ACCEPTED*) echo "  listen  | and accepted a connection on it" ;;
+    *) echo "FAIL: the restored socket was not actually listening"; echo "  got: $lrest"; exit 1;;
+esac
+
+# 2. A CONNECTED socket cannot be resumed -- the far end is a process that will
+#    not exist -- so it comes back hung up. That has to mean end-of-file and
+#    ENOTCONN, not a descriptor that hangs: a read that blocks forever is worse
+#    than the refusal this replaced.
+echo "  ---- a connected socket comes back hung up ----"
+HIMG=${TMPDIR:-/tmp}/aok-ckpt-hungup-$$.img
+rm -f "$HIMG"
+hungup_prog="perl -e '
+\$| = 1;
+use Socket;
+socketpair(P, Q, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die \"socketpair: \$!\";
+syswrite(Q, \"still-here\");
+print \"A-BEFORE-SAVE\n\";
+open(C, \">\", \"/proc/ish/checkpoint\") or die; print C \"save $HIMG\n\"; close(C);
+print \"B-AFTER-SAVE\n\";
+my \$pn = getpeername(P);
+print \"C-PEER-\", (defined \$pn ? \"OK\" : \"ENOTCONN\"), \"\n\";
+my \$buf = \"\"; my \$n = sysread(P, \$buf, 64);
+if (!defined \$n) { print \"D-READ-ERROR\n\"; }
+elsif (\$n == 0) { print \"D-READ-EOF\n\"; }
+else { print \"D-READ-BYTES\n\"; }
+'"
+hsave=$(ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" $SH -c "$hungup_prog" 2>&1)
+[ -s "$HIMG" ] || { echo "FAIL: a guest with a connected socket wrote no image"; echo "  got: $hsave"; rm -f "$HIMG"; exit 1; }
+hrest=$(ISH_RESTORE="$HIMG" "$ISH" -f "$ROOT" 2>&1)
+rm -f "$HIMG"
+case $hrest in
+    *C-PEER-ENOTCONN*) echo "  hungup  | getpeername says ENOTCONN" ;;
+    *) echo "FAIL: a restored connected socket still claims a peer"; echo "  got: $hrest"; exit 1;;
+esac
+case $hrest in
+    *D-READ-EOF*) echo "  hungup  | and reading it gives end-of-file, not a hang" ;;
+    *) echo "FAIL: a restored dead socket did not read EOF"; echo "  got: $hrest"; exit 1;;
+esac
+
+# 3. And poll() has to SAY it is readable. A closed socket is readable on Linux
+#    because a read returns 0, so revents is POLLIN|POLLHUP -- a program that
+#    waits for POLLIN before reading must be told to read. This asserts the
+#    bit, not just the wake-up: select() counts POLLHUP as readable all by
+#    itself, so a select-based check passes even when POLLIN is missing and
+#    every poll()-based program is left waiting. Measured at 0x18
+#    (POLLHUP|POLLERR) before the ckpt_hungup arm in sock_poll existed.
+#    docs/build_555_musts.md item 4 asks for exactly this assertion.
+PIMG=${TMPDIR:-/tmp}/aok-ckpt-poll-$$.img
+rm -f "$PIMG"
+poll_prog="perl -e '
+\$| = 1;
+use Socket; use IO::Poll qw(POLLIN POLLHUP);
+socketpair(P, Q, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die;
+open(C, \">\", \"/proc/ish/checkpoint\") or die; print C \"save $PIMG\n\"; close(C);
+my \$p = IO::Poll->new; \$p->mask(\*P => POLLIN);
+my \$n = \$p->poll(5); my \$ev = \$p->events(\*P) || 0;
+printf(\"P-REVENTS-0x%x\n\", \$ev);
+print \"P-HAS-POLLIN\n\" if \$ev & POLLIN;
+print \"P-HAS-POLLHUP\n\" if \$ev & POLLHUP;
+'"
+ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" $SH -c "$poll_prog" >/dev/null 2>&1 || true
+if [ -s "$PIMG" ]; then
+    prest=$(ISH_RESTORE="$PIMG" "$ISH" -f "$ROOT" 2>&1)
+    rm -f "$PIMG"
+    case $prest in
+        *P-HAS-POLLIN*) echo "  hungup  | poll() reports POLLIN, so a poll loop reads the EOF" ;;
+        *) echo "FAIL: poll() on a restored hung-up socket omits POLLIN"; echo "  got: $prest"; exit 1;;
+    esac
+    case $prest in
+        *P-HAS-POLLHUP*) : ;;
+        *) echo "FAIL: poll() on a restored hung-up socket omits POLLHUP"; echo "  got: $prest"; exit 1;;
+    esac
+else
+    rm -f "$PIMG"
+    echo "  hungup  | (poll leg skipped: no image)"
+fi
 
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"

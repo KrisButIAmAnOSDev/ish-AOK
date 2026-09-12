@@ -19,6 +19,10 @@
 
 extern const struct fd_ops socket_fdops;
 
+// Build the struct fd for an already-created host socket, without
+// installing it in any descriptor table. See fs/sock.c.
+struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol);
+
 int_t sys_socketcall(dword_t call_num, addr_t args_addr);
 int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr);
 

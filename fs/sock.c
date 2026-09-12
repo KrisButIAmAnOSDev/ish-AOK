@@ -31,6 +31,7 @@
 #include "fs/poll.h"
 #include "fs/real.h"
 #include "fs/sock.h"
+#include "fs/sock_ckpt.h"
 #include "util/timer.h"
 #include "debug.h"
 
@@ -2466,10 +2467,14 @@ static void sock_trace_iov_preview(struct fd *sock, const struct iovec *iov, siz
 
 static int unix_socket_finish_peer(struct fd *sock);
 
-static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+// Build the struct fd for a host socket WITHOUT installing it anywhere.
+// Split out of sock_fd_create so a checkpoint restore can build one and put
+// it at a particular number in a particular process (fdtable_install_at)
+// rather than at the next free number in the current one.
+struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL)
-        return _ENOMEM;
+        return NULL;
     fd->stat.mode = S_IFSOCK | 0666;
     // A socket's inode belongs to whoever created it. adhoc_fd_create zeroes
     // the whole statbuf, so this was uid 0 -- every socket in the system
@@ -2509,6 +2514,13 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
         list_init(&fd->socket.unix_scm);
     }
     sock_debug_event("fd-create", fd, 0, 0);
+    return fd;
+}
+
+static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+    struct fd *fd = sock_fd_adopt(sock_fd, domain, type, protocol);
+    if (fd == NULL)
+        return _ENOMEM;
     return f_install(fd, type & ~SOCKET_TYPE_MASK);
 }
 
@@ -5201,6 +5213,18 @@ static int copy_unix_peer_name(char *sockaddr, dword_t *sockaddr_len, struct fd 
     return peer == NULL ? _ENOTCONN : 0;
 }
 
+// The length getsockname reports for a socket with no address. These are
+// Linux's sockaddr sizes, which are ABI constants and identical on every
+// architecture AOK emulates -- 16 for sockaddr_in, 28 for sockaddr_in6, and
+// for an unnamed unix socket just the two-byte family.
+static dword_t sock_ckpt_hungup_addr_len(int domain) {
+    switch (domain) {
+        case AF_INET_: return 16;
+        case AF_INET6_: return 28;
+    }
+    return 2;
+}
+
 static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
     STRACE("getsockname(%d, 0x%llx, 0x%llx)", sock_fd,
             (unsigned long long) sockaddr_addr,
@@ -5231,6 +5255,27 @@ static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
     // where Linux has a two-byte family. Writing those bytes back unconverted
     // handed the guest a mangled address -- python's http.server read the
     // host part of getsockname() as an int and died in socket.getfqdn().
+    // Rebuilt by a checkpoint restore with no address of its own. The host
+    // descriptor underneath is an anonymous socketpair end, so asking the host
+    // would tell the guest that its AF_INET socket is an unnamed AF_UNIX one.
+    // Answer with the family the guest knows it by and a zero address -- the
+    // state an unbound socket of that family is genuinely in.
+    if (sock->socket.ckpt_hungup) {
+        dword_t real_len = sock_ckpt_hungup_addr_len(sock->socket.domain);
+        memset(sockaddr, 0, sizeof(sockaddr));
+        // Guest layout, written directly: the family is the first two bytes of
+        // every Linux sockaddr and the rest is zero, so there is nothing for
+        // sockaddr_write to convert.
+        uint16_t family = (uint16_t) sock->socket.domain;
+        memcpy(sockaddr, &family, sizeof(family));
+        dword_t write_len = real_len < sockaddr_len ? real_len : sockaddr_len;
+        if (user_write(sockaddr_addr, sockaddr, write_len))
+            return _EFAULT;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
     if (sock->socket.bind_deferred) {
         dword_t real_len = sock->socket.deferred_addr_len;
         if (real_len > sizeof(sockaddr))
@@ -5324,6 +5369,11 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
     // copy_unix_name's unsigned length subtraction, drove an out-of-bounds
     // write) whenever the guest's requested length was too small to hold it.
     char sockaddr[sizeof(struct sockaddr_storage)];
+
+    // A restore rebuilt this one with its peer already gone, which is what
+    // ENOTCONN means. Asking the host would name the closed socketpair end.
+    if (sock->socket.ckpt_hungup)
+        return _ENOTCONN;
 
     if (sock->socket.domain == AF_NETLINK_) {
         if (sockaddr_len < sizeof(struct sockaddr_nl_))
@@ -8722,6 +8772,18 @@ static int sock_poll(struct fd *fd) {
         }
         return types;
     }
+    // Rebuilt by a checkpoint restore with its peer already closed. Unlike
+    // conn_dead just below, there IS an end-of-file waiting here, and that is
+    // the whole point: Linux reports a peer-closed socket as readable for
+    // exactly that reason, because a read returns 0. So POLL_READ belongs
+    // alongside POLL_HUP. Without it a program that waits for POLLIN before
+    // reading never reads the end-of-file it is being told about -- measured
+    // as revents 0x18 on a restored socket, the failure
+    // docs/build_555_musts.md item 4 describes. Placed ahead of the
+    // half-close discriminator below on purpose: there is no live peer to ask
+    // with a zero-length send, and no half-close to tell apart.
+    if (fd->socket.ckpt_hungup)
+        return POLL_READ | POLL_HUP;
     // The connection is gone for good -- iOS killed it while the device slept,
     // and sock_translate_err has already said so once. Report what Linux shows
     // for a dead connection, and specifically NOT POLL_READ: a poll loop that
@@ -9243,4 +9305,221 @@ int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr) {
 
 int_t sys_socketcall(dword_t call_num, addr_t args_addr) {
     return sys_socketcall_guest(call_num, args_addr);
+}
+
+// ------------------------------------------------- checkpoint save/restore
+//
+// A socket is described well enough to be BUILT again, never photographed --
+// the host object belongs to this process and does not outlive it. On iOS it
+// does not even outlive a suspension: the system tears connected sockets down
+// while the app is frozen, which is what the ENOTCONN->ECONNRESET translation
+// above exists to report. So a connection that cannot be resumed comes back
+// hung up rather than costing the whole session. See fs/sock_ckpt.h.
+
+const char *sock_ckpt_state_name(uint32_t state) {
+    switch (state) {
+        case SOCK_CKPT_FRESH: return "fresh";
+        case SOCK_CKPT_BOUND: return "bound";
+        case SOCK_CKPT_LISTEN: return "listen";
+        case SOCK_CKPT_NETLINK: return "netlink";
+        case SOCK_CKPT_HUNGUP: return "hungup";
+    }
+    return "?";
+}
+
+// Did a bind() actually put this socket somewhere? A socket that has never
+// been bound still answers getsockname -- with the wildcard address and port
+// zero -- so the presence of a name proves nothing and the port is the test.
+static bool sock_ckpt_addr_is_bound(const void *addr, socklen_t len) {
+    const struct sockaddr *sa = addr;
+    if (len < (socklen_t) sizeof(sa->sa_family))
+        return false;
+    if (sa->sa_family == AF_INET && len >= (socklen_t) sizeof(struct sockaddr_in))
+        return ((const struct sockaddr_in *) addr)->sin_port != 0;
+    if (sa->sa_family == AF_INET6 && len >= (socklen_t) sizeof(struct sockaddr_in6))
+        return ((const struct sockaddr_in6 *) addr)->sin6_port != 0;
+    return false;
+}
+
+int sock_ckpt_describe(struct fd *sock, struct sock_ckpt_desc *out) {
+    if (sock == NULL || sock->ops != &socket_fdops)
+        return _EINVAL;
+    memset(out, 0, sizeof(*out));
+    out->domain = sock->socket.domain;
+    out->type = sock->socket.type;
+    out->protocol = sock->socket.protocol;
+    if (sock->real_fd >= 0) {
+        int flags = fcntl(sock->real_fd, F_GETFL);
+        out->nonblock = (flags >= 0 && (flags & O_NONBLOCK)) ? 1 : 0;
+    }
+
+    // Netlink is emulated end to end (real_fd < 0), so there is no host object
+    // to have lost and the rebuild is exact -- port id included, because that
+    // is the address the guest knows this socket by.
+    if (sock->socket.domain == AF_NETLINK_) {
+        out->state = SOCK_CKPT_NETLINK;
+        out->netlink_port_id = sock->socket.netlink_port_id;
+        out->netlink_groups = sock->socket.netlink_groups;
+        return 0;
+    }
+    if (sock->real_fd < 0) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+    // Connected: the far end is a process somewhere else, which will not be
+    // there on the way back.
+    char peer[SOCK_CKPT_ADDR_MAX];
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(sock->real_fd, (struct sockaddr *) peer, &peer_len) == 0) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+    // Only the internet families are rebuilt for real in this version. An
+    // AF_LOCAL bind owns a path in the guest filesystem, so putting it back
+    // means unlinking and recreating a node while the restore is still
+    // rebuilding the filesystem view -- separate work. Until then a unix
+    // socket comes back hung up, which costs that socket rather than the
+    // session.
+    if (sock->socket.domain != AF_INET_ && sock->socket.domain != AF_INET6_) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+
+    if (sock->socket.bind_deferred) {
+        // Not on the host yet (see sock_bind_materialize), so what bind() was
+        // told is the only record of where this socket goes.
+        uint32_t len = sock->socket.deferred_addr_len;
+        if (len > sizeof(out->addr))
+            len = sizeof(out->addr);
+        memcpy(out->addr, sock->socket.deferred_addr, len);
+        out->addr_len = len;
+        out->state = SOCK_CKPT_BOUND;
+    } else {
+        socklen_t len = sizeof(out->addr);
+        if (getsockname(sock->real_fd, (struct sockaddr *) out->addr, &len) == 0 &&
+                sock_ckpt_addr_is_bound(out->addr, len)) {
+            out->addr_len = (uint32_t) len;
+            out->state = sock->socket.listening ? SOCK_CKPT_LISTEN : SOCK_CKPT_BOUND;
+        } else {
+            memset(out->addr, 0, sizeof(out->addr));
+            out->state = SOCK_CKPT_FRESH;
+        }
+    }
+    if (out->state == SOCK_CKPT_LISTEN)
+        out->backlog = sock->sockrestart.backlog > 0
+                ? (uint32_t) sock->sockrestart.backlog : 128;
+    return 0;
+}
+
+// A descriptor whose peer is already gone. A socketpair with one end closed is
+// exactly that, and it behaves correctly everywhere it matters: read gives 0,
+// write gives EPIPE, and poll gives POLLIN|POLLHUP -- so a select loop wakes,
+// reads the end-of-file and closes, which is what every program already does
+// when a peer disappears. A plain unconnected socket would NOT do that: it
+// polls WRITABLE, and the loop spins forever.
+static struct fd *sock_ckpt_hungup_fd(const struct sock_ckpt_desc *desc, int *err) {
+    int pair[2];
+    int real_type = desc->type == SOCK_DGRAM_ ? SOCK_DGRAM : SOCK_STREAM;
+    if (socketpair(AF_UNIX, real_type, 0, pair) < 0) {
+        *err = errno_map();
+        return NULL;
+    }
+    close(pair[1]);
+    struct fd *fd = sock_fd_adopt(pair[0], desc->domain, desc->type, desc->protocol);
+    if (fd == NULL) {
+        close(pair[0]);
+        *err = _ENOMEM;
+        return NULL;
+    }
+    fd->socket.ckpt_hungup = true;
+    // NOT conn_dead. That marker means "iOS killed this connection and there is
+    // nothing left to read", and sock_poll answers it with POLL_ERR|POLL_HUP
+    // and DELIBERATELY no POLL_READ, so a poll loop is not told to read
+    // something that will only error. This socket is the other case: its peer
+    // is closed and there IS an end-of-file waiting, which is what a restore
+    // wants the guest to read. Measured: with conn_dead set, poll returned
+    // 0x18 (HUP|ERR) and a program waiting for POLLIN before reading never
+    // read the EOF it was being told about -- the exact failure
+    // docs/build_555_musts.md item 4 describes.
+    return fd;
+}
+
+struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err) {
+    *err = 0;
+    if (desc->state == SOCK_CKPT_NETLINK) {
+        struct fd *fd = adhoc_fd_create(&socket_fdops);
+        if (fd == NULL) {
+            *err = _ENOMEM;
+            return NULL;
+        }
+        fd->stat.mode = S_IFSOCK | 0666;
+        fd->stat.uid = current != NULL ? current->uid : 0;
+        fd->stat.gid = current != NULL ? current->gid : 0;
+        fd->type = S_IFSOCK;
+        fd->real_fd = -1;
+        fd->socket.domain = desc->domain;
+        fd->socket.type = desc->type;
+        fd->socket.protocol = desc->protocol;
+        sock_init_emulation_defaults(fd);
+        fd->socket.netlink_port_id = desc->netlink_port_id != 0
+                ? desc->netlink_port_id : netlink_next_port_id();
+        fd->socket.netlink_groups = desc->netlink_groups;
+        fd->fake_inode = fd->socket.netlink_port_id;
+        netlink_notify_register(fd);
+        return fd;
+    }
+    if (desc->state == SOCK_CKPT_HUNGUP)
+        return sock_ckpt_hungup_fd(desc, err);
+
+    int real_domain = sock_family_to_real((int) desc->domain);
+    int real_type = sock_type_to_real((int) desc->type, (int) desc->protocol);
+    if (real_domain < 0 || real_type < 0)
+        return sock_ckpt_hungup_fd(desc, err);
+    int s = socket(real_domain, real_type, (int) desc->protocol);
+    if (s < 0) {
+        printk("WARNING: checkpoint: socket(%d, %d, %d) failed: %s\n",
+               real_domain, real_type, desc->protocol, strerror(errno));
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    // The address may still be considered taken -- the same reason
+    // sockrestart_on_resume sets these, and here the process that held it may
+    // genuinely still be shutting down.
+    int reuse = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+    if (desc->addr_len != 0 &&
+            bind(s, (const struct sockaddr *) desc->addr,
+                 (socklen_t) desc->addr_len) < 0) {
+        printk("WARNING: checkpoint: rebinding a restored socket failed: %s\n",
+               strerror(errno));
+        close(s);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    if (desc->state == SOCK_CKPT_LISTEN &&
+            listen(s, desc->backlog > 0 ? (int) desc->backlog : 128) < 0) {
+        printk("WARNING: checkpoint: relistening a restored socket failed: %s\n",
+               strerror(errno));
+        close(s);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    if (desc->nonblock) {
+        int flags = fcntl(s, F_GETFL);
+        if (flags >= 0)
+            fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+    struct fd *fd = sock_fd_adopt(s, (int) desc->domain, (int) desc->type,
+                                  (int) desc->protocol);
+    if (fd == NULL) {
+        close(s);
+        *err = _ENOMEM;
+        return NULL;
+    }
+    if (desc->state == SOCK_CKPT_LISTEN) {
+        fd->socket.listening = true;
+        fd->sockrestart.backlog = (int) desc->backlog;
+        sockrestart_begin_listen(fd);
+    }
+    return fd;
 }
