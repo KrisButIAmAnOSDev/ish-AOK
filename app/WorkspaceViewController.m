@@ -5385,6 +5385,17 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         // itself, so the branch below is the ordinary not-resuming launch.
         struct checkpoint_status resumeStatus;
         checkpoint_get_status(&resumeStatus);
+        // Recorded either way, because this runs ONCE per launch and latches:
+        // if the workspace somehow appears before the restore has happened
+        // (the session picker still up, say) the resume branch is missed and
+        // never retried, and the symptom -- no terminals -- looks identical to
+        // the bug this replaced. The breadcrumb says which branch ran and why,
+        // so the next report is one line to diagnose instead of a hunt.
+        [ISHDiagnosticsStore recordBreadcrumb:@"workspace.launch.layout"
+                                      details:@{@"restored": @(resumeStatus.restored),
+                                                @"hasSavedLayout": @(hasSavedLayout),
+                                                @"windows": @(savedLayout.count),
+                                                @"applied": @(resumeStatus.restored && hasSavedLayout)}];
         if (resumeStatus.restored && hasSavedLayout) {
             [self applySavedWorkspaceLayout:savedLayout];
         } else {
