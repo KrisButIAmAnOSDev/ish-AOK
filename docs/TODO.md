@@ -1077,6 +1077,32 @@ before it is safe, which is why it was not bundled into a checkpoint fix.
 `list_remove` change and converting the remaining bare removes to a re-initing
 form.
 
+### The Desktops applet's default height under-counts its action buttons
+
+Noticed 2026-09-12 while adding the Session button, and **pre-existing** -- left
+alone rather than changed under an unrelated commit.
+
+`ISHWorkspaceWorkspacesContentSize` (app/WorkspaceViewController.m) derives the
+applet's preferred size from its contents, but carries a single
+`actionsHeight` term (36pt phone / 44pt otherwise) while `_contentStack`
+receives more than one action row in the classic style:
+
+- **classic**: `_newWorkspaceButton`, `_closeHiddenButton`, `_sessionButton`,
+  `listCard` -- three buttons, one term (plus the `sessionHeight` term added
+  with the Session button, so the shortfall is the *second* of the two older
+  buttons).
+- **modern**: `layoutRow`, `_sessionButton`, `listCard` -- covered correctly by
+  `actionsHeight` + `sessionHeight`.
+
+The consequence is cosmetic: this is the preferred/fallback size for a window
+the user can resize, so the applet opens a little shorter than its contents in
+the classic style and the bottom button sits tight against the edge.
+
+**Next step.** Replace the fixed `actionsHeight` with a count of the action
+rows actually added, so the two styles cannot drift apart again -- the same
+bug will recur the next time a button is added to one branch and not the
+other.
+
 ## Deferred on purpose
 
 ### Suspend and Exit terminates the app, which the HIG discourages
