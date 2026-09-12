@@ -30,7 +30,11 @@
 extern lock_t atomic_l_lock;
 time_t boot_time;  // Store the boot time.
 
-struct list tasks_pending_deletion_queue;
+// Self-pointing from load, for the same reason as alive_pids_list below: a
+// bare global starts NULL/NULL, list_for_each_entry has no NULL check, and
+// cleanup_pending_deletions walks this one. init_pending_queues still
+// list_inits it, which is a no-op on an already-empty list.
+struct list tasks_pending_deletion_queue = LIST_INITIALIZER(tasks_pending_deletion_queue);
 pthread_mutex_t tasks_pending_deletion_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int iOSMajorRelease;
@@ -68,7 +72,19 @@ int task_set_pid_max(dword_t value) {
     return 0;
 }
 lock_t pids_lock;
-struct list alive_pids_list;
+// Statically self-pointing, NOT left zeroed for become_first_process to
+// list_init (kernel/init.c). A bare global starts as NULL/NULL, and
+// list_for_each_entry has no NULL check -- so anything that walked this list
+// before the guest booted followed `next` into 0 and faulted at
+// 0xfffffffffffffff8 on the FIRST iteration. That is reachable: the app's
+// background save calls checkpoint_save_external without requiring a booted
+// guest, and the session-resume picker defers the boot until someone answers
+// it. ckpt_check_scope does refuse with "there is no guest running", but it
+// has to call task_snapshot_collect to learn that, and that call was the
+// crash. An empty list must READ as empty before boot, not fault.
+// init.c's list_init stays: re-initialising an empty list is a no-op, and it
+// still matters if the kernel is ever brought up twice.
+struct list alive_pids_list = LIST_INITIALIZER(alive_pids_list);
 
 void init_pending_queues(void) {
 // Initialize the pending deletion queues.  Tasks, memory and file descriptors (eventually)

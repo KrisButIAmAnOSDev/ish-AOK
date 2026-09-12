@@ -997,96 +997,52 @@ any repeated HTTPS handshake will do.
 
 ---
 
-### A checkpoint freeze can crash walking alive_pids_list
+### FIXED: a checkpoint save before the guest booted crashed on a NULL list head
 
-**Device, 2026-09-12, one occurrence, unrelated to sockets.** `EXC_BAD_ACCESS`
-at `0xfffffffffffffff8` in `task_snapshot_collect+172`, called from
-`checkpoint_save` <- `checkpoint_save_external` <- the background-save block.
-Resolved against the dylib's own symbol table, so the frame is real and not a
-nearest-exported-symbol guess.
+**Root-caused and fixed 2026-09-12.** Four device crashes, all
+`task_snapshot_collect+172`, `ldur x28, [x24, #-0x8]`,
+`KERN_INVALID_ADDRESS at 0xfffffffffffffff8`, always from the app's background
+save.
 
-The faulting instruction is `ldur x28, [x24, #-0x8]` -- `list_for_each_entry`
-computing `pid_entry` from a list node. Faulting at -8 from zero means the
-`->next` it followed was **NULL**, i.e. `alive_pids_list` was mutated under the
-walk. `task_snapshot_collect` (kernel/task.c:182) does take `pids_lock` with
-`complex_lockt`, and `task_unlink_locked` (kernel/task.c:737) does the
-`list_remove(&pid->alive)` -- its name asserts the lock is held. `exec.c:689`
-removes from the same list too. So either a remover runs without the lock, or
-`complex_lockt` is not the same exclusion the removers take.
+**The cause.** `alive_pids_list` was a bare global (`kernel/task.c`), so it
+started **NULL/NULL** and only became a valid empty list when
+`become_first_process` called `list_init` (`kernel/init.c:304`). But
+`list_for_each_entry` has no NULL check, so any walk before boot followed
+`next` into 0 and faulted on the FIRST iteration. `ckpt_check_scope` does have
+the right guard -- it refuses with "there is no guest running" when the
+snapshot is empty -- but it has to call `task_snapshot_collect` to learn that,
+and that call was the crash. The guard sat downstream of the fault.
 
-**Not a boot-timing window -- corrected 2026-09-12.** The first filing said it
-fired ~6s into boot. A later run waited **120 seconds** after boot before
-backgrounding and crashed identically, so that claim was wrong.
+**What made it reachable, and it was a regression of mine.** The app's
+background save (`AppDelegate.m`, `ISHSuspendGuardEnterBackground`) is gated on
+`shouldSuspendToDisk`, **not** on the guest being booted. The session-resume
+picker added earlier the same day defers `ensureBooted` while it waits for an
+answer (`TerminalViewController.m:464-467`). So once any session slot existed,
+every launch deferred the boot, and backgrounding fired a save against a kernel
+that had never come up. The first device run had no slot, booted normally, and
+saved 20 tasks and 24 sockets without incident -- which is why it looked
+intermittent.
 
-**What actually separates the runs.** Three device runs, same binary, same
-bundle version:
+**The fix** is one line: `alive_pids_list` (and
+`tasks_pending_deletion_queue`, the only other bare global head) are now
+`LIST_INITIALIZER`-initialised, so an empty list READS as empty from load.
+`init.c`'s `list_init` stays -- re-initialising an empty list is a no-op.
 
-| run | lines | tasks written | `swap:`/`zswap:` in log | outcome |
-|-----|-------|---------------|--------------------------|---------|
-| 1   | 882   | 20 (24 sockets) | present                | froze and described cleanly, no refusal |
-| 2   | 9     | 0               | absent                 | SIGSEGV |
-| 3   | 24    | 0               | absent                 | SIGSEGV |
+**Measured, same tree and build dir, only the declaration differing:**
 
-The run that worked had swap and zswap initialised and a native program parked
-(`native park: pid 17 described itself in 2349 bytes`); both crashing runs died
-before any of that reached the log. So the marker is **how far guest
-initialisation had got**, not how long the app had been up -- a save landing
-while tasks are still being created fits `task_snapshot_collect` walking
-`alive_pids_list` against `task_create_pid_`'s `list_add` (kernel/task.c:705).
+| binary | `ISH_CHECKPOINT_AFTER=0.001` x8 | result |
+|--------|--------------------------------|--------|
+| before | 8/8 **SIGSEGV** (rc 139)       | crash in the walk |
+| after  | 0/8                            | `refused (-3) there is no guest running` |
 
-The CLI does not reproduce it: an immediate save on a quiet guest writes its
-image in ~3s.
+The reproducer to keep: `ISH_CHECKPOINT_AFTER=<delay>:<path>` with a delay
+short enough to beat the boot. Driving `/proc/ish/checkpoint` instead exercises
+`checkpoint_save` from a guest task and cannot reach this at all -- which is
+why ~20 earlier attempts found nothing.
 
-**Blame is NOT yet established.** It has only ever been observed on builds
-carrying the socket restore rule, because no device save was ever run on
-b694c3716. The reasoning for calling it pre-existing is that the faulting
-instruction is a plain list walk with nothing socket-shaped in it -- but that
-is an argument, not a measurement, and the commit message that called it
-pre-existing overstated what was known.
-
-**The locking audit is DONE, and it came back clean.** Every mutation and every
-walk holds `pids_lock`: `task_create_pid_` (task.c:705), `task_unlink_locked`
-(task.c:737) via all three callers (`exit.c:692` inside do_exit's
-`complex_lockt` region, `fork.c:356`, `task.c:794`), `exec.c:689`, and both
-exit-path walkers (`pgrp_is_orphaned_locked` / `pgrp_has_stopped_member_locked`,
-reached from `do_exit` which takes the lock at its head). `complex_lockt` is a
-plain `pthread_mutex_lock` on the same mutex a bare `lock()` takes, so there is
-no exclusion gap between them. **So the NULL `->next` is NOT explained by a
-missing lock, and that hypothesis is spent.**
-
-**What the code does show.** `list_remove` (util/list.h:69) leaves a node
-**NULL/NULL**, while `list_init` leaves it pointing at itself, and
-`list_for_each_entry` stops only on `&item->member != (list)` -- it has **no
-NULL check**. Seven sites walk `alive_pids_list` with that macro. So any node
-reachable from the list with a NULL `next` faults the walk at
-`ldur x28, [x24, #-0x8]`. `task_unlink_locked` uses bare `list_remove` where
-the line above it uses `list_remove_safe`, and sets `pid->task = NULL` before
-the remove -- so `pid_empty` (which tests task/session/pgroup and never
-`alive`) already reports empty mid-unlink. That is a latent hazard worth
-hardening regardless of whether it is this crash.
-
-**The list-hardening fix was TRIED and did NOT resolve it (2026-09-12).**
-Commit `91e2f1d17` made both `alive_pids_list` unlink sites leave `pid->alive`
-self-pointing instead of NULL, on the reasoning that the faulting instruction
-is exactly that NULL walk. Built for the device, installed, and run: the app
-still died with SIGSEGV and **0 tasks written**, producing a fourth crash
-report. So either the NULL node arrives from a path neither unlink site covers,
-or the leaf symbol has been misleading and the fault is elsewhere. The fix is
-kept -- it closes a real hazard and breaks nothing (0 failures, external-save
-path 6/6) -- but it is not the cure.
-
-**No reproducer yet, and the obvious ones are exhausted.** `ISH_CHECKPOINT_AFTER=<delay>:<path>`
-(main.c:451) fires `checkpoint_save_external` from a **host thread** -- the
-app's exact path, and the one to use; driving it through
-`/proc/ish/checkpoint` exercises `checkpoint_save` instead and proves nothing
-about this. With that knob: 8/8 clean under heavy fork churn, 8/8 images
-written. The device differs by having ~20 daemons, swap and zswap up, native
-programs parked, and a real root -- one of those is the missing ingredient.
-
-**Next step.** Harden the walk rather than keep hunting: either give
-`list_for_each_entry` a NULL-safe form for these seven sites, or make
-`task_unlink_locked` re-init `pid->alive` instead of leaving it NULL. Both are
-cheap and neither needs the reproducer. Then re-test on device.
+**Still worth doing:** gate the background save on the guest actually being
+booted, so it refuses cleanly rather than relying on the scope check; and the
+`list_remove`/`list_for_each_entry` NULL class below.
 
 ### list_remove leaves a NULL node and the walk macro has no NULL check
 
