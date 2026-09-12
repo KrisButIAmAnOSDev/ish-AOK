@@ -259,9 +259,18 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey]) {
-        [NSUserDefaults.standardUserDefaults setBool:NO forKey:kPreferenceOpenDiagnosticsOnLaunchKey];
-    }
+    // Deliberately NOT cleared here any more.
+    //
+    // This is a SWITCH in the iOS Settings app, and a switch that turns itself
+    // off the first time it works is a switch that does not work: set it, get
+    // Diagnostics once, relaunch expecting Diagnostics, get the shell. Reported
+    // exactly that way. A switch stays where it was put until it is moved.
+    //
+    // The disarm it used to do was protection against getting stuck in
+    // Diagnostics -- but the control lives OUTSIDE the app, in Settings, so it
+    // can always be turned off no matter what state iSH-AOK itself is in.
+    // That is the whole reason this preference is in Settings rather than in
+    // the app's own UI.
 }
 
 // The Refresh button. The ONLY thing that replaces the text after the first

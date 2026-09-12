@@ -299,7 +299,17 @@ static void ConfigureTerminalViewController(SceneDelegate *delegate, TerminalVie
     EnsureSceneWindow(self, scene);
     NSUserActivity *requestedActivity = SceneEffectiveRequestedActivity(session, connectionOptions);
 
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey]) {
+    BOOL wantsDiagnostics =
+        [NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey];
+    // Recorded either way. "I set Open Diagnostics On Launch and got the shell"
+    // is otherwise unanswerable: the preference is written by the iOS Settings
+    // app and read here, and nothing in between says what this launch actually
+    // saw. A crash during willFinishLaunching (the boot, and the restore) also
+    // means this line is never reached at all -- which is itself the answer,
+    // and shows up as this stage being absent.
+    [ISHDiagnosticsStore recordLaunchStage:@"scene.diagnosticsPreference"
+                                   details:@{@"openDiagnosticsOnLaunch": @(wantsDiagnostics)}];
+    if (wantsDiagnostics) {
         [ISHDiagnosticsStore recordLaunchStage:@"scene.rootController.diagnostics"
                                        details:@{@"session": session.persistentIdentifier ?: @""}];
         self.window.rootViewController = ISHCreateAboutNavigationController(NO, YES);

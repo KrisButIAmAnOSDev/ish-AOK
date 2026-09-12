@@ -368,6 +368,19 @@ static uint64_t ckpt_fingerprint(void) {
 // because kernel/calls.c consults it on EVERY syscall return: the common
 // answer is "no" and it must cost a relaxed load and a branch.
 static _Atomic int ckpt_freeze_active;
+// Raised while a RESTORE holds its tasks, as distinct from a save's freeze.
+//
+// Both raise ckpt_freeze_active -- a restored task parks in the same place a
+// checkpointed one does, which is the point. But the two want opposite things
+// from a native program: a save needs it to describe itself, while a restore
+// is putting state IN and has nothing to ask. Worse, the program being parked
+// during a restore is one that has just been re-launched and may be a few
+// instructions into its own startup, with none of the structures a dump reads
+// built yet. That crashed on a device: a re-launched zsh reached its first
+// syscall inside parseopts, parked, and was asked to serialise itself --
+// aok_run_state_script read sigtrapped[SIGDEBUG] with sigtrapped still NULL,
+// which is the 0x80 in the report.
+static _Atomic int ckpt_restoring;
 // The parking lot. A leaf lock -- nothing is ever taken under it.
 static pthread_mutex_t ckpt_park_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ckpt_park_cond = PTHREAD_COND_INITIALIZER;
@@ -449,8 +462,11 @@ void checkpoint_native_park(void) {
     // A program with no ckpt_dump leaves this NULL, and ckpt_check_scope has
     // already refused on its behalf -- so reaching here with nothing is the
     // freeze that was allowed to start, not a silent loss.
+    // Never during a restore: see ckpt_restoring. The task still parks below,
+    // which is all the restore actually wants from it.
     const struct native_program *prog = native_program_running(current);
-    if (prog != NULL && prog->ckpt_dump != NULL &&
+    if (atomic_load_explicit(&ckpt_restoring, memory_order_acquire) == 0 &&
+            prog != NULL && prog->ckpt_dump != NULL &&
             current->ckpt_native_state == NULL) {
         ckpt_dumping = true;
         current->ckpt_native_state = prog->ckpt_dump();
@@ -2446,6 +2462,7 @@ int checkpoint_restore(const char *host_path) {
     // Every task exists and is complete; now let them go. The freezer's own
     // parking lot does the releasing, so a restored task and a checkpointed
     // one wait in exactly the same place.
+    atomic_fetch_add_explicit(&ckpt_restoring, 1, memory_order_acq_rel);
     atomic_fetch_add_explicit(&ckpt_freeze_active, 1, memory_order_acq_rel);
     for (unsigned i = 1; i < nbuilt; i++) {
         if (built[i]->zombie)
@@ -2455,10 +2472,12 @@ int checkpoint_restore(const char *host_path) {
             ckpt_refuse("could not start restored pid %d", built[i]->pid);
             err = _EAGAIN;
             ckpt_thaw_all();
+    atomic_fetch_sub_explicit(&ckpt_restoring, 1, memory_order_acq_rel);
             goto out;
         }
     }
     ckpt_thaw_all();
+    atomic_fetch_sub_explicit(&ckpt_restoring, 1, memory_order_acq_rel);
 
     // Nudge each restored terminal into redrawing.
     //
