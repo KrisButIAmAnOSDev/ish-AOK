@@ -1065,6 +1065,16 @@ the remove -- so `pid_empty` (which tests task/session/pgroup and never
 `alive`) already reports empty mid-unlink. That is a latent hazard worth
 hardening regardless of whether it is this crash.
 
+**The list-hardening fix was TRIED and did NOT resolve it (2026-09-12).**
+Commit `91e2f1d17` made both `alive_pids_list` unlink sites leave `pid->alive`
+self-pointing instead of NULL, on the reasoning that the faulting instruction
+is exactly that NULL walk. Built for the device, installed, and run: the app
+still died with SIGSEGV and **0 tasks written**, producing a fourth crash
+report. So either the NULL node arrives from a path neither unlink site covers,
+or the leaf symbol has been misleading and the fault is elsewhere. The fix is
+kept -- it closes a real hazard and breaks nothing (0 failures, external-save
+path 6/6) -- but it is not the cure.
+
 **No reproducer yet, and the obvious ones are exhausted.** `ISH_CHECKPOINT_AFTER=<delay>:<path>`
 (main.c:451) fires `checkpoint_save_external` from a **host thread** -- the
 app's exact path, and the one to use; driving it through
