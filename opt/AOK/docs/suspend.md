@@ -99,6 +99,13 @@ refusal names the process and the reason, in `/proc/ish/checkpoint`:
 A refusal costs nothing: the session carries on exactly as it was. A save is a
 copy, and the machine is stopped only for as long as it takes to write one.
 
+**A resumed session starts with a blank screen.** Press Return and your prompt
+appears. Nothing has been lost: a checkpoint saves the machine, not the
+picture of it. The shell printed its prompt before the suspend, and it has no
+reason to print it again -- so the terminal is a fresh, empty window attached
+to a shell that is exactly where you left it. Anything you type goes to the
+session you saved.
+
 **Sockets are rebuilt, not copied.** A socket belongs to the process that owns
 it and cannot outlive it -- on iOS it does not even outlive a suspension, since
 the system tears connected sockets down while the app is frozen. So what
