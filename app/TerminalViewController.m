@@ -1761,8 +1761,15 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 	    // that would create a second shell, which is what the user saw when this
 	    // was missing: a fresh prompt in the window, and the session they
 	    // suspended alive and unreachable on the console.
+	    // Ask for THIS window's session, not merely the next one in the queue.
+	    // In Workspace mode several windows resume at once, and two terminals
+	    // coming back swapped reads as a failure even though both are alive --
+	    // one of them may be the Session Shell (the admin surface) and the
+	    // other an ordinary login. desiredRestoredSessionPid is set by the
+	    // workspace host from the pid it recorded in the saved layout; 0 (the
+	    // full-screen terminal) means "any", which is the old behaviour.
 	    struct checkpoint_restored_session restored;
-	    if (checkpoint_take_restored_session(&restored)) {
+	    if (checkpoint_take_restored_session_for_pid(self.desiredRestoredSessionPid, &restored)) {
 	        Terminal *terminal = (__bridge Terminal *) restored.terminal;
 	        if (terminal != nil) {
 	            self.sessionTerminal = terminal;

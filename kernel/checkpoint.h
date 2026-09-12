@@ -122,6 +122,13 @@ struct checkpoint_restored_session {
 // image had them. Returns 1 and fills `out`, or 0 when there are none left;
 // each is handed out exactly once.
 int checkpoint_take_restored_session(struct checkpoint_restored_session *out);
+// Take the restored session whose session leader is `leader_pid`, falling back
+// to the next one in the queue when there is no such session. A window that
+// was showing a particular shell before the suspend asks for that shell back:
+// the pts NUMBER is not stable across a restore (the restore makes fresh
+// ptys), but the leader pid is, because the checkpoint restores pids.
+int checkpoint_take_restored_session_for_pid(int leader_pid,
+                                            struct checkpoint_restored_session *out);
 
 // Traces a restored task's first few syscalls when ISH_CHECKPOINT_DEBUG is on.
 void checkpoint_trace_syscall(unsigned long nr);

@@ -1611,6 +1611,38 @@ void checkpoint_trace_syscall(unsigned long nr) {
             current->pid, current->comm, nr);
 }
 
+int checkpoint_take_restored_session_for_pid(int leader_pid,
+                                            struct checkpoint_restored_session *out) {
+    int got = 0;
+    lock(&ckpt_lock, 0);
+    // Exact match first: the window that was showing this shell gets this
+    // shell back, not whichever session happens to be next in the queue. Two
+    // terminals coming back swapped is a small wrong that reads as a big one,
+    // because one of them may be the Session Shell (the admin surface) while
+    // the other is an ordinary login.
+    for (unsigned i = ckpt_session_taken; i < ckpt_session_count; i++) {
+        if (leader_pid > 0 && ckpt_sessions[i].leader_pid != leader_pid)
+            continue;
+        *out = ckpt_sessions[i];
+        // Keep the queue contiguous: swap the one just taken to the front of
+        // the untaken range, so the plain take() below stays correct.
+        ckpt_sessions[i] = ckpt_sessions[ckpt_session_taken];
+        ckpt_session_taken++;
+        got = 1;
+        break;
+    }
+    unsigned count = ckpt_session_count, taken = ckpt_session_taken;
+    unlock(&ckpt_lock);
+    CKPT_TRACE("UI asked for restored session pid %d: %s (%u of %u taken)\n",
+               leader_pid, got ? "handed it over" : "no match", taken, count);
+    if (got)
+        return 1;
+    // No session with that leader -- it may not have been saved, or this is a
+    // window that had no session at all. Fall back to the queue order rather
+    // than leaving the window empty.
+    return checkpoint_take_restored_session(out);
+}
+
 int checkpoint_take_restored_session(struct checkpoint_restored_session *out) {
     int got = 0;
     lock(&ckpt_lock, 0);

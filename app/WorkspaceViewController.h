@@ -36,6 +36,15 @@ extern NSString *_Nullable ISHWorkspaceToolIdentifierForViewController(UIViewCon
 // NSUserDefaults, so it must contain only plist types and stay small.
 // Restore is called after viewDidLoad, when the window is recreated from a
 // saved layout.
+// Capture the live Workspace arrangement into the saved layout, as part of
+// taking a checkpoint.
+//
+// A checkpoint saves the guest; windows and applets are app state, and the two
+// have to be captured in the same act or they describe different machines. A
+// no-op when no Workspace is on screen (shell mode), which leaves any earlier
+// layout untouched rather than clearing it.
+void ISHWorkspaceCaptureLayoutForSuspend(void);
+
 @protocol WorkspaceStatefulTool <NSObject>
 - (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving;
 - (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state;

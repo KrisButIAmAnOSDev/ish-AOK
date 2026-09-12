@@ -2591,6 +2591,11 @@ int ISHSuspendSessionSaveNow(void) {
     NSString *image = ISHSuspendSessionImagePath();
     if (image == nil)
         return _ENOENT;
+    // The windows, in the same act as the guest. A checkpoint that describes
+    // the processes but not the arrangement showing them comes back as a
+    // running machine nobody can see -- which is exactly what a Workspace
+    // suspend did before this: every shell alive, no terminals on screen.
+    ISHWorkspaceCaptureLayoutForSuspend();
     return checkpoint_save_external(image.fileSystemRepresentation);
 }
 
@@ -2612,6 +2617,7 @@ int ISHSuspendSessionSuspendAndExit(void) {
     NSString *image = ISHSuspendSessionImagePath();
     if (image == nil)
         return _ENOENT;
+    ISHWorkspaceCaptureLayoutForSuspend();
     int err = checkpoint_save_external(image.fileSystemRepresentation);
     if (err < 0)
         return err;
@@ -4174,6 +4180,10 @@ void ISHSuspendGuardEnterBackground(void) {
                     saveTask = UIBackgroundTaskInvalid;
                 }
             }];
+            // Captured on the way OUT of the main thread, before the work is
+            // handed to the background queue: the arrangement is UIKit state
+            // and this is the last moment it is certainly quiescent.
+            ISHWorkspaceCaptureLayoutForSuspend();
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 int cerr = checkpoint_save_external(image.fileSystemRepresentation);
                 struct checkpoint_status ck;

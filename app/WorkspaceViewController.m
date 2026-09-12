@@ -137,6 +137,7 @@ static NSString *const ISHWorkspaceToolDisplayIdentifier = @"display";
 // get -- "there is no Workspace" rather than a dangling one.
 static __weak WorkspaceViewController *ISHWorkspaceActiveController = nil;
 
+
 // Every tool a guest may name. The guest gets this list by reading
 // /proc/ish/workspace, and anything not on it is refused: a guest asking the
 // app to put something on screen must only be able to ask for things that were
@@ -3385,6 +3386,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             descriptor[@"sessionTerminalUUID"] = sessionTerminalUUID.UUIDString;
         if (terminalRole.length > 0)
             descriptor[@"terminalRole"] = terminalRole;
+        // The session leader pid -- the only identifier for this window's shell
+        // that survives a suspend to disk. The Terminal UUID above dies with
+        // the process and the restore hands out fresh pts numbers, but the
+        // checkpoint restores pids, so this is what lets the window ask for
+        // its OWN shell back rather than whichever one is next in the queue.
+        int sessionPid = windowView.hostedTerminalViewController.sessionPid;
+        if (sessionPid > 0)
+            descriptor[@"sessionPid"] = @(sessionPid);
         CGFloat overrideFontSize = windowView.hostedTerminalViewController.overrideFontSize;
         if (overrideFontSize > 0)
             descriptor[@"fontSize"] = @(overrideFontSize);
@@ -3483,7 +3492,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 
 - (ISHWorkspaceContainedWindowView *)restoreDesktopTerminalWindowWithSessionUUID:(NSUUID *)sessionTerminalUUID
                                                              displayTerminalUUID:(NSUUID *)displayTerminalUUID
-                                                                   terminalRole:(NSString *)terminalRole {
+                                                                   terminalRole:(NSString *)terminalRole
+                                                                      sessionPid:(int)sessionPid {
     if (displayTerminalUUID == nil && sessionTerminalUUID == nil)
         return nil;
 
@@ -3526,6 +3536,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     // fresh session, and a restored Session Shell window has to come back as root.
     terminalViewController.alwaysLoginAsRoot =
         [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSessionShell];
+    // Which shell this window was showing before a suspend, by leader pid.
+    // Set BEFORE reconnect, because that is what starts the session and the
+    // session is what claims a restored one. 0 when the layout predates this
+    // or the window had no session, which falls back to queue order.
+    terminalViewController.desiredRestoredSessionPid = sessionPid;
     ISHWorkspaceContainedWindowView *windowView =
         [self openDesktopTerminalWindowWithTitle:title terminalViewController:terminalViewController];
     [terminalViewController reconnectSessionFromTerminalUUID:restoreUUID];
@@ -3766,7 +3781,16 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }
+    [self applySavedWorkspaceLayout:layout];
+}
 
+// The silent core of the restore above.
+//
+// Split out because a resume has to do exactly this and must NOT do the rest:
+// no "No Saved Layout" alert, because a resume is not a request -- nobody
+// asked, and an alert at launch would be an error message for something that
+// merely has nothing to put back.
+- (void)applySavedWorkspaceLayout:(NSArray<NSDictionary<NSString *, id> *> *)layout {
     NSDictionary<NSString *, id> *dashboardDescriptor = nil;
     NSDictionary<NSString *, id> *dockDescriptor = nil;
     NSMutableArray<NSDictionary<NSString *, id> *> *windowDescriptors = [NSMutableArray array];
@@ -3826,7 +3850,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             ISHWorkspaceContainedWindowView *windowView =
                 [self restoreDesktopTerminalWindowWithSessionUUID:(sessionTerminalUUID ?: displayTerminalUUID)
                                               displayTerminalUUID:displayTerminalUUID
-                                                    terminalRole:terminalRole];
+                                                    terminalRole:terminalRole
+                                                      sessionPid:[descriptor[@"sessionPid"] intValue]];
             if (windowView != nil) {
                 if ([deduplicatedTerminalRoles containsObject:terminalRole])
                     [restoredTerminalRoles addObject:terminalRole];
@@ -5349,6 +5374,20 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         self.didEnsureDefaultWorkspaceUtilities = YES;
         NSArray<NSDictionary<NSString *, id> *> *savedLayout = [self savedWorkspaceLayoutForCurrentScene];
         BOOL hasSavedLayout = [savedLayout isKindOfClass:NSArray.class] && savedLayout.count > 0;
+        // Did this launch resume a suspended session? Then the guest is
+        // ALREADY RUNNING, and the arrangement that was showing it has to come
+        // back with it -- terminals included. Without this the restore
+        // published its sessions and nothing ever claimed them: a device
+        // suspend-and-exit in Workspace mode came back with the shells alive
+        // and not one terminal on screen, which reads as total data loss.
+        //
+        // applySavedWorkspaceLayout ends by opening the default utilities
+        // itself, so the branch below is the ordinary not-resuming launch.
+        struct checkpoint_status resumeStatus;
+        checkpoint_get_status(&resumeStatus);
+        if (resumeStatus.restored && hasSavedLayout) {
+            [self applySavedWorkspaceLayout:savedLayout];
+        } else {
         [self ensureDefaultWorkspaceUtilitiesOpen];
         // Honor a saved arrangement: don't force the LLM chat back open if it was closed before
         // saving, and reopen the Launcher (at its saved spot) if it was shown on the desktop.
@@ -5363,6 +5402,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                fallbackSize:ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolLauncherIdentifier)];
         }
         [self applyDesktopVisibility];
+        }
     }
     if (self.dockWindow != nil) {
         [self applyInitialPlacementToDockWindow:self.dockWindow];
@@ -13954,3 +13994,23 @@ static int ISHWorkspaceOpenImpl(const char *request) {
     ish_workspace_open = ISHWorkspaceOpenImpl;
 }
 @end
+
+void ISHWorkspaceCaptureLayoutForSuspend(void) {
+    WorkspaceViewController *workspace = ISHWorkspaceActiveController;
+    if (workspace == nil)
+        return;   // shell mode: nothing on screen to describe
+    // Defined at the END of this file on purpose: it sends saveWorkspaceLayout:
+// and that selector is not visible until after @implementation.
+// UIKit, so main. Synchronous on purpose: this runs immediately BEFORE
+    // checkpoint_save_external, and a layout captured after the guest is
+    // frozen -- or after the app has exited -- describes a different machine
+    // than the image does. Nothing is holding the main thread at this point;
+    // the freeze has not started yet.
+    if (NSThread.isMainThread) {
+        [workspace saveWorkspaceLayout:nil];
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [workspace saveWorkspaceLayout:nil];
+        });
+    }
+}

@@ -25,6 +25,17 @@ typedef NS_ENUM(NSInteger, ISHFreshSessionTerminalDisplayMode) {
 - (void)reconnectSessionFromTerminalUUID:(NSUUID *)uuid;
 - (void)focusTerminal;
 @property (readonly) NSUUID *sessionTerminalUUID; // 0 means invalid
+// The session leader's pid, or 0 when there is no session. This is the ONLY
+// identifier for a session that survives a suspend to disk: a Terminal's UUID
+// dies with the process, and the restore hands out fresh pts numbers, but the
+// checkpoint restores pids. The workspace records it in its saved layout so a
+// window can ask for its own shell back.
+@property (readonly) int sessionPid;
+// Set before a session starts to ask for a particular restored session (by the
+// leader pid recorded in the saved layout). 0 means "any". Falls back to the
+// next session in the queue when there is no such session -- see
+// checkpoint_take_restored_session_for_pid.
+@property (nonatomic) int desiredRestoredSessionPid;
 @property UISceneSession *sceneSession API_AVAILABLE(ios(13.0));
 @property (nonatomic) BOOL showsWorkspaceDashboardButton;
 @property (nonatomic) BOOL embeddedInWorkspaceWindow;
