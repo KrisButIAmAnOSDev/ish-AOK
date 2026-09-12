@@ -997,6 +997,32 @@ any repeated HTTPS handshake will do.
 
 ---
 
+### A checkpoint freeze can crash walking alive_pids_list
+
+**Device, 2026-09-12, one occurrence, unrelated to sockets.** `EXC_BAD_ACCESS`
+at `0xfffffffffffffff8` in `task_snapshot_collect+172`, called from
+`checkpoint_save` <- `checkpoint_save_external` <- the background-save block.
+Resolved against the dylib's own symbol table, so the frame is real and not a
+nearest-exported-symbol guess.
+
+The faulting instruction is `ldur x28, [x24, #-0x8]` -- `list_for_each_entry`
+computing `pid_entry` from a list node. Faulting at -8 from zero means the
+`->next` it followed was **NULL**, i.e. `alive_pids_list` was mutated under the
+walk. `task_snapshot_collect` (kernel/task.c:182) does take `pids_lock` with
+`complex_lockt`, and `task_unlink_locked` (kernel/task.c:737) does the
+`list_remove(&pid->alive)` -- its name asserts the lock is held. `exec.c:689`
+removes from the same list too. So either a remover runs without the lock, or
+`complex_lockt` is not the same exclusion the removers take.
+
+**It fired on a guest ~6 seconds into boot**, with 20 daemons starting, when a
+save was triggered by backgrounding the app. The CLI does not reproduce it: an
+immediate save on a quiet guest writes its image in ~3s.
+
+**Next step.** Audit every `alive_pids_list` mutation for the lock it holds
+(`kernel/task.c:705`, `:737`, `kernel/exec.c:689`) against what
+`complex_lockt(&pids_lock)` actually excludes. A save fired during boot is the
+reproducer to aim for.
+
 ## Deferred on purpose
 
 ### Suspend and Exit terminates the app, which the HIG discourages
