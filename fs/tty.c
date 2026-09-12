@@ -1643,6 +1643,32 @@ static int tty_ioctl(struct fd *fd, int cmd, void *arg) {
     return err;
 }
 
+// Signal the foreground process group of a terminal.
+//
+// Deliberately NOT sharing tty_set_winsize's copy of this walk below, because
+// the locking has to differ: that one runs on the UI thread on every window
+// resize and uses trylock, so a contended moment silently skips a redraw that
+// the next resize will repeat anyway. This runs once at the end of a restore,
+// where skipping is not recoverable -- nothing will ask again -- so it waits
+// for the lock.
+void tty_signal_fg_group(struct tty *tty, int sig) {
+    if (tty == NULL)
+        return;
+    lock(&tty->lock, 0);
+    dword_t fg = tty->fg_group;
+    unlock(&tty->lock);
+    if (fg == 0)
+        return;
+    complex_lockt(&pids_lock, 0);
+    struct pid *pid = pid_get(fg);
+    if (pid != NULL) {
+        struct tgroup *tgroup;
+        list_for_each_entry(&pid->pgroup, tgroup, pgroup)
+            send_signal(tgroup->leader, sig, SIGINFO_NIL);
+    }
+    unlock(&pids_lock);
+}
+
 void tty_set_winsize(struct tty *tty, struct winsize_ winsize) {
     if (winsize.row == 0 || winsize.col == 0)
         return;

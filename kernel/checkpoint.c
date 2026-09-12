@@ -2408,6 +2408,27 @@ int checkpoint_restore(const char *host_path) {
     }
     ckpt_thaw_all();
 
+    // Nudge each restored terminal into redrawing.
+    //
+    // A checkpoint saves the machine, not the picture of it: the shell printed
+    // its prompt before the suspend and has no reason to print it again, so a
+    // resumed session came back as a blank window attached to a perfectly
+    // healthy shell. The first person to use this read that as the terminals
+    // having been lost, which is a bad thing for a restore to look like.
+    //
+    // SIGWINCH is the honest signal for it -- the terminal really is a new
+    // window -- and redrawing on one is what a line editor already does:
+    // zsh's zle and readline both reprint the prompt line. A shell with no
+    // line editor (dash) still will not, because it only prints a prompt after
+    // reading a line; pressing Return remains the answer there.
+    //
+    // After the thaw, because a frozen task cannot take a signal, and before
+    // ckpt_lock is taken, so this never holds two locks at once.
+    for (uint32_t i = 0; i < st.set_count; i++) {
+        if (st.sets[i].tty != NULL)
+            tty_signal_fg_group(st.sets[i].tty, SIGWINCH_);
+    }
+
     lock(&ckpt_lock, 0);
     // Hand the restored sessions to the UI. Published only on success: a
     // restore that failed half way leaves tasks that are about to be torn
