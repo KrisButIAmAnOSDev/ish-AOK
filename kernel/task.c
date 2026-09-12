@@ -733,8 +733,24 @@ void task_unlink_locked(struct task *task) {
     list_remove(&task->siblings);
     list_remove_safe(&task->ptrace_siblings);
     struct pid *pid = pid_get(task->pid);
+    // pid_get returns NULL for a pid it considers empty, and pid_empty is
+    // satisfied by `task == NULL` alone once session and pgroup are gone -- so
+    // a second unlink of the same task arrives here with nothing to unlink.
+    if (pid == NULL)
+        return;
     pid->task = NULL;
+    // Re-init rather than leave it NULL. list_remove sets next and prev to
+    // NULL (util/list.h), list_init leaves a node pointing at itself, and
+    // list_for_each_entry stops only on `&item->member != (list)` -- it has no
+    // NULL check, and SEVEN sites walk alive_pids_list with it. A node left
+    // NULL is therefore a live hazard for every one of those walks: the walk
+    // follows `next` into 0 and the container_of subtraction faults at
+    // 0xfffffffffffffff8, which is the shape of the device checkpoint crash in
+    // docs/TODO.md. Self-pointing is the state list_init already gives a fresh
+    // pid (task_create_pid_), and nothing reads this node's emptiness --
+    // pid_empty tests task/session/pgroup and never `alive`.
     list_remove(&pid->alive);
+    list_init(&pid->alive);
 }
 
 static void task_free_final(struct task *task) {

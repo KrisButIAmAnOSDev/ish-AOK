@@ -686,7 +686,11 @@ static void exec_de_thread(void) {
     struct pid *own = pid_get(current->pid);
     if (own != NULL && own->task == current) {
         own->task = NULL;
+        // Self-pointing, not NULL -- see the matching comment in
+        // task_unlink_locked. list_for_each_entry has no NULL check and seven
+        // sites walk alive_pids_list with it.
         list_remove(&own->alive);
+        list_init(&own->alive);
     }
     // ...and take the leader's, which is this process's pid. Session and
     // process-group membership hang off struct pid, so they travel with it.
