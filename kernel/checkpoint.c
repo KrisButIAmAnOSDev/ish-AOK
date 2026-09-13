@@ -1796,7 +1796,24 @@ static struct ckpt_stdio_set *ckpt_stdio_set_for(struct ckpt_restore_state *st,
                              ? (int) h->console_minor : rec->tty_num);
         CKPT_TRACE("pid %u came back on %s\n", rec->pid, set->path);
     } else {
+        // create_piped_stdio wraps the host's OWN descriptors 0, 1 and 2, and
+        // these struct fds are closed when the restore lets go of the set --
+        // which, for a process the image then gives /dev/null, is the last
+        // reference. That closed the host's stdin, stdout and stderr outright,
+        // the numbers were handed straight to the next fakefs open, and every
+        // later write to "stdout" landed on busybox or ld-musl instead: the
+        // restored session printed nothing, and its writes failed with the -1
+        // a host write() returns, which the guest reads as EPERM. Hand the
+        // restore its own copies, above 2, so closing them closes nothing else.
         create_piped_stdio();
+        for (int i = 0; i < 3; i++) {
+            struct fd *piped = current->files->files[i];
+            if (piped == NULL || piped->real_fd != i)
+                continue;
+            int copy = fcntl(i, F_DUPFD_CLOEXEC, 3);
+            if (copy >= 0)
+                piped->real_fd = copy;
+        }
     }
 
     lock(&files->lock, 0);

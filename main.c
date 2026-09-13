@@ -387,80 +387,82 @@ static void *quiesce_test_thread(void *arg) {
 }
 
 
-// ---- a2 TEMPORARY: ISH_CLI_PTY, a session on a pseudo-terminal ------------
-#include "fs/tty.h"
-
 // ---- ISH_CLI_PTY: a session on a PSEUDO-terminal, from the command line ----
 //
 // The iOS app's shape -- a Terminal object owns the master side -- made
 // reachable from the CLI. Without it the CLI runs its command as init on the
 // console, and kernel/checkpoint.c's CKPT_TTY_PTS restore path (sessions,
 // controlling terminals, foreground process groups -- everything job control
-// touches) cannot be exercised outside the app at all. That made every restore
-// bug a four-minute round trip through the simulator UI, which is a bad price
-// for a class of bug that lives exactly here.
+// touches) cannot be exercised outside the app. That made every restore bug a
+// four-minute round trip through the simulator UI.
 //
-// Write-only on purpose. The master just mirrors guest output to stderr, which
-// is enough to watch a restored session work or fail, and it keeps a reader
-// thread from competing with the CLI's own stdin. Only .write is mandatory:
-// fs/tty.c NULL-checks init/open/cleanup.
-static int cli_pty_write(struct tty *tty, const void *buf, size_t len,
-                         bool blocking) {
-    (void) tty;
-    (void) blocking;
-    ssize_t written = write(STDERR_FILENO, buf, len);
-    (void) written;
-    return (int) len;
+// The master side is THIS process: guest output goes to stdout, and a reader
+// thread feeds stdin into the terminal a byte at a time, so a full-screen
+// program (ktop, an editor) can be driven by typing. For that the invoking
+// terminal is put into raw mode -- and put BACK on exit, because leaving
+// someone's shell raw is not a debugging aid. Only .write is mandatory to
+// fs/tty.c; .init is where the reader starts.
+static struct termios cli_pty_saved_termios;
+static bool cli_pty_termios_saved;
+
+static void cli_pty_restore_host_terminal(void) {
+    if (cli_pty_termios_saved)
+        tcsetattr(STDIN_FILENO, TCSANOW, &cli_pty_saved_termios);
 }
 
-static struct tty_driver_ops cli_pty_ops = { .write = cli_pty_write };
-static struct tty_driver cli_pty_driver = { .ops = &cli_pty_ops };
-
-static struct tty *cli_pty_open_session(void) {
-    return pty_open_fake(&cli_pty_driver);
-}
-static void *a2_pty_read_thread(void *_tty) {
-    struct tty *tty = _tty;
-    char ch;
+static void *cli_pty_read_thread(void *opaque) {
+    struct tty *tty = opaque;
     int in = dup(STDIN_FILENO);
-    if (in < 0) in = STDIN_FILENO;
+    if (in < 0)
+        in = STDIN_FILENO;
+    char ch;
     for (;;) {
         ssize_t n = read(in, &ch, 1);
-        if (n != 1) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) { usleep(10000); continue; }
-            for (;;) pause();
+        if (n == 1) {
+            tty_input(tty, &ch, 1, 0);
+            continue;
         }
-        tty_input(tty, &ch, 1, 0);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            usleep(10000);
+            continue;
+        }
+        // EOF (stdin is /dev/null, or a pipe that closed): nothing more will
+        // ever arrive, so stop reading rather than spinning on it.
+        return NULL;
     }
-    return NULL;
 }
-static struct termios a2_old_termios;
-static int a2_pty_init(struct tty *tty) {
+
+static int cli_pty_init(struct tty *tty) {
     struct winsize winsz;
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz) == 0) {
         tty->winsize.col = winsz.ws_col;
         tty->winsize.row = winsz.ws_row;
     }
-    if (tcgetattr(STDIN_FILENO, &a2_old_termios) == 0) {
-        struct termios raw = a2_old_termios;
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &cli_pty_saved_termios) == 0) {
+        cli_pty_termios_saved = true;
+        atexit(cli_pty_restore_host_terminal);
+        struct termios raw = cli_pty_saved_termios;
         cfmakeraw(&raw);
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     }
     pthread_t th;
-    if (pthread_create(&th, NULL, a2_pty_read_thread, tty) != 0)
+    if (pthread_create(&th, NULL, cli_pty_read_thread, tty) != 0)
         return _EIO;
     pthread_detach(th);
     return 0;
 }
-static int a2_pty_write(struct tty *UNUSED(tty), const void *buf, size_t len, bool UNUSED(b)) {
+
+static int cli_pty_write(struct tty *UNUSED(tty), const void *buf, size_t len,
+                         bool UNUSED(blocking)) {
     return (int) write(STDOUT_FILENO, buf, len);
 }
-static struct tty_driver_ops a2_pty_ops = { .init = a2_pty_init, .write = a2_pty_write };
-static struct tty_driver a2_pty_driver = {.ops = &a2_pty_ops};
-static struct tty *a2_pty_open_session(void) {
-    struct tty *tty = pty_open_fake(&a2_pty_driver);
-    if (IS_ERR(tty)) return NULL;
-    return tty;
+
+static struct tty_driver_ops cli_pty_ops = { .init = cli_pty_init, .write = cli_pty_write };
+static struct tty_driver cli_pty_driver = { .ops = &cli_pty_ops };
+
+static struct tty *cli_pty_open_session(void) {
+    struct tty *tty = pty_open_fake(&cli_pty_driver);
+    return IS_ERR(tty) ? NULL : tty;
 }
 
 int main(int argc, char *const argv[]) {
@@ -554,10 +556,6 @@ int main(int argc, char *const argv[]) {
                 cli_checkpoint_path = at;
             }
         }
-    }
-    if (getenv("ISH_CLI_PTY") != NULL) {
-        cli_session_tty_open = a2_pty_open_session;
-        checkpoint_open_session_tty = a2_pty_open_session;
     }
     halt_hook = cli_halt;
     // hle_stats_dump runs from cli_halt, after guest teardown has closed the
