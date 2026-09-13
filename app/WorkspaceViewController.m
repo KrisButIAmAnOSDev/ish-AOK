@@ -1001,36 +1001,52 @@ static CGFloat ISHWorkspaceAudioWindowWidth(void) {
     return ISHWorkspaceAudioDeviceWidth() + 12.0;  // 6pt margin each side
 }
 
+// Each size is the WINDOW frame, the 24pt title bar included, and is meant to
+// show the applet's default display without clipping (measured 2026-09-13 by
+// opening every applet at its default on an iPhone 17 Pro and an iPad Pro 13"
+// simulator). Scroll-view applets may be shorter than their content; nothing
+// else may be. Placement clamps a default to the usable area, so a width that
+// is too wide for a smaller phone simply shrinks to fit.
 static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
+        // Time, the full date and the zone line. At 144x74 the date wrapped to
+        // two lines, the title bar covered the top of the time and the zone
+        // line was cut off.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-            return CGSizeMake(144, 74);
+            return CGSizeMake(220, 140);
+        // Wide enough that "Unavailable" and "478.42 GB free" stop breaking
+        // mid-word, tall enough for the Root/Startup row under them.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
-            return CGSizeMake(280, 154);
+            return CGSizeMake(368, 176);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
             return ISHWorkspaceMonitorContentSize();
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
-            return CGSizeMake(328, 176);
+            return CGSizeMake(328, 188);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
             return CGSizeMake(340, 248);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
             return ISHWorkspaceWorkspacesContentSize(1);
+        // All four cards; at 238 the Live terminals card was entirely hidden.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
-            return CGSizeMake(332, 238);
+            return CGSizeMake(332, 372);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-            return CGSizeMake(336, 256);
+            return CGSizeMake(336, 268);
+        // All five rows of actions; at 184 three of them were below the edge.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
-            return CGSizeMake(312, 184);
+            return CGSizeMake(312, 364);
+        // At 248 the toolbar left a 108pt-tall page.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
-            return CGSizeMake(352, 248);
+            return CGSizeMake(352, 520);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
             return CGSizeMake(360, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
             return CGSizeMake(352, 620);
+        // These two scroll vertically, but at 352 their row subtitles and
+        // switch labels were truncated sideways, which scrolling cannot reveal.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolFilesystemsIdentifier])
-            return CGSizeMake(352, 620);
+            return CGSizeMake(376, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSettingsIdentifier])
-            return CGSizeMake(352, 620);
+            return CGSizeMake(376, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
             return CGSizeMake(352, 560);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
@@ -1047,32 +1063,37 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
             return CGSizeMake(340, 420);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolVideoPlayerIdentifier])
             return CGSizeMake(340, 260);
+        // Room for the status text beside its three buttons, and a 16:9
+        // display under the toolbar.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolDisplayIdentifier])
-            return CGSizeMake(344, 300);
+            return CGSizeMake(364, 268);
         return CGSizeMake(344, 580);
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-        return CGSizeMake(156, 76);
+        return CGSizeMake(240, 148);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
-        return CGSizeMake(318, 168);
+        return CGSizeMake(380, 196);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
         return ISHWorkspaceMonitorContentSize();
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
-        return CGSizeMake(360, 188);
+        return CGSizeMake(360, 206);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
         return CGSizeMake(460, 300);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
         return ISHWorkspaceWorkspacesContentSize(1);
+    // The Live terminals card sat wholly below the edge, so nothing even looked cut.
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
-        return CGSizeMake(460, 286);
+        return CGSizeMake(460, 384);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
         return CGSizeMake(500, 320);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
-        return CGSizeMake(400, 220);
+        return CGSizeMake(400, 396);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
         return CGSizeMake(620, 420);
+    // Its longest line ends near 600pt; at 820 about a fifth of the window was
+    // empty to the right of it.
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
-        return CGSizeMake(820, 760);
+        return CGSizeMake(640, 760);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
         return CGSizeMake(760, 700);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolFilesystemsIdentifier])
@@ -1112,10 +1133,13 @@ static CGSize ISHWorkspacePreferredDockContentSize(void) {
     return CGSizeMake(220, 64);
 }
 
+// Classic style's Layout Manager: a two-line note and two buttons, plus "New
+// Workspace Window" on iPad. At 312x176 / 360x214 the card ran off the bottom,
+// and on iPad the third button was hidden altogether.
 static CGSize ISHWorkspacePreferredDashboardContentSize(void) {
     if (ISHWorkspaceUsesPhoneLayout())
-        return CGSizeMake(312, 176);
-    return CGSizeMake(360, 214);
+        return CGSizeMake(312, 204);
+    return CGSizeMake(360, 284);
 }
 
 static CGSize ISHWorkspaceMinimumDashboardContentSize(void) {
@@ -1145,8 +1169,10 @@ static CGSize ISHWorkspaceMinimumTerminalContentSize(void) {
 
 static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
+        // Below this the date and zone lines overflow the card whatever the
+        // font scaling does; it is the smallest size that shows the whole face.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-            return CGSizeMake(132, 68);
+            return CGSizeMake(180, 124);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
             return CGSizeMake(232, 132);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
@@ -1195,7 +1221,7 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
     }
 
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-        return CGSizeMake(150, 72);
+        return CGSizeMake(180, 124);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
         return CGSizeMake(260, 144);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])

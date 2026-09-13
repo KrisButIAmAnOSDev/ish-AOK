@@ -146,7 +146,14 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
         [_toolbarCard.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor constant:inset],
         [_toolbarCard.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:inset],
         [_toolbarCard.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-inset],
-        [_toolbarCard.heightAnchor constraintEqualToConstant:22.0],
+        // At least 22, not exactly 22: a failure switches the status label to
+        // as many lines as the message needs (failWithMessage:), and a pill of
+        // fixed height left those lines spilling out of it -- over the title
+        // bar above and onto the display below. The pill grows around them now,
+        // and the display, pinned to the pill's bottom, moves down with it.
+        [_toolbarCard.heightAnchor constraintGreaterThanOrEqualToConstant:22.0],
+        [_statusLabel.topAnchor constraintGreaterThanOrEqualToAnchor:_toolbarCard.topAnchor constant:3.0],
+        [_statusLabel.bottomAnchor constraintLessThanOrEqualToAnchor:_toolbarCard.bottomAnchor constant:-3.0],
 
         [_statusLabel.leadingAnchor constraintEqualToAnchor:_toolbarCard.leadingAnchor constant:10.0],
         [_statusLabel.centerYAnchor constraintEqualToAnchor:_toolbarCard.centerYAnchor],
@@ -472,6 +479,14 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     [button setTitle:title forState:UIControlStateNormal];
     button.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
     button.contentEdgeInsets = UIEdgeInsetsZero;
+    // The buttons keep their width; the status label beside them wraps into
+    // what is left. At equal priorities a failure message (which runs to
+    // several lines) squeezed Paste and Ctrl+Alt+Del to nothing on a phone and
+    // cut Reconnect -- the one button a failure needs -- to "Re...ect".
+    [button setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                            forAxis:UILayoutConstraintAxisHorizontal];
+    [button setContentHuggingPriority:UILayoutPriorityRequired
+                              forAxis:UILayoutConstraintAxisHorizontal];
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
