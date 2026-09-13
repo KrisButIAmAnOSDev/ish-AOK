@@ -1892,6 +1892,16 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         st->native_state = native_state;
         st->native_env = native_env;
         st->native_env_len = rec->native_env_len;
+        // Its session and process group, which the jump below would otherwise
+        // skip along with everything that really is emulator-only. Without
+        // them the re-launched program kept the brand-new session
+        // ckpt_new_task gave it -- sid == its own pid -- and was on the
+        // terminal as a session LEADER. When it exited, exit_hangup_session_tty
+        // did what a leader's exit does and took the session off the terminal,
+        // so the shell that had been waiting on it got ENOTTY from tcsetpgrp:
+        // "can't set tty process group: Not a tty", no prompt after ktop, and
+        // every external command after that finishing Done(2) with no output.
+        tgroup_restore_ids(current, (pid_t_) rec->sid, (pid_t_) rec->pgid);
         goto descriptors;
     }
 
