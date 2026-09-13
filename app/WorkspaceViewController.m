@@ -3273,7 +3273,18 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     // saved/unsaved indicator has to hear about it. Only Desktop-level events
     // posted this before, which is why opening an applet left the Save icon
     // sitting on green.
-    [self postDesktopsDidChange];
+    //
+    // On the NEXT runloop turn, not now: this runs inside
+    // createDesktopWindowWithTitle:, and every caller sets the thing that gives
+    // the window its identity -- workspaceToolIdentifier, or the hosted terminal
+    // -- only after that returns. Posting synchronously therefore describes a
+    // window with no identity, the arrangement signature comes out unchanged,
+    // and the icon stayed green anyway. That was the first version of this fix,
+    // and it is why the Save icon still read "saved" after opening a Clock.
+    __weak typeof(self) weakSelfForIndicator = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelfForIndicator postDesktopsDidChange];
+    });
     if (appliesInitialPlacement) {
         [self applyInitialFrameIfNeededToDesktopWindow:windowView];
         [self.desktopSurfaceView bringSubviewToFront:windowView];
