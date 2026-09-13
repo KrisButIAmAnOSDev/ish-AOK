@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <pthread.h>
 
 #include "fs/dev.h"
 #include "fs/devices.h"
@@ -383,6 +386,83 @@ static void *quiesce_test_thread(void *arg) {
     return NULL;
 }
 
+
+// ---- a2 TEMPORARY: ISH_CLI_PTY, a session on a pseudo-terminal ------------
+#include "fs/tty.h"
+
+// ---- ISH_CLI_PTY: a session on a PSEUDO-terminal, from the command line ----
+//
+// The iOS app's shape -- a Terminal object owns the master side -- made
+// reachable from the CLI. Without it the CLI runs its command as init on the
+// console, and kernel/checkpoint.c's CKPT_TTY_PTS restore path (sessions,
+// controlling terminals, foreground process groups -- everything job control
+// touches) cannot be exercised outside the app at all. That made every restore
+// bug a four-minute round trip through the simulator UI, which is a bad price
+// for a class of bug that lives exactly here.
+//
+// Write-only on purpose. The master just mirrors guest output to stderr, which
+// is enough to watch a restored session work or fail, and it keeps a reader
+// thread from competing with the CLI's own stdin. Only .write is mandatory:
+// fs/tty.c NULL-checks init/open/cleanup.
+static int cli_pty_write(struct tty *tty, const void *buf, size_t len,
+                         bool blocking) {
+    (void) tty;
+    (void) blocking;
+    ssize_t written = write(STDERR_FILENO, buf, len);
+    (void) written;
+    return (int) len;
+}
+
+static struct tty_driver_ops cli_pty_ops = { .write = cli_pty_write };
+static struct tty_driver cli_pty_driver = { .ops = &cli_pty_ops };
+
+static struct tty *cli_pty_open_session(void) {
+    return pty_open_fake(&cli_pty_driver);
+}
+static void *a2_pty_read_thread(void *_tty) {
+    struct tty *tty = _tty;
+    char ch;
+    int in = dup(STDIN_FILENO);
+    if (in < 0) in = STDIN_FILENO;
+    for (;;) {
+        ssize_t n = read(in, &ch, 1);
+        if (n != 1) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) { usleep(10000); continue; }
+            for (;;) pause();
+        }
+        tty_input(tty, &ch, 1, 0);
+    }
+    return NULL;
+}
+static struct termios a2_old_termios;
+static int a2_pty_init(struct tty *tty) {
+    struct winsize winsz;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz) == 0) {
+        tty->winsize.col = winsz.ws_col;
+        tty->winsize.row = winsz.ws_row;
+    }
+    if (tcgetattr(STDIN_FILENO, &a2_old_termios) == 0) {
+        struct termios raw = a2_old_termios;
+        cfmakeraw(&raw);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+    pthread_t th;
+    if (pthread_create(&th, NULL, a2_pty_read_thread, tty) != 0)
+        return _EIO;
+    pthread_detach(th);
+    return 0;
+}
+static int a2_pty_write(struct tty *UNUSED(tty), const void *buf, size_t len, bool UNUSED(b)) {
+    return (int) write(STDOUT_FILENO, buf, len);
+}
+static struct tty_driver_ops a2_pty_ops = { .init = a2_pty_init, .write = a2_pty_write };
+static struct tty_driver a2_pty_driver = {.ops = &a2_pty_ops};
+static struct tty *a2_pty_open_session(void) {
+    struct tty *tty = pty_open_fake(&a2_pty_driver);
+    if (IS_ERR(tty)) return NULL;
+    return tty;
+}
+
 int main(int argc, char *const argv[]) {
     // The system's memory-pressure source, which outranks our own per-process
     // headroom arithmetic; see host_mem_pressure_start() in platform/darwin.c.
@@ -440,6 +520,14 @@ int main(int argc, char *const argv[]) {
                 strcasecmp(pa, "no") != 0 && strcasecmp(pa, "off") != 0)
             doEnablePixAccel = true;
     }
+    // ISH_CLI_PTY=1 -- run the command as a child of init on a PSEUDO-terminal
+    // instead of as init on the console, which is the app's shape and the only
+    // way to reach the checkpoint's CKPT_TTY_PTS restore path from here. See
+    // cli_pty_open_session above and the block in xX_main_Xx.h.
+    if (getenv("ISH_CLI_PTY") != NULL) {
+        cli_session_tty_open = cli_pty_open_session;
+        checkpoint_open_session_tty = cli_pty_open_session;
+    }
     // ISH_CHECKPOINT_AFTER=<seconds>:<path> -- take a checkpoint from a thread
     // that is NOT a guest task, after the guest has been running a while.
     //
@@ -466,6 +554,10 @@ int main(int argc, char *const argv[]) {
                 cli_checkpoint_path = at;
             }
         }
+    }
+    if (getenv("ISH_CLI_PTY") != NULL) {
+        cli_session_tty_open = a2_pty_open_session;
+        checkpoint_open_session_tty = a2_pty_open_session;
     }
     halt_hook = cli_halt;
     // hle_stats_dump runs from cli_halt, after guest teardown has closed the

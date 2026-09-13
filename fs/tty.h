@@ -165,6 +165,16 @@ struct tty_driver_ops {
 extern struct tty_driver *tty_drivers[256];
 extern struct tty_driver real_tty_driver;
 
+// A factory for a PSEUDO-terminal whose master side is not a guest process --
+// the shape the iOS app has, where the master is a Terminal object. NULL
+// unless an entry point installs one; main.c does when ISH_CLI_PTY is set, so
+// the CLI can run a session on a pts and exercise the checkpoint's
+// CKPT_TTY_PTS restore path, which is otherwise unreachable from here (see
+// kernel/checkpoint.c's ckpt_stdio_set_for: it downgrades a pts to the console
+// when checkpoint_open_session_tty is NULL). Debug only; it changes nothing
+// about a normal launch.
+extern struct tty *(*cli_session_tty_open)(void);
+
 struct tty {
     unsigned refcount;
     struct tty_driver *driver;

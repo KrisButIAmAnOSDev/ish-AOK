@@ -173,6 +173,58 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     argv_copy[p] = '\0';
     if (argv[optind] == NULL)
 	    return _ENOENT;
+
+    // ISH_CLI_PTY (see main.c): start the command the way the app starts a
+    // session -- as a CHILD of init, on a pseudo-terminal -- rather than as
+    // init itself on the console. Same sequence as
+    // app/TerminalViewController.m's startSession: become_new_init_child, make
+    // the pts, create_stdio on it, do_execve, task_start. init stays behind as
+    // a sleeper so the process outlives the session, which is also what the app
+    // does. Debug only.
+    if (cli_session_tty_open != NULL) {
+        struct task *init_task = current;
+        // init is not on the person's terminal in the app either; give it a
+        // descriptor that is checkpointable and that nothing is reading.
+        create_stdio("/dev/null", 1, 3);
+        static const char sleeper[] = "/bin/sleep\0" "2000000\0";
+        err = do_execve("/bin/sleep", 2, (char *) sleeper,
+                        envp == NULL ? "\0" : envp);
+        if (err < 0)
+            return err;
+        intptr_t cerr = become_new_init_child();
+        if (cerr < 0) {
+            current = init_task;
+            return (int) cerr;
+        }
+        struct tty *session_tty = cli_session_tty_open();
+        if (session_tty == NULL || IS_ERR(session_tty)) {
+            current = init_task;
+            return _EIO;
+        }
+        char pts_path[64];
+        snprintf(pts_path, sizeof(pts_path), "/dev/pts/%d", session_tty->num);
+        err = create_stdio(pts_path, TTY_PSEUDO_SLAVE_MAJOR, session_tty->num);
+        tty_release(session_tty);
+        if (err < 0) {
+            current = init_task;
+            return err;
+        }
+        err = do_execve(argv[optind], argc - optind, argv_copy,
+                        envp == NULL ? "\0" : envp);
+        if (err < 0) {
+            current = init_task;
+            return err;
+        }
+        if (task_start(current) < 0) {
+            current = init_task;
+            return _EAGAIN;
+        }
+        current = init_task;
+        tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
+        exit_hook = exit_handler;
+        return 0;
+    }
+
     err = do_execve(argv[optind], argc - optind, argv_copy, envp == NULL ? "\0" : envp);
     if (err < 0)
         return err;

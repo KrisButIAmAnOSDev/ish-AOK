@@ -9,6 +9,9 @@
 
 extern struct tty_driver pty_slave;
 
+// See fs/tty.h. Installed by main.c under ISH_CLI_PTY; NULL everywhere else.
+struct tty *(*cli_session_tty_open)(void);
+
 // the master holds a reference to the slave, so the slave will always be cleaned up second
 // when the master cleans up it hangs up the slave, making any operation that references the master unreachable
 
