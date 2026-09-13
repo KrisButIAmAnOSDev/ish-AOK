@@ -3642,6 +3642,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         if (existing != nil) {
             existing.workspaceDesktopIndex = self.activeDesktopIndex;
             existing.hidden = NO;
+            [self postDesktopsDidChange];   // same reason as openOrFocus
             return existing;
         }
     }
@@ -6524,6 +6525,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         existingWindow.workspaceDesktopIndex = self.activeDesktopIndex;
         existingWindow.hidden = NO;
         [self focusDesktopWindow:existingWindow];
+        // Summoning an applet from another Desktop CHANGES the arrangement, so
+        // the saved/unsaved indicator has to hear about it. Opening an applet
+        // that already existed took this branch and posted nothing, which is
+        // why the Save icon stayed green after opening a Clock -- the window was
+        // already there, hidden, and only its Desktop moved.
+        [self postDesktopsDidChange];
         return;
     }
     [self openWorkspaceToolWithIdentifier:toolIdentifier];
