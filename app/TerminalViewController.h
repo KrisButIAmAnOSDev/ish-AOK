@@ -31,11 +31,21 @@ typedef NS_ENUM(NSInteger, ISHFreshSessionTerminalDisplayMode) {
 // checkpoint restores pids. The workspace records it in its saved layout so a
 // window can ask for its own shell back.
 @property (readonly) int sessionPid;
+// The pseudo-terminal this window's own shell runs on, or nil when the window
+// has none (it shows the console, or adopted a terminal it did not start).
+// What the workspace records at suspend: the shell to ask for on resume is
+// this one, whatever the window is displaying.
+@property (readonly, nonatomic) Terminal *sessionTerminal;
 // Set before a session starts to ask for a particular restored session (by the
 // leader pid recorded in the saved layout). 0 means "any". Falls back to the
 // next session in the queue when there is no such session -- see
 // checkpoint_take_restored_session_for_pid.
 @property (nonatomic) int desiredRestoredSessionPid;
+// A window that had no shell of its own when the layout was saved (a System
+// Console showing tty1 with nothing behind it) must not adopt a restored one
+// on the way back: any session it took would be somebody else's, hidden
+// behind the console it displays. The workspace sets this from its layout.
+@property (nonatomic) BOOL declinesRestoredSession;
 @property UISceneSession *sceneSession API_AVAILABLE(ios(13.0));
 @property (nonatomic) BOOL showsWorkspaceDashboardButton;
 @property (nonatomic) BOOL embeddedInWorkspaceWindow;

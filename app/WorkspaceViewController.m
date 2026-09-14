@@ -3473,19 +3473,35 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         // the process and the restore hands out fresh pts numbers, but the
         // checkpoint restores pids, so this is what lets the window ask for
         // its OWN shell back rather than whichever one is next in the queue.
-        // Prefer the TTY's own session id over the pid the window remembers.
+        //
+        // Its OWN shell: the one on the pseudo-terminal this window started
+        // (sessionTerminal), not whatever it happens to be displaying. A System
+        // Console window shows tty1 while its shell sits on a pts behind it,
+        // and this used to record tty1's session -- the console login's --
+        // which no restore ever hands out, because only pts sessions come back
+        // through the queue. So the console window asked for a pid that could
+        // not match, fell back to queue order, and took the FIRST restored
+        // session: the other window's ktop. That window then got the console's
+        // hidden shell, or nothing. Reported as "the former ktop window was
+        // blank and the console window had a wedged ktop in it".
         //
         // A window does not always start the session it shows: one that adopted
-        // an existing terminal never learned a pid, so this recorded nothing
-        // and the restore fell back to queue order -- two terminals coming back
-        // holding each other's shells. The tty knows its session whoever opened
-        // it, and a session leader's pid IS the session id, which is what the
-        // restore reports.
-        int sessionPid = windowView.hostedTerminalViewController.terminal.guestSessionId;
+        // an existing pts never learned a pid, so the tty is asked for its
+        // session -- a session leader's pid IS the session id, which is what
+        // the restore reports. Only a window with no shell of its own falls
+        // through to the displayed terminal, and then only for a pts.
+        TerminalViewController *hosted = windowView.hostedTerminalViewController;
+        int sessionPid = hosted.sessionTerminal.guestSessionId;
         if (sessionPid <= 0)
-            sessionPid = windowView.hostedTerminalViewController.sessionPid;
+            sessionPid = hosted.sessionPid;
+        if (sessionPid <= 0 && hosted.sessionTerminal == nil &&
+                hosted.terminal.type == TTY_PSEUDO_SLAVE_MAJOR)
+            sessionPid = hosted.terminal.guestSessionId;
         if (sessionPid > 0)
             descriptor[@"sessionPid"] = @(sessionPid);
+        // Whether there is a shell to ask for at all. A window with none (a
+        // console with nothing behind it) must not adopt one on the way back.
+        descriptor[@"ownsSession"] = @(sessionPid > 0);
         // What this terminal had printed. Not part of the guest at all -- it
         // lives in hterm -- so without this a resumed window came back blank
         // and the session's whole history was gone.
@@ -3592,7 +3608,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 - (ISHWorkspaceContainedWindowView *)restoreDesktopTerminalWindowWithSessionUUID:(NSUUID *)sessionTerminalUUID
                                                              displayTerminalUUID:(NSUUID *)displayTerminalUUID
                                                                    terminalRole:(NSString *)terminalRole
-                                                                      sessionPid:(int)sessionPid {
+                                                                      sessionPid:(int)sessionPid
+                                                                     ownsSession:(BOOL)ownsSession {
     if (displayTerminalUUID == nil && sessionTerminalUUID == nil)
         return nil;
 
@@ -3640,6 +3657,18 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     // session is what claims a restored one. 0 when the layout predates this
     // or the window had no session, which falls back to queue order.
     terminalViewController.desiredRestoredSessionPid = sessionPid;
+    // And no shell at all for a window that had none: see the property.
+    terminalViewController.declinesRestoredSession = !ownsSession;
+    // Which terminal a shell started HERE is shown on. Only a window whose
+    // saved session did not come back starts one, and the default answer for
+    // a fresh shell in Workspace mode is "the system console" -- which, for a
+    // window that is not the console, put tty1 into a second window. tty1 was
+    // already in the console window, so this one showed "Terminal already open
+    // in another window" and nothing else: the blank, unresponsive window.
+    terminalViewController.freshSessionTerminalDisplayMode =
+        [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSystemConsole]
+            ? ISHFreshSessionTerminalDisplayModeSystemConsole
+            : ISHFreshSessionTerminalDisplayModeSessionShell;
     ISHWorkspaceContainedWindowView *windowView =
         [self openDesktopTerminalWindowWithTitle:title terminalViewController:terminalViewController];
     [terminalViewController reconnectSessionFromTerminalUUID:restoreUUID];
@@ -4279,7 +4308,33 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     NSSet<NSString *> *deduplicatedTerminalRoles =
         [NSSet setWithArray:@[ISHWorkspaceTerminalRoleSessionShell, ISHWorkspaceTerminalRoleSystemConsole]];
     NSMutableSet<NSString *> *restoredTerminalRoles = [NSMutableSet set];
+    // Terminals that can name their shell go first, in two senses. A window
+    // claims its restored session when it is created, and a window whose
+    // recorded pid matches nothing falls back to the next session in the
+    // queue -- so if that window is created first it takes a shell another
+    // window is about to ask for by name. Creating the exact matches first
+    // makes the fallback safe: by the time it runs, everything that could be
+    // claimed by name has been. The saved stacking order is put back below,
+    // so this changes who gets which shell and nothing the user can see.
+    NSMutableArray<NSDictionary<NSString *, id> *> *orderedDescriptors = [NSMutableArray array];
+    NSMutableArray<NSDictionary<NSString *, id> *> *deferredTerminals = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *descriptor in windowDescriptors) {
+        if ([descriptor[@"kind"] isEqualToString:ISHWorkspaceSavedLayoutKindTerminal] &&
+                !checkpoint_restored_session_pending([descriptor[@"sessionPid"] intValue]))
+            [deferredTerminals addObject:descriptor];
+        else
+            [orderedDescriptors addObject:descriptor];
+    }
+    [orderedDescriptors addObjectsFromArray:deferredTerminals];
+    // Keyed by the descriptor OBJECT, not its contents: two windows of the
+    // same applet at the same spot (a cascade that wrapped, or two zoomed
+    // windows) have equal dictionaries, and an isEqual: map would hand both
+    // lookups the same window and leave the other one at the back.
+    NSMapTable<NSDictionary<NSString *, id> *, ISHWorkspaceContainedWindowView *> *windowsByDescriptor =
+        [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                  valueOptions:NSPointerFunctionsWeakMemory
+                                      capacity:windowDescriptors.count];
+    for (NSDictionary<NSString *, id> *descriptor in orderedDescriptors) {
         NSString *kind = descriptor[@"kind"];
         NSDictionary<NSString *, id> *frameDescriptor = descriptor[@"frame"];
         if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTool]) {
@@ -4291,6 +4346,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             if ([self isGlobalToolIdentifier:toolIdentifier] && [self desktopWindowForToolIdentifier:toolIdentifier] != nil)
                 continue;
             ISHWorkspaceContainedWindowView *windowView = [self openWorkspaceToolWindowWithIdentifier:toolIdentifier];
+            if (windowView != nil)
+                [windowsByDescriptor setObject:windowView forKey:descriptor];
             [self applySavedFrameDescriptor:frameDescriptor
                                    toWindow:windowView
                                fallbackSize:ISHWorkspacePreferredToolContentSize(toolIdentifier)];
@@ -4312,12 +4369,17 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             NSString *terminalRole = [self terminalRoleFromSavedDescriptor:descriptor displayTerminal:displayTerminal];
             if ([deduplicatedTerminalRoles containsObject:terminalRole] && [restoredTerminalRoles containsObject:terminalRole])
                 continue;
+            // A layout from before "ownsSession" was recorded says nothing
+            // either way; those windows keep the old behaviour and may adopt.
+            BOOL ownsSession = descriptor[@"ownsSession"] == nil || [descriptor[@"ownsSession"] boolValue];
             ISHWorkspaceContainedWindowView *windowView =
                 [self restoreDesktopTerminalWindowWithSessionUUID:(sessionTerminalUUID ?: displayTerminalUUID)
                                               displayTerminalUUID:displayTerminalUUID
                                                     terminalRole:terminalRole
-                                                      sessionPid:[descriptor[@"sessionPid"] intValue]];
+                                                      sessionPid:[descriptor[@"sessionPid"] intValue]
+                                                     ownsSession:ownsSession];
             if (windowView != nil) {
+                [windowsByDescriptor setObject:windowView forKey:descriptor];
                 if ([deduplicatedTerminalRoles containsObject:terminalRole])
                     [restoredTerminalRoles addObject:terminalRole];
                 [self applySavedFrameDescriptor:frameDescriptor
@@ -4337,6 +4399,13 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                     windowView.hostedTerminalViewController.overrideFontSize = savedFontSize;
             }
         }
+    }
+    // The stacking the layout saved, front to back: the loop above created
+    // the windows in claiming order, not this one.
+    for (NSDictionary<NSString *, id> *descriptor in windowDescriptors) {
+        ISHWorkspaceContainedWindowView *windowView = [windowsByDescriptor objectForKey:descriptor];
+        if (windowView != nil && windowView.superview == self.desktopSurfaceView)
+            [self.desktopSurfaceView bringSubviewToFront:windowView];
     }
 
     // The Desktop that was showing -- after the windows, because switching

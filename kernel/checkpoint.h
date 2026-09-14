@@ -129,6 +129,12 @@ int checkpoint_take_restored_session(struct checkpoint_restored_session *out);
 // ptys), but the leader pid is, because the checkpoint restores pids.
 int checkpoint_take_restored_session_for_pid(int leader_pid,
                                             struct checkpoint_restored_session *out);
+// Whether a restored session led by `leader_pid` is still waiting to be shown.
+// A peek, not a take: the workspace uses it to let every window that can name
+// its own shell claim it BEFORE any window falls back to queue order, so a
+// window with a stale pid cannot take a shell that another window is about to
+// ask for by name.
+int checkpoint_restored_session_pending(int leader_pid);
 
 // Traces a restored task's first few syscalls when ISH_CHECKPOINT_DEBUG is on.
 void checkpoint_trace_syscall(unsigned long nr);

@@ -1687,6 +1687,19 @@ int checkpoint_take_restored_session_for_pid(int leader_pid,
     return checkpoint_take_restored_session(out);
 }
 
+int checkpoint_restored_session_pending(int leader_pid) {
+    int pending = 0;
+    lock(&ckpt_lock, 0);
+    for (unsigned i = ckpt_session_taken; i < ckpt_session_count; i++) {
+        if (leader_pid > 0 && ckpt_sessions[i].leader_pid == leader_pid) {
+            pending = 1;
+            break;
+        }
+    }
+    unlock(&ckpt_lock);
+    return pending;
+}
+
 int checkpoint_take_restored_session(struct checkpoint_restored_session *out) {
     int got = 0;
     lock(&ckpt_lock, 0);

@@ -1818,7 +1818,8 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
 	    // full-screen terminal) means "any", which is the old behaviour.
 	    self.sessionWasRestored = NO;
 	    struct checkpoint_restored_session restored;
-	    if (checkpoint_take_restored_session_for_pid(self.desiredRestoredSessionPid, &restored)) {
+	    if (!self.declinesRestoredSession &&
+	            checkpoint_take_restored_session_for_pid(self.desiredRestoredSessionPid, &restored)) {
 	        Terminal *terminal = (__bridge Terminal *) restored.terminal;
 	        if (terminal != nil) {
 	            self.sessionTerminal = terminal;
