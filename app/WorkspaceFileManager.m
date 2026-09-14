@@ -106,6 +106,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         // programs and the other roots all hang off it, and it is the same on
         // every root, so it is the one path a user can always be pointed at.
         @{@"title": @"/AOK", @"path": @"/AOK", @"symbol": @"shippingbox"},
+        @{@"title": @"Docs", @"path": @"/AOK/docs", @"symbol": @"book"},
         @{@"title": @"Persist", @"path": @"/AOK/persist", @"symbol": @"externaldrive"},
         @{@"title": @"/tmp", @"path": @"/tmp", @"symbol": @"clock"},
         @{@"title": @"Root (/)", @"path": @"/", @"symbol": @"internaldrive"},
