@@ -2506,35 +2506,8 @@ static CGFloat ISHWorkspaceThemeTextViewFontSize(void) {
 
 // ---- first responder, and per-window text size ------------------------------
 //
-// UIKit has no way to ask for the first responder. An action sent to nil goes
-// to it, so send one that records its receiver.
-static __weak UIResponder *ISHWorkspaceCapturedFirstResponder;
-
-@interface UIResponder (ISHWorkspaceFirstResponder)
-- (void)ish_workspaceCaptureFirstResponder:(id)sender;
-@end
-
-@implementation UIResponder (ISHWorkspaceFirstResponder)
-- (void)ish_workspaceCaptureFirstResponder:(id)sender {
-    ISHWorkspaceCapturedFirstResponder = self;
-}
-@end
-
-static UIResponder *ISHWorkspaceCurrentFirstResponder(void) {
-    ISHWorkspaceCapturedFirstResponder = nil;
-    [UIApplication.sharedApplication sendAction:@selector(ish_workspaceCaptureFirstResponder:)
-                                             to:nil
-                                           from:nil
-                                       forEvent:nil];
-    UIResponder *responder = ISHWorkspaceCapturedFirstResponder;
-    ISHWorkspaceCapturedFirstResponder = nil;
-    // With no first responder the action falls through to the application (or
-    // its delegate). Neither is "the responder" in any useful sense.
-    if (responder == UIApplication.sharedApplication ||
-            responder == (id) UIApplication.sharedApplication.delegate)
-        return nil;
-    return responder;
-}
+// The first responder itself is found by -[WorkspaceViewController
+// workspaceFirstResponder].
 
 // The workspace window a responder lives in -- a view inside it, or a view
 // controller whose view is -- or nil.
@@ -5499,6 +5472,31 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     return nil;
 }
 
+static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewController *viewController) {
+    if (viewController.isFirstResponder)
+        return viewController;
+    for (UIViewController *child in viewController.childViewControllers) {
+        UIResponder *responder = ISHWorkspaceFirstResponderAmongViewControllers(child);
+        if (responder != nil)
+            return responder;
+    }
+    return nil;
+}
+
+// The first responder inside the Workspace: the Workspace itself, a view
+// controller in one of its windows (the File Manager is first responder
+// itself), or a view.
+//
+// Asked of each responder with -isFirstResponder. It used to be found by
+// sending an action to nil and recording who received it, and that route is
+// not the first responder: it goes where UIKit sends EDITING actions, which can
+// still be a text view after something else took first responder. Measured:
+// with MotePad's editor left behind and the Workspace first responder, it named
+// the editor, and Cmd+= resized MotePad while a Markdown window was in front.
+- (nullable UIResponder *)workspaceFirstResponder {
+    return ISHWorkspaceFirstResponderAmongViewControllers(self) ?: ISHWorkspaceFindFirstResponder(self.view);
+}
+
 // Called when a non-terminal window comes to the front. Leaves focus alone when
 // the window already holds it -- MotePad's editor, a text field being typed in
 // -- or when the applet has no text to scale, so tapping a Clock does not take
@@ -5506,7 +5504,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 - (void)claimKeyboardFocusForTextScalableWindow:(ISHWorkspaceContainedWindowView *)windowView {
     if (windowView == nil || [self textScalableForDesktopWindow:windowView] == nil)
         return;
-    if (ISHWorkspaceWindowContainingResponder(ISHWorkspaceCurrentFirstResponder()) == windowView)
+    if (ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]) == windowView)
         return;
     [self becomeFirstResponder];
 }
@@ -5514,7 +5512,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // The window a text-size chord is for: the one holding first responder, else
 // the frontmost window on the active Desktop.
 - (nullable ISHWorkspaceContainedWindowView *)textSizeTargetWindow {
-    ISHWorkspaceContainedWindowView *focused = ISHWorkspaceWindowContainingResponder(ISHWorkspaceCurrentFirstResponder());
+    ISHWorkspaceContainedWindowView *focused = ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]);
     if (focused != nil && focused != self.dockWindow && !focused.hidden &&
             focused.superview == self.desktopSurfaceView)
         return focused;
@@ -5617,8 +5615,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     // Text size. Always present, by the rule above; only the titles vary. A
     // focused terminal lists its own identical commands in the Cmd-hold HUD,
     // so these go untitled then rather than appearing twice.
-    UIResponder *firstResponder = ISHWorkspaceCurrentFirstResponder();
-    BOOL terminalFocused = ISHWorkspaceWindowContainingResponder(firstResponder).hostedTerminalViewController != nil;
+    BOOL terminalFocused = ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]).hostedTerminalViewController != nil;
     NSMutableArray<UIKeyCommand *> *commands = [@[previous, next, cycleForward, cycleBackward] mutableCopy];
     NSArray<NSArray<NSString *> *> *textSizeChords = @[@[@"+", @"Increase Text Size"], @[@"=", @""],
                                                       @[@"-", @"Decrease Text Size"], @[@"0", @"Reset Text Size"]];
