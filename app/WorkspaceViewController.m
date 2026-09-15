@@ -955,7 +955,9 @@ static UIViewController *ISHCreateRootsViewController(void) {
 //
 // The row heights follow the applet's text scale (WorkspaceTextScalable), and the
 // applet takes them from the same two functions, so a scaled list and the window
-// sized for it cannot disagree. The Add/Edit footer does not scale, and the width
+// sized for it cannot disagree. The compaction pass asks the Launcher for this size
+// (-launcherContentSizeForDisplayedLevel) rather than taking the root level at 1.0
+// from the preferred size. The Add/Edit footer does not scale, and the width
 // only grows: narrower than the default, those fixed-size pills would clip.
 static CGFloat ISHWorkspaceLauncherRowHeight(CGFloat textScale) {
     return ceil((ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0) * textScale);
@@ -2760,6 +2762,7 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 @end
 
 @interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController <UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UIDropInteractionDelegate, WorkspaceStatefulTool>
+- (CGSize)launcherContentSizeForDisplayedLevel;
 @end
 
 @interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WorkspaceStatefulTool>
@@ -6630,6 +6633,15 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
             continue;
 
         CGSize targetSize = ISHWorkspacePreferredToolContentSize(toolIdentifier);
+        // The Launcher's preferred size is its root level at text size 1.0.
+        // This pass runs on every theme change, resume and appearance, and the
+        // Launcher only autosizes when its list changes, so shrinking to that
+        // size left a scaled or drilled-into list cut off until the next edit.
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier]) {
+            UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
+            if ([contentViewController isKindOfClass:WorkspaceLauncherToolViewController.class])
+                targetSize = [(WorkspaceLauncherToolViewController *) contentViewController launcherContentSizeForDisplayedLevel];
+        }
         CGRect currentFrame = windowView.frame;
         BOOL shouldShrinkWidth = CGRectGetWidth(currentFrame) > targetSize.width + 24.0;
         BOOL shouldShrinkHeight = CGRectGetHeight(currentFrame) > targetSize.height + 24.0;
@@ -9603,6 +9615,16 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
             [(id)strongSelf.workspaceHostViewController autosizeLauncherWindowForItemCount:strongSelf->_rowShortcuts.count
                                                                               showsBackRow:strongSelf->_currentPath.count > 0];
     });
+}
+
+// The size the window is autosized to for the level on screen, at the list's own
+// text size. The Workspace's compaction pass shrinks the Launcher to this rather
+// than to its preferred size, so the two cannot disagree.
+- (CGSize)launcherContentSizeForDisplayedLevel {
+    // No list has been built before -viewDidLoad; when it is, it opens at the root.
+    if (_rowShortcuts == nil)
+        return ISHWorkspaceLauncherContentSizeAtTextScale(ISHWorkspaceLauncherShortcuts().count, NO, self.workspaceTextScale);
+    return ISHWorkspaceLauncherContentSizeAtTextScale(_rowShortcuts.count, _currentPath.count > 0, self.workspaceTextScale);
 }
 
 #pragma mark WorkspaceTextScalable
