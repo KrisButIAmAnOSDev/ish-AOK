@@ -18,6 +18,7 @@ static const CGFloat kFileManagerSidebarWidth = 180.0;
 static const CGFloat kFileManagerSidebarCollapseThreshold = 520.0;
 static const CGFloat kFileManagerToolbarHeight = 44.0;
 static const CGFloat kFileManagerStatusBarHeight = 28.0;
+static const CGFloat kFileManagerSidebarRowHeight = 36.0;
 static const CGFloat kFileManagerDividerThickness = 1.0 / 3.0;  // hairline; UIView doesn't need device-scale awareness here
 
 static NSString *const kFileManagerSortModeDefaultsKey = @"WorkspaceFileManagerSortMode";
@@ -52,7 +53,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     return nil;
 }
 
-@interface WorkspaceFileManagerToolViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface WorkspaceFileManagerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceFileManagerToolViewController {
@@ -64,6 +65,9 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     UIView *_dividerView;
 
     UIView *_toolbarView;
+    NSLayoutConstraint *_toolbarHeightConstraint;
+    NSLayoutConstraint *_pathScrollHeightConstraint;
+    NSLayoutConstraint *_statusBarHeightConstraint;
     UIButton *_backButton;
     UIButton *_forwardButton;
     UIButton *_upButton;
@@ -95,6 +99,13 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     BOOL _navigationPinned;  // a restore or user action happened; the async default-directory kick must not override it
 
     NSString *_homeDirectoryPath;  // sidebar "Home" target; resolved from /etc/passwd, see -resolveHomeDirectoryPath
+
+    // The file rows' fonts are UIKit's Subtitle-cell defaults; nothing here set
+    // one. These are those defaults, read off a fresh cell, and whether any row
+    // has been given a scaled font since (see -applyTextScaleToFileCell:).
+    UIFont *_fileRowBaseTextFont;
+    UIFont *_fileRowBaseDetailFont;
+    BOOL _fileRowFontsScaled;
 }
 
 // Fixed, non-editable sidebar rows for v1 -- the plan's "user-editable Favorites" is a
@@ -265,7 +276,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     _sidebarTableView.translatesAutoresizingMaskIntoConstraints = NO;
     _sidebarTableView.dataSource = self;
     _sidebarTableView.delegate = self;
-    _sidebarTableView.rowHeight = 36.0;
+    _sidebarTableView.rowHeight = [self scaledHeight:kFileManagerSidebarRowHeight];
     [_sidebarContainerView addSubview:_sidebarTableView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -314,13 +325,14 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     _pathStack.spacing = 2.0;
     [_pathScrollView addSubview:_pathStack];
 
+    _pathScrollHeightConstraint = [_pathScrollView.heightAnchor constraintEqualToConstant:[self pathScrollHeight]];
     [NSLayoutConstraint activateConstraints:@[
         [_pathStack.leadingAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.leadingAnchor],
         [_pathStack.trailingAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.trailingAnchor],
         [_pathStack.topAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.topAnchor],
         [_pathStack.bottomAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.bottomAnchor],
         [_pathStack.heightAnchor constraintEqualToAnchor:_pathScrollView.frameLayoutGuide.heightAnchor],
-        [_pathScrollView.heightAnchor constraintEqualToConstant:kFileManagerToolbarHeight - 12.0],
+        _pathScrollHeightConstraint,
     ]];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_backButton, _forwardButton, _upButton, _pathScrollView, _moreButton]];
@@ -363,12 +375,13 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         if (i > 0) {
             UILabel *separator = [UILabel new];
             separator.text = @"›";
-            separator.font = [UIFont systemFontOfSize:12.0];
+            separator.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:12.0]];
             separator.textColor = theme[@"secondary"];
             [_pathStack addArrangedSubview:separator];
         }
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:(isLast ? UIFontWeightSemibold : UIFontWeightRegular)];
+        button.titleLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:13.0]
+                                                   weight:(isLast ? UIFontWeightSemibold : UIFontWeightRegular)];
         [button setTitle:titles[i] forState:UIControlStateNormal];
         [button setTitleColor:(isLast ? theme[@"primary"] : theme[@"accent"]) forState:UIControlStateNormal];
         button.enabled = !isLast;  // the current location isn't a link anywhere
@@ -414,7 +427,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
     _statusLabel = [UILabel new];
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _statusLabel.font = [UIFont systemFontOfSize:11.0];
+    _statusLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:11.0]];
     [_statusBarView addSubview:_statusLabel];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -432,6 +445,8 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 - (void)activateRegionConstraints {
     UIView *content = self.toolContentView;
     _sidebarWidthConstraint = [_sidebarContainerView.widthAnchor constraintEqualToConstant:kFileManagerSidebarWidth];
+    _toolbarHeightConstraint = [_toolbarView.heightAnchor constraintEqualToConstant:[self pathScrollHeight] + 12.0];
+    _statusBarHeightConstraint = [_statusBarView.heightAnchor constraintEqualToConstant:[self scaledHeight:kFileManagerStatusBarHeight]];
     [NSLayoutConstraint activateConstraints:@[
         [_sidebarContainerView.topAnchor constraintEqualToAnchor:content.topAnchor],
         [_sidebarContainerView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
@@ -446,7 +461,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         [_toolbarView.topAnchor constraintEqualToAnchor:content.topAnchor],
         [_toolbarView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
         [_toolbarView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
-        [_toolbarView.heightAnchor constraintEqualToConstant:kFileManagerToolbarHeight],
+        _toolbarHeightConstraint,
 
         [_tableView.topAnchor constraintEqualToAnchor:_toolbarView.bottomAnchor],
         [_tableView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
@@ -456,8 +471,65 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         [_statusBarView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
         [_statusBarView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
         [_statusBarView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
-        [_statusBarView.heightAnchor constraintEqualToConstant:kFileManagerStatusBarHeight],
+        _statusBarHeightConstraint,
     ]];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0. What scales is what a person reads: file names and
+// their size/date line, the sidebar's place names, the breadcrumb path and the
+// status line. The toolbar's icon buttons, the row icons and the sidebar's
+// width stay as they are. Each font below is built from its unscaled size
+// wherever the view already builds it -- the breadcrumb and the empty state on
+// every rebuild, the cells on every dequeue -- so a theme change or a reload
+// keeps the scale rather than compounding it.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    // The base class can call this before -viewDidLoad here has built anything.
+    if (_toolbarView == nil)
+        return;
+    if (fabs(self.workspaceTextScale - 1.0) > 0.001)
+        _fileRowFontsScaled = YES;
+    _sidebarTableView.rowHeight = [self scaledHeight:kFileManagerSidebarRowHeight];
+    _pathScrollHeightConstraint.constant = [self pathScrollHeight];
+    _toolbarHeightConstraint.constant = [self pathScrollHeight] + 12.0;
+    _statusBarHeightConstraint.constant = [self scaledHeight:kFileManagerStatusBarHeight];
+    _statusLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:11.0]];
+    [self rebuildBreadcrumb];
+    [_tableView reloadData];
+    [_sidebarTableView reloadData];
+    [self updateEmptyState];
+}
+
+// Whole points, and exactly `height` at scale 1.0.
+- (CGFloat)scaledHeight:(CGFloat)height {
+    return ceil(height * self.workspaceTextScale);
+}
+
+// The breadcrumb grows with its text, and the toolbar with it. Neither shrinks
+// below its default: the back/forward/up buttons beside the path do not scale,
+// and a smaller bar would crowd them.
+- (CGFloat)pathScrollHeight {
+    CGFloat unscaled = kFileManagerToolbarHeight - 12.0;
+    return MAX(unscaled, [self scaledHeight:unscaled]);
+}
+
+// `font` at this window's text scale; `font` itself at 1.0.
+- (UIFont *)scaledFont:(UIFont *)font {
+    CGFloat size = [self workspaceScaledFontSize:font.pointSize];
+    return size == font.pointSize ? font : [font fontWithSize:size];
+}
+
+// Until the text is first scaled a file row keeps UIKit's own fonts, untouched.
+// After that every row is given one, even back at 1.0, because a dequeued cell
+// still carries whatever font its last row had.
+- (void)applyTextScaleToFileCell:(UITableViewCell *)cell {
+    if (!_fileRowFontsScaled || _fileRowBaseTextFont == nil)
+        return;
+    cell.textLabel.font = [self scaledFont:_fileRowBaseTextFont];
+    if (_fileRowBaseDetailFont != nil)
+        cell.detailTextLabel.font = [self scaledFont:_fileRowBaseDetailFont];
 }
 
 #pragma mark Theme
@@ -671,7 +743,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     label.textAlignment = NSTextAlignmentCenter;
     label.numberOfLines = 0;
     label.textColor = self.workspaceTheme[@"secondary"] ?: UIColor.secondaryLabelColor;
-    label.font = [UIFont systemFontOfSize:15.0];
+    label.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:15.0]];
     if (_loadError != nil)
         label.text = _loadError.localizedDescription.length ? _loadError.localizedDescription : @"Couldn’t load this folder.";
     else if (![ISHGuestFileBridge.sharedBridge isGuestAvailable])
@@ -707,7 +779,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kFileManagerSidebarCellReuseID];
     NSDictionary *row = [self sidebarRows][(NSUInteger)indexPath.row];
     cell.textLabel.text = row[@"title"];
-    cell.textLabel.font = [UIFont systemFontOfSize:13.0];
+    cell.textLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:13.0]];
     cell.textLabel.textColor = self.workspaceTheme[@"primary"];
     cell.imageView.image = [UIImage systemImageNamed:row[@"symbol"]];
     cell.imageView.tintColor = self.workspaceTheme[@"accent"];
@@ -718,8 +790,16 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
 - (UITableViewCell *)fileCellForRowAtIndexPath:(NSIndexPath *)indexPath inTableView:(UITableView *)tableView {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kFileManagerCellReuseID];
-    if (cell == nil)
+    if (cell == nil) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:kFileManagerCellReuseID];
+        // A new cell has had nothing set on it, so its fonts are the defaults
+        // the text scale multiplies.
+        if (_fileRowBaseTextFont == nil) {
+            _fileRowBaseTextFont = cell.textLabel.font;
+            _fileRowBaseDetailFont = cell.detailTextLabel.font;
+        }
+    }
+    [self applyTextScaleToFileCell:cell];
     if ((NSUInteger)indexPath.row >= _items.count)
         return cell;
 

@@ -952,20 +952,38 @@ static UIViewController *ISHCreateRootsViewController(void) {
 // table's actual row height or the new two-button footer). Used both as the preferred open size
 // (root level, no back row) and by -autosizeLauncherWindowForItemCount:showsBackRow: (current
 // level) when shortcuts are added/removed/drilled into.
-static CGSize ISHWorkspaceLauncherContentSize(NSUInteger itemRowCount, BOOL showsBackRow) {
+//
+// The row heights follow the applet's text scale (WorkspaceTextScalable), and the
+// applet takes them from the same two functions, so a scaled list and the window
+// sized for it cannot disagree. The Add/Edit footer does not scale, and the width
+// only grows: narrower than the default, those fixed-size pills would clip.
+static CGFloat ISHWorkspaceLauncherRowHeight(CGFloat textScale) {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0) * textScale);
+}
+
+static CGFloat ISHWorkspaceLauncherBackRowHeight(CGFloat textScale) {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 28.0 : 30.0) * textScale);
+}
+
+static CGSize ISHWorkspaceLauncherContentSizeAtTextScale(NSUInteger itemRowCount, BOOL showsBackRow, CGFloat textScale) {
     BOOL phone = ISHWorkspaceUsesPhoneLayout();
     CGFloat inset = phone ? 12.0 : 16.0;
     CGFloat spacing = 8.0;
-    CGFloat width = phone ? 168.0 : 200.0;
-    CGFloat tableRowHeight = phone ? 34.0 : 38.0;              // matches _tableView.rowHeight
-    CGFloat backRowHeight = phone ? 28.0 : 30.0;                // matches launcherBackButton's minimum height
+    CGFloat defaultWidth = phone ? 168.0 : 200.0;
+    CGFloat width = MAX(defaultWidth, ceil(defaultWidth * textScale));
+    CGFloat tableRowHeight = ISHWorkspaceLauncherRowHeight(textScale);      // matches _tableView.rowHeight
+    CGFloat backRowHeight = ISHWorkspaceLauncherBackRowHeight(textScale);   // matches launcherBackButton's minimum height
     CGFloat footerRowHeight = (phone ? 26.0 : 28.0) + 8.0;      // Add/Edit pill height + its 4pt top/bottom margins
 
-    CGFloat itemsHeight = itemRowCount > 0 ? (itemRowCount * tableRowHeight) : (phone ? 28.0 : 32.0);
+    CGFloat itemsHeight = itemRowCount > 0 ? (itemRowCount * tableRowHeight) : ceil((phone ? 28.0 : 32.0) * textScale);
     CGFloat height = inset + itemsHeight + spacing + footerRowHeight + inset;
     if (showsBackRow)
         height += backRowHeight + spacing;
     return CGSizeMake(width, height);
+}
+
+static CGSize ISHWorkspaceLauncherContentSize(NSUInteger itemRowCount, BOOL showsBackRow) {
+    return ISHWorkspaceLauncherContentSizeAtTextScale(itemRowCount, showsBackRow, 1.0);
 }
 
 // The Desktops applet sizes itself to the Desktop count: a vertical list of "Desktop N" rows
@@ -5140,7 +5158,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
     if (window == nil)
         return;
-    [self resizeDesktopWindow:window toSize:ISHWorkspaceLauncherContentSize(itemCount, showsBackRow) animated:YES];
+    // At the list's own text size, or its scaled rows run past the window.
+    CGFloat textScale = 1.0;
+    UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:window];
+    if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        textScale = ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale;
+    [self resizeDesktopWindow:window
+                       toSize:ISHWorkspaceLauncherContentSizeAtTextScale(itemCount, showsBackRow, textScale)
+                     animated:YES];
 }
 
 - (void)autosizeMonitorWindow {
@@ -7911,6 +7936,29 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// A font size at a tool window's text scale (WorkspaceTextScalable), for the
+// applets below whose sizes come from ISHWorkspaceThemeFontSize. At 1.0 the size
+// comes back untouched: -workspaceScaledFontSize: rounds to half a point, and the
+// density and phone factors give sizes in between (11 * 0.92 on a phone), so the
+// rounding alone would move text nobody had scaled -- or had scaled and put back.
+static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController *tool, CGFloat size) {
+    if (fabs(tool.workspaceTextScale - 1.0) < 0.001)
+        return size;
+    return [tool workspaceScaledFontSize:size];
+}
+
+// Theme names, their descriptions, the panel's prose (the preview card's sample
+// text included), the colour names with their R/G/B readouts and the editor's
+// buttons follow Cmd+= / Cmd+- / Cmd+0. The theme thumbnails, the wallpaper
+// image, the swatches, the sliders and the Rings/Bars control are pictures and
+// controls, and stay as they are.
+//
+// This applet posts ISHWorkspaceToolThemeDidChangeNotification, which every
+// applet observes. The text scale is this window's alone, so nothing here goes
+// near that notification: the scale is re-applied to this view controller only.
+@interface WorkspaceThemesToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceThemesToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
@@ -7935,6 +7983,47 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     NSMutableArray<UIButton *> *_themeSelectionButtons;
     NSMutableArray<UIButton *> *_editorActionButtons;
     NSString *_editingThemeIdentifier;
+    // The labels built once, each with the font it was finally given (the
+    // factory's size, or the literal that replaced it), and the fixed widths of
+    // the slider rows' R/G/B and value columns. Every re-apply starts from these.
+    NSMapTable<UILabel *, UIFont *> *_unscaledLabelFonts;
+    NSMapTable<NSLayoutConstraint *, NSNumber *> *_unscaledColumnWidths;
+}
+
+#pragma mark WorkspaceTextScalable
+
+- (void)recordUnscaledLabel:(UILabel *)label {
+    if (label.font != nil)
+        [_unscaledLabelFonts setObject:label.font forKey:label];
+}
+
+- (void)recordUnscaledColumnWidth:(NSLayoutConstraint *)constraint {
+    [_unscaledColumnWidths setObject:@(constraint.constant) forKey:constraint];
+}
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    for (UILabel *label in _unscaledLabelFonts) {
+        UIFont *unscaled = [_unscaledLabelFonts objectForKey:label];
+        CGFloat size = ISHWorkspaceToolScaledFontSize(self, unscaled.pointSize);
+        label.font = size == unscaled.pointSize ? unscaled : [unscaled fontWithSize:size];
+    }
+    // The columns line the sliders up across the cards; they widen with their
+    // digits so "255" is not clipped.
+    for (NSLayoutConstraint *constraint in _unscaledColumnWidths)
+        constraint.constant = ceil([_unscaledColumnWidths objectForKey:constraint].doubleValue * self.workspaceTextScale);
+    for (UIButton *button in _editorActionButtons)
+        button.titleLabel.font = [self themeUtilityButtonFont];
+    // The library is rebuilt rather than re-fonted: its rows build their fonts at
+    // the current scale, and this is the same rebuild a theme change runs.
+    [self refreshThemeSelectionButtons];
+}
+
+- (UIFont *)themeUtilityButtonFont {
+    return [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))
+                             weight:UIFontWeightSemibold];
 }
 
 - (NSString *)themeEditorTitleForKey:(NSString *)key {
@@ -7990,7 +8079,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     button.layer.cornerRadius = 10;
     button.layer.borderWidth = 1;
     button.contentEdgeInsets = UIEdgeInsetsMake(7, 10, 7, 10);
-    button.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1) weight:UIFontWeightSemibold];
+    button.titleLabel.font = [self themeUtilityButtonFont];
     [button setTitle:title forState:UIControlStateNormal];
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     [_editorActionButtons addObject:button];
@@ -8035,10 +8124,14 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     textStack.alignment = UIStackViewAlignmentLeading;
     textStack.userInteractionEnabled = NO;
     UILabel *titleLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleBody monospaced:NO];
-    titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightSemibold];
+    // Built at the window's text scale: -refreshThemeSelectionButtons rebuilds
+    // these rows, so this is where their size is decided every time.
+    titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                        weight:UIFontWeightSemibold];
     titleLabel.numberOfLines = 1;
     titleLabel.text = title;
     UILabel *detailLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+    detailLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
     detailLabel.numberOfLines = 2;
     [textStack addArrangedSubview:titleLabel];
     [textStack addArrangedSubview:detailLabel];
@@ -8075,6 +8168,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
     UILabel *titleLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
     titleLabel.text = title;
+    [self recordUnscaledLabel:titleLabel];
     UIView *swatch = [UIView new];
     swatch.translatesAutoresizingMaskIntoConstraints = NO;
     swatch.layer.cornerRadius = 8;
@@ -8104,7 +8198,10 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         UILabel *channelLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:YES];
         channelLabel.text = channelDescriptor[@"name"];
         channelLabel.textAlignment = NSTextAlignmentCenter;
-        [channelLabel.widthAnchor constraintEqualToConstant:16].active = YES;
+        NSLayoutConstraint *channelWidth = [channelLabel.widthAnchor constraintEqualToConstant:16];
+        channelWidth.active = YES;
+        [self recordUnscaledLabel:channelLabel];
+        [self recordUnscaledColumnWidth:channelWidth];
 
         UISlider *slider = [UISlider new];
         slider.minimumValue = 0.0f;
@@ -8114,7 +8211,10 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
         UILabel *valueLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:YES];
         valueLabel.textAlignment = NSTextAlignmentRight;
-        [valueLabel.widthAnchor constraintEqualToConstant:28].active = YES;
+        NSLayoutConstraint *valueWidth = [valueLabel.widthAnchor constraintEqualToConstant:28];
+        valueWidth.active = YES;
+        [self recordUnscaledLabel:valueLabel];
+        [self recordUnscaledColumnWidth:valueWidth];
 
         [row addArrangedSubview:channelLabel];
         [row addArrangedSubview:slider];
@@ -8349,6 +8449,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     _themeDetailLabelsByIdentifier = [NSMutableDictionary dictionary];
     _themeSelectionButtons = [NSMutableArray array];
     _editorActionButtons = [NSMutableArray array];
+    _unscaledLabelFonts = [NSMapTable weakToStrongObjectsMapTable];
+    _unscaledColumnWidths = [NSMapTable strongToStrongObjectsMapTable];
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -8589,6 +8691,17 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [_contentStack.widthAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.widthAnchor constant:-28],
     ]];
 
+    // Recorded here, after every literal that replaced a factory font (the
+    // eyebrow's 11pt) has run, so the text scale multiplies the font each label
+    // really has.
+    for (UILabel *label in @[headerEyebrow, _activeThemeLabel, headerBody,
+                             libraryTitle, librarySubtitle,
+                             editorTitle, _editorThemeLabel, _previewTitleLabel, _previewBodyLabel,
+                             backgroundTitle, backgroundSubtitle,
+                             densityTitle, _densityValueLabel, densitySubtitle,
+                             gaugeTitle, gaugeSubtitle])
+        [self recordUnscaledLabel:label];
+
     [self refreshThemeSelectionButtons];
     [self loadThemeIntoEditorWithIdentifier:ISHWorkspaceCurrentThemeIdentifier()];
 }
@@ -8668,13 +8781,25 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// Terminal names, the summary, the suspend status and the button captions all
+// follow Cmd+= / Cmd+- / Cmd+0; there is no chrome here beyond the cards.
+@interface WorkspaceSessionsToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceSessionsToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UILabel *_summaryLabel;
     UIStackView *_quickActionsStack;
     UIStackView *_sessionButtonsStack;
+    // Its first four are the quick actions, but only by the trim in
+    // -refreshSessions, which also drops the suspend button. The text scale
+    // keeps its own list of the quick actions rather than lean on that.
     NSMutableArray<UIButton *> *_trackedButtons;
+    NSArray<UIButton *> *_quickActionButtons;
+    UILabel *_summaryEyebrowLabel;
+    UILabel *_sessionsTitleLabel;
+    UILabel *_suspendEyebrowLabel;
     // Suspend to disk (kernel/checkpoint.c). The automatic half needs no UI --
     // it happens on backgrounding -- so what is here is the state of it and
     // the one thing a user cannot do any other way from a GUI: take one NOW.
@@ -8686,25 +8811,30 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // The two-line title these buttons wear, split out because the suspend button
 // changes both halves as its state changes ("Save Session Now" / "Open
 // Settings" / "Saving...").
+//
+// Every button's fonts are decided here, at the window's text scale, so a
+// terminal row rebuilt by -refreshSessions comes out at the current size.
 - (void)restyleSessionButton:(UIButton *)button title:(NSString *)title subtitle:(NSString *)subtitle {
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
     style.alignment = NSTextAlignmentLeft;
+    CGFloat titleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline));
+    CGFloat subtitleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1));
     NSMutableAttributedString *titleString =
         [[NSMutableAttributedString alloc] initWithString:title
                                                attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
+        NSFontAttributeName: [UIFont systemFontOfSize:titleSize
                                                weight:UIFontWeightSemibold],
         NSParagraphStyleAttributeName: style,
     }];
     [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
                                                                         attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
                                                weight:UIFontWeightMedium],
         NSParagraphStyleAttributeName: style,
     }]];
     [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
                                                                         attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
                                                weight:UIFontWeightMedium],
         NSParagraphStyleAttributeName: style,
     }]];
@@ -8750,6 +8880,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     UILabel *summaryTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
     summaryTitle.text = @"ACTIVE SESSIONS";
     summaryTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    _summaryEyebrowLabel = summaryTitle;
     _summaryLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
     _summaryLabel.numberOfLines = 0;
     [summaryStack addArrangedSubview:summaryTitle];
@@ -8802,6 +8933,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     }
     [_quickActionsStack addArrangedSubview:rowOne];
     [_quickActionsStack addArrangedSubview:rowTwo];
+    _quickActionButtons = (NSArray<UIButton *> *) [rowOne.arrangedSubviews arrayByAddingObjectsFromArray:rowTwo.arrangedSubviews];
     [NSLayoutConstraint activateConstraints:@[
         [_quickActionsStack.topAnchor constraintEqualToAnchor:quickActionsCard.topAnchor constant:8],
         [_quickActionsStack.leadingAnchor constraintEqualToAnchor:quickActionsCard.leadingAnchor constant:8],
@@ -8817,6 +8949,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     [sessionsCard addSubview:sessionsStack];
     UILabel *sessionsTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
     sessionsTitle.text = @"Live terminals";
+    _sessionsTitleLabel = sessionsTitle;
     _sessionButtonsStack = [UIStackView new];
     _sessionButtonsStack.axis = UILayoutConstraintAxisVertical;
     _sessionButtonsStack.spacing = 6;
@@ -8839,6 +8972,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     UILabel *suspendTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
     suspendTitle.text = @"SESSION SUSPEND";
     suspendTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    _suspendEyebrowLabel = suspendTitle;
     _suspendLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
     _suspendLabel.numberOfLines = 0;
     _suspendButton = [self sessionButtonWithTitle:@"Save Session Now"
@@ -9021,6 +9155,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
     if (Terminal.activeTerminals.count == 0) {
         UILabel *emptyLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+        emptyLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
         emptyLabel.text = @"No active terminals. Use the quick actions above to start a shell or console.";
         [_sessionButtonsStack addArrangedSubview:emptyLabel];
         return;
@@ -9038,6 +9173,38 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         button.accessibilityIdentifier = uuidString;
         [_sessionButtonsStack addArrangedSubview:button];
     }
+    [self workspaceApplyTheme];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Each size is rebuilt from its unscaled value: the labels from the sizes
+// -viewDidLoad gave them, the buttons through -restyleSessionButton:.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    UIFont *eyebrowFont = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, 9) weight:UIFontWeightSemibold];
+    _summaryEyebrowLabel.font = eyebrowFont;
+    _suspendEyebrowLabel.font = eyebrowFont;
+    _summaryLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleHeadline))];
+    _sessionsTitleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))];
+    _suspendLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))];
+    // The quick actions are built once, and their title and subtitle are not
+    // kept; they are read back out of the "Title\nSubtitle" the button wears.
+    for (UIButton *button in _quickActionButtons) {
+        NSString *text = [button attributedTitleForState:UIControlStateNormal].string;
+        NSRange newline = [text rangeOfString:@"\n"];
+        if (newline.location == NSNotFound)
+            continue;
+        [self restyleSessionButton:button
+                             title:[text substringToIndex:newline.location]
+                          subtitle:[text substringFromIndex:NSMaxRange(newline)]];
+    }
+    // Rebuilds the terminal rows and the suspend button at the new size.
+    [self refreshSessions];
+    // A restyled title has lost its colours, and -refreshSessions only puts
+    // them back when there is a terminal to list.
     [self workspaceApplyTheme];
 }
 
@@ -9281,6 +9448,13 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// The shortcut names (written by the user), the "‹ Back" row and the empty-list
+// text follow Cmd+= / Cmd+- / Cmd+0. The + Add and Edit pills are the list's
+// controls, deliberately muted beside it, and stay as they are; so do the
+// folder and reorder glyphs.
+@interface WorkspaceLauncherToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceLauncherToolViewController {
     // Outer scroll + vertical stack, matching every other applet in this file (see e.g. the
     // Monitor/Sessions/Storage tool view controllers): proven to position header/list/footer
@@ -9363,7 +9537,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     // so it never needs to scroll on its own — this also avoids a repeat of the earlier bug
     // where an ancestor scroll view's pan gesture competed with a drag inside this list.
     _tableView.scrollEnabled = NO;
-    _tableView.rowHeight = ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0;
+    _tableView.rowHeight = ISHWorkspaceLauncherRowHeight(self.workspaceTextScale);
     _tableView.separatorColor = [self launcherColorForKey:@"stroke" fallback:[UIColor colorWithWhite:0.5 alpha:0.35]];
     [_tableView registerClass:UITableViewCell.class forCellReuseIdentifier:ISHWorkspaceLauncherRowReuseIdentifier];
     _tableViewHeightConstraint = [_tableView.heightAnchor constraintEqualToConstant:_tableView.rowHeight];
@@ -9420,8 +9594,28 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     // its persisted frame (like the dock) so it returns to exactly where the user left it.
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [(id)weakSelf.workspaceHostViewController restoreLauncherWindowPlacement];
+        typeof(self) strongSelf = weakSelf;
+        [(id)strongSelf.workspaceHostViewController restoreLauncherWindowPlacement];
+        // The persisted frame is saved only when the user moves or resizes the
+        // window, so its size is from before any text-size change. Size the
+        // window to the scaled rows again, keeping the place just restored.
+        if (strongSelf != nil && fabs(strongSelf.workspaceTextScale - 1.0) > 0.001)
+            [(id)strongSelf.workspaceHostViewController autosizeLauncherWindowForItemCount:strongSelf->_rowShortcuts.count
+                                                                              showsBackRow:strongSelf->_currentPath.count > 0];
     });
+}
+
+#pragma mark WorkspaceTextScalable
+
+// The row height, the cells' font and the Back row are all decided where the
+// list is built, so a rebuild is the whole of it -- and the rebuild autosizes
+// the window, which is what keeps the last row on screen.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_tableView == nil)
+        return;
+    _tableView.rowHeight = ISHWorkspaceLauncherRowHeight(self.workspaceTextScale);
+    [self rebuildLauncherList];
 }
 
 - (UIColor *)launcherColorForKey:(NSString *)key fallback:(UIColor *)fallback {
@@ -9468,6 +9662,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
 
     if (shortcuts.count == 0) {
         UILabel *empty = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+        empty.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
         empty.numberOfLines = 0;
         empty.text = _currentPath.count > 0 ? @"No shortcuts in this group yet." : @"No shortcuts yet.";
         [_contentStack addArrangedSubview:empty];
@@ -9508,7 +9703,10 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
 
     cell.backgroundColor = UIColor.clearColor;
     cell.textLabel.text = name;
-    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightMedium];
+    // Set on every dequeue, from the unscaled size: a reused cell carries the
+    // font of whatever row it last showed, at whatever scale that was.
+    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                            weight:UIFontWeightMedium];
     cell.textLabel.textColor = [self launcherColorForKey:@"primary" fallback:UIColor.darkTextColor];
     cell.accessoryType = (isGroup && !_isEditing) ? UITableViewCellAccessoryDisclosureIndicator : UITableViewCellAccessoryNone;
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -9748,9 +9946,10 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     UIColor *primary = [self launcherColorForKey:@"primary" fallback:UIColor.darkTextColor];
     [back setTitle:@"‹ Back" forState:UIControlStateNormal];
     [back setTitleColor:primary forState:UIControlStateNormal];
-    back.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightSemibold];
+    back.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                             weight:UIFontWeightSemibold];
     back.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-    CGFloat minHeight = ISHWorkspaceUsesPhoneLayout() ? 28.0 : 30.0;
+    CGFloat minHeight = ISHWorkspaceLauncherBackRowHeight(self.workspaceTextScale);
     [back.heightAnchor constraintGreaterThanOrEqualToConstant:minHeight].active = YES;
     [back addTarget:self action:@selector(backButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     if (_isEditing) {
@@ -12267,10 +12466,53 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 
 @end
 
+// The header, its description and every button's two-line caption follow
+// Cmd+= / Cmd+- / Cmd+0.
+@interface WorkspaceShortcutsToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceShortcutsToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     NSMutableArray<UIButton *> *_shortcutButtons;
+    // One per button, in the same order: the height a button keeps even when its
+    // caption is short, which grows and shrinks with the caption's text.
+    NSMutableArray<NSLayoutConstraint *> *_shortcutMinimumHeightConstraints;
+    UILabel *_headerLabel;
+    UILabel *_detailLabel;
+}
+
+- (CGFloat)shortcutButtonMinimumHeight {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 52.0 : 58.0) * self.workspaceTextScale);
+}
+
+// The caption's fonts at the window's text scale. Colours are left to
+// -workspaceApplyTheme, which adds them to whatever title this sets.
+- (void)styleShortcutButton:(UIButton *)button title:(NSString *)title subtitle:(NSString *)subtitle {
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentLeft;
+    CGFloat titleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline));
+    CGFloat subtitleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1));
+    NSMutableAttributedString *label =
+        [[NSMutableAttributedString alloc] initWithString:title
+                                               attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:titleSize
+                                               weight:UIFontWeightSemibold],
+        NSParagraphStyleAttributeName: style,
+    }];
+    [label appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
+                                                                  attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [label appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
+                                                                  attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [button setAttributedTitle:label forState:UIControlStateNormal];
 }
 
 - (UIButton *)shortcutButtonWithTitle:(NSString *)title subtitle:(NSString *)subtitle identifier:(NSString *)identifier {
@@ -12284,31 +12526,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     button.layer.borderWidth = 1;
     [button setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
     [button setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisVertical];
-    CGFloat minimumHeight = ISHWorkspaceUsesPhoneLayout() ? 52.0 : 58.0;
-    [button.heightAnchor constraintGreaterThanOrEqualToConstant:minimumHeight].active = YES;
+    NSLayoutConstraint *minimumHeight = [button.heightAnchor constraintGreaterThanOrEqualToConstant:[self shortcutButtonMinimumHeight]];
+    minimumHeight.active = YES;
+    [_shortcutMinimumHeightConstraints addObject:minimumHeight];
 
-    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-    style.alignment = NSTextAlignmentLeft;
-    NSMutableAttributedString *label =
-        [[NSMutableAttributedString alloc] initWithString:title
-                                               attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
-                                               weight:UIFontWeightSemibold],
-        NSParagraphStyleAttributeName: style,
-    }];
-    [label appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                  attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [label appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
-                                                                  attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [button setAttributedTitle:label forState:UIControlStateNormal];
+    [self styleShortcutButton:button title:title subtitle:subtitle];
     [button addTarget:self action:@selector(runShortcut:) forControlEvents:UIControlEventTouchUpInside];
     [_shortcutButtons addObject:button];
     return button;
@@ -12318,6 +12540,7 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     [super viewDidLoad];
     self.title = @"Quick Actions";
     _shortcutButtons = [NSMutableArray array];
+    _shortcutMinimumHeightConstraints = [NSMutableArray array];
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -12333,6 +12556,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     header.text = @"Quick workspace actions";
     UILabel *detail = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
     detail.text = @"Open the most common tools and terminal actions without leaving the workspace.";
+    _headerLabel = header;
+    _detailLabel = detail;
     [_contentStack addArrangedSubview:header];
     [_contentStack addArrangedSubview:detail];
 
@@ -12400,6 +12625,32 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     _contentStack.spacing = ISHWorkspaceDensityValue(4, 6);
+}
+
+#pragma mark WorkspaceTextScalable
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    _headerLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleHeadline))];
+    _detailLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
+    // The captions are rebuilt, not re-fonted: a font set over the whole string
+    // would flatten the title and subtitle to one size. Their text is not kept
+    // anywhere else, so it is read back out of the "Title\nSubtitle" itself.
+    for (NSUInteger index = 0; index < _shortcutButtons.count; index++) {
+        UIButton *button = _shortcutButtons[index];
+        NSString *text = [button attributedTitleForState:UIControlStateNormal].string;
+        NSRange newline = [text rangeOfString:@"\n"];
+        if (newline.location != NSNotFound)
+            [self styleShortcutButton:button
+                                title:[text substringToIndex:newline.location]
+                             subtitle:[text substringFromIndex:NSMaxRange(newline)]];
+        if (index < _shortcutMinimumHeightConstraints.count)
+            _shortcutMinimumHeightConstraints[index].constant = [self shortcutButtonMinimumHeight];
+    }
+    // The rebuilt captions have no colours yet.
+    [self workspaceApplyTheme];
 }
 
 - (void)runShortcut:(UIButton *)sender {
