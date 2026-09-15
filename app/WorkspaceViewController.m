@@ -2392,6 +2392,59 @@ static CGSize ISHWorkspaceMonitorContentSize(void) {
     return CGSizeMake(width, contentHeight + ISHWorkspaceWindowTitleBarHeight);
 }
 
+// ---- Info and Monitor at a text scale (WorkspaceTextScalable) ----------------
+//
+// Both windows are sized to fit their tiles, so bigger text needs a bigger window, not a scroll.
+// Only the readings scale (a tile's subtitle, Info's Root and Startup values, Monitor's detail
+// rows), so only their rows add height. Across, the text widens by the scale and the insets,
+// icons and gaps beside it do not. Widening the window by exactly that keeps every value at the
+// fit it had at 1.0; left at the 1.0 width, adjustsFontSizeToFitWidth shrank the larger text
+// straight back. Neither window goes below its 1.0 size: smaller text only leaves room.
+
+// A line of text at `pointSize` times `textScale` (rounded as -workspaceScaledFontSize: rounds),
+// as tall as a label lays it out.
+static CGFloat ISHWorkspaceScaledLineHeight(CGFloat pointSize, CGFloat textScale, UIFontWeight weight) {
+    CGFloat scaledSize = round(pointSize * textScale * 2.0) / 2.0;
+    return ceil([UIFont systemFontOfSize:scaledSize weight:weight].lineHeight);
+}
+
+// `width` with all but its `chromeWidth` scaled.
+static CGFloat ISHWorkspaceScaledWindowWidth(CGFloat width, CGFloat chromeWidth, CGFloat textScale) {
+    return MAX(width, ceil(chromeWidth + (width - chromeWidth) * textScale));
+}
+
+static CGSize ISHWorkspaceMonitorContentSizeForTextScale(CGFloat textScale) {
+    CGSize size = ISHWorkspaceMonitorContentSize();
+    // The five detail rows are as tall as their 16pt icons until the 12pt text outgrows them. The
+    // card allowance above has slack past that; the growth goes on top of it.
+    CGFloat rowGrowth = MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightSemibold)) -
+                        MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightSemibold));
+    // The 20pt header allowance in each of the two gauge rows, which the 12pt subtitle outgrows.
+    CGFloat headerGrowth = MAX(20.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightRegular)) -
+                           MAX(20.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightRegular));
+    size.height += 5.0 * MAX(0.0, rowGrowth) + 2.0 * MAX(0.0, headerGrowth);
+    // A detail row's fixed part: the content stack's and the card's insets, the 18pt icon and the
+    // 10pt gaps either side of the title.
+    size.width = ISHWorkspaceScaledWindowWidth(size.width, 6.0 * 2.0 + 12.0 * 2.0 + 18.0 + 10.0 * 2.0, textScale);
+    return size;
+}
+
+static CGSize ISHWorkspaceInfoContentSizeForTextScale(CGFloat textScale) {
+    CGSize size = ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolInfoIdentifier);
+    // The gauge row's header is as tall as its 16pt icon until the 12pt subtitle outgrows it.
+    CGFloat headerGrowth = MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightRegular)) -
+                           MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightRegular));
+    // The stat row's value (-workspaceStatTileWithIcon:caption:valueLabel:).
+    CGFloat valuePointSize = ISHWorkspaceUsesPhoneLayout() ? 15.0 : 17.0;
+    CGFloat valueGrowth = ISHWorkspaceScaledLineHeight(valuePointSize, textScale, UIFontWeightSemibold) -
+                          ISHWorkspaceScaledLineHeight(valuePointSize, 1.0, UIFontWeightSemibold);
+    size.height += MAX(0.0, headerGrowth) + MAX(0.0, valueGrowth);
+    // Fixed across a row: the content stack's insets, the gap between the two tiles and each
+    // tile's insets.
+    size.width = ISHWorkspaceScaledWindowWidth(size.width, 6.0 * 2.0 + 8.0 + 12.0 * 2.0 * 2.0, textScale);
+    return size;
+}
+
 static CGFloat ISHWorkspaceDensityValue(CGFloat compact, CGFloat roomy) {
     return compact + ((roomy - compact) * ISHWorkspaceCurrentDensity());
 }
@@ -5169,13 +5222,6 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     [self resizeDesktopWindow:window
                        toSize:ISHWorkspaceLauncherContentSizeAtTextScale(itemCount, showsBackRow, textScale)
                      animated:YES];
-}
-
-- (void)autosizeMonitorWindow {
-    ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolMonitorIdentifier];
-    if (window == nil)
-        return;
-    [self resizeDesktopWindow:window toSize:ISHWorkspaceMonitorContentSize() animated:YES];
 }
 
 // In-app Desktops: a Desktop is a set of contained windows sharing a workspaceDesktopIndex.
@@ -9281,11 +9327,19 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
 
 @end
 
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). What a person reads here scales: the per-root
+// lines (a -workspaceThemeTextView, which the base class re-fonts) and the summary above them.
+// The ROOT STORAGE heading and the Rescan row stay: a card title, and a button with its caption,
+// in a horizontal row where larger text would only squeeze the caption against the button.
+@interface WorkspaceStorageToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceStorageToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UILabel *_summaryLabel;
     UITextView *_detailsTextView;
+    NSLayoutConstraint *_detailsMinimumHeightConstraint;
     UIButton *_refreshButton;
     NSUInteger _refreshGeneration;
 }
@@ -9361,8 +9415,9 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
     UIView *detailsCard = [self workspaceThemeCardView];
     _detailsTextView = [self workspaceThemeTextView];
     [detailsCard addSubview:_detailsTextView];
+    _detailsMinimumHeightConstraint = [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:[self storageDetailsMinimumHeight]];
     [NSLayoutConstraint activateConstraints:@[
-        [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:(ISHWorkspaceUsesPhoneLayout() ? 132.0 : 168.0)],
+        _detailsMinimumHeightConstraint,
         [_detailsTextView.topAnchor constraintEqualToAnchor:detailsCard.topAnchor constant:8],
         [_detailsTextView.leadingAnchor constraintEqualToAnchor:detailsCard.leadingAnchor constant:8],
         [_detailsTextView.trailingAnchor constraintEqualToAnchor:detailsCard.trailingAnchor constant:-8],
@@ -9447,6 +9502,19 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
             self->_detailsTextView.text = [lines componentsJoinedByString:@"\n"];
         });
     });
+}
+
+// A scrolling text view has no height of its own, so the details card sits at this minimum. It
+// follows the text size, to show as many lines as at 1.0, but not below its 1.0 height: smaller
+// text shows more lines instead of leaving a gap under the card in a window that does not shrink.
+- (CGFloat)storageDetailsMinimumHeight {
+    return (ISHWorkspaceUsesPhoneLayout() ? 132.0 : 168.0) * MAX(1.0, self.workspaceTextScale);
+}
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_summaryLabel];
+    _detailsMinimumHeightConstraint.constant = [self storageDetailsMinimumHeight];
 }
 
 - (void)workspaceApplyTheme {
@@ -14553,6 +14621,31 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 @end
 
+// Info's and Monitor's window follows the text size only while it still has the size the applet
+// gave it -- its size at the previous scale. A window someone has resized keeps their frame, and so
+// does a restored one: the Workspace applies the saved frame before the saved scale, and that frame
+// already has the size it had at that scale. The scroll view shows whatever no longer fits.
+// `autosizedSize` is the frame the last resize produced, because the Desktop clamps a size larger
+// than its room and the clamped frame then matches neither computed size.
+static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewController *viewController,
+                                                 CGSize previousSize, CGSize size, CGSize *autosizedSize) {
+    ISHWorkspaceContainedWindowView *windowView = ISHWorkspaceWindowContainingResponder(viewController);
+    if (windowView == nil)
+        return;
+    CGSize current = windowView.frame.size;
+    BOOL atPreviousSize = fabs(current.width - previousSize.width) < 1.0 &&
+                          fabs(current.height - previousSize.height) < 1.0;
+    BOOL atAutosizedSize = fabs(current.width - autosizedSize->width) < 1.0 &&
+                           fabs(current.height - autosizedSize->height) < 1.0;
+    if (!atPreviousSize && !atAutosizedSize)
+        return;
+    [(id) viewController.workspaceHostViewController resizeDesktopWindow:windowView toSize:size animated:YES];
+    *autosizedSize = windowView.frame.size;
+}
+
+@interface WorkspaceInfoToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceInfoToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
@@ -14565,6 +14658,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UILabel *_rootValueLabel;
     UILabel *_startupValueLabel;
     NSTimer *_timer;
+    CGFloat _appliedTextScale;      // the scale the labels and window were last sized for; 0 is 1.0
+    CGSize _autosizedWindowSize;
 }
 
 - (UIView *)infoMetricCardWithTitle:(NSString *)title valueLabel:(UILabel * __strong *)valueLabel {
@@ -14727,11 +14822,33 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _startupValueLabel.text = ISHInitialWindowTitle();
 }
 
+// WorkspaceTextScalable. The readings scale: the Battery and Storage subtitles and the Root and
+// Startup values. The tile captions and icons stay, and so do the gauges: WorkspaceGaugeView draws
+// its percentage to fit the ring, and the ring's height is the tile's. The window grows with the
+// text while it still has the size Info gave it (ISHWorkspaceResizeWindowForTextScale).
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_batterySubtitle];
+    [self workspaceScaleLabel:_storageSubtitle];
+    [self workspaceScaleLabel:_rootValueLabel];
+    [self workspaceScaleLabel:_startupValueLabel];
+    CGFloat previousScale = _appliedTextScale > 0 ? _appliedTextScale : 1.0;
+    _appliedTextScale = self.workspaceTextScale;
+    if (fabs(_appliedTextScale - previousScale) < 0.001)
+        return;
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspaceInfoContentSizeForTextScale(previousScale),
+                                         ISHWorkspaceInfoContentSizeForTextScale(_appliedTextScale),
+                                         &_autosizedWindowSize);
+}
+
 - (void)workspaceApplyTheme {
     [super workspaceApplyTheme];
     _storageGauge.fillColor = self.workspaceTheme[@"accentAlt"];
 }
 
+@end
+
+@interface WorkspaceMonitorToolViewController () <WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceMonitorToolViewController {
@@ -14752,9 +14869,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UILabel *_networkValueLabel;
     UILabel *_startupValueLabel;
     UILabel *_liveValueLabel;
+    NSMutableArray<UILabel *> *_detailRowLabels;   // title and value of each detail row
     NSTimer *_timer;
     natural_t _previousCPUTicks[CPU_STATE_MAX];
     BOOL _hasPreviousCPUSample;
+    CGFloat _appliedTextScale;      // the scale the labels and window were last sized for; 0 is 1.0
+    CGSize _autosizedWindowSize;
 }
 
 - (void)viewDidLoad {
@@ -14788,13 +14908,25 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [_gaugeRow2 addArrangedSubview:[self workspaceGaugeTileWithIcon:@"internaldrive" caption:@"Storage" subtitleLabel:&_storageSubtitle gauge:&_storageGauge]];
     [_contentStack addArrangedSubview:_gaugeRow2];
 
-    [_contentStack addArrangedSubview:[self workspaceRowsCardWithRows:@[
+    NSArray<UIView *> *detailRows = @[
         [self workspaceIconRowWithIcon:@"clock" title:@"Uptime" valueLabel:&_uptimeValueLabel],
         [self workspaceIconRowWithIcon:@"folder" title:@"Root" valueLabel:&_rootValueLabel],
         [self workspaceIconRowWithIcon:@"network" title:@"Network" valueLabel:&_networkValueLabel],
         [self workspaceIconRowWithIcon:@"bolt" title:@"Startup" valueLabel:&_startupValueLabel],
         [self workspaceIconRowWithIcon:@"square.grid.2x2" title:@"Live" valueLabel:&_liveValueLabel],
-    ]]];
+    ];
+    [_contentStack addArrangedSubview:[self workspaceRowsCardWithRows:detailRows]];
+    // The text scale needs each row's title as well as its value, and the row helper hands back
+    // only the value.
+    _detailRowLabels = [NSMutableArray array];
+    for (UIView *row in detailRows) {
+        if (![row isKindOfClass:UIStackView.class])
+            continue;
+        for (UIView *view in ((UIStackView *) row).arrangedSubviews) {
+            if ([view isKindOfClass:UILabel.class])
+                [_detailRowLabels addObject:(UILabel *) view];
+        }
+    }
 
     [NSLayoutConstraint activateConstraints:@[
         [_scrollView.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor],
@@ -14820,9 +14952,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)monitorGaugeStyleDidChange {
     // Ring vs bar gauges differ in height, so resize the window to the new style (deferred so the
     // gauges re-lay-out first) — keeps both gauge rows visible instead of clipping or floating.
+    // At the window's text size, or a larger detail card is clipped. And this Monitor's own window:
+    // looking one up by tool identifier found the frontmost Monitor, whichever that was.
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [(id)weakSelf.workspaceHostViewController autosizeMonitorWindow];
+        WorkspaceMonitorToolViewController *strongSelf = weakSelf;
+        ISHWorkspaceContainedWindowView *windowView = ISHWorkspaceWindowContainingResponder(strongSelf);
+        if (windowView == nil)
+            return;
+        [(id) strongSelf.workspaceHostViewController resizeDesktopWindow:windowView
+                                                                   toSize:ISHWorkspaceMonitorContentSizeForTextScale(strongSelf.workspaceTextScale)
+                                                                 animated:YES];
+        strongSelf->_autosizedWindowSize = windowView.frame.size;
     });
 }
 
@@ -15039,6 +15180,27 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                             (unsigned long) [Terminal activeTerminals].count];
 }
 
+// WorkspaceTextScalable. The readings scale: the four tile subtitles and both columns of the
+// detail rows. The tile captions, icons and gauges stay, as in Info. The window grows with the
+// text while it still has the size Monitor gave it; a gauge style change sizes it for the text
+// either way (-monitorGaugeStyleDidChange).
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_cpuSubtitle];
+    [self workspaceScaleLabel:_memorySubtitle];
+    [self workspaceScaleLabel:_batterySubtitle];
+    [self workspaceScaleLabel:_storageSubtitle];
+    for (UILabel *label in _detailRowLabels)
+        [self workspaceScaleLabel:label];
+    CGFloat previousScale = _appliedTextScale > 0 ? _appliedTextScale : 1.0;
+    _appliedTextScale = self.workspaceTextScale;
+    if (fabs(_appliedTextScale - previousScale) < 0.001)
+        return;
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspaceMonitorContentSizeForTextScale(previousScale),
+                                         ISHWorkspaceMonitorContentSizeForTextScale(_appliedTextScale),
+                                         &_autosizedWindowSize);
+}
+
 - (void)workspaceApplyTheme {
     [super workspaceApplyTheme];
     _memoryGauge.fillColor = self.workspaceTheme[@"accentAlt"];
@@ -15047,11 +15209,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 @end
 
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). The interface lines are a
+// -workspaceThemeTextView, which the base class re-fonts, and the summary line above them is a
+// reading too. The CONNECTIVITY heading stays, as the card's title.
+@interface WorkspaceNetworksToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceNetworksToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UILabel *_summaryLabel;
     UITextView *_textView;
+    NSLayoutConstraint *_detailsMinimumHeightConstraint;
     NSTimer *_timer;
 }
 
@@ -15093,8 +15262,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UIView *detailsCard = [self workspaceThemeCardView];
     _textView = [self workspaceThemeTextView];
     [detailsCard addSubview:_textView];
+    _detailsMinimumHeightConstraint = [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:[self networksDetailsMinimumHeight]];
     [NSLayoutConstraint activateConstraints:@[
-        [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:(ISHWorkspaceUsesPhoneLayout() ? 92.0 : 110.0)],
+        _detailsMinimumHeightConstraint,
         [_textView.topAnchor constraintEqualToAnchor:detailsCard.topAnchor constant:8],
         [_textView.leadingAnchor constraintEqualToAnchor:detailsCard.leadingAnchor constant:8],
         [_textView.trailingAnchor constraintEqualToAnchor:detailsCard.trailingAnchor constant:-8],
@@ -15157,6 +15327,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _contentStack.spacing = ISHWorkspaceDensityValue(4, 8);
 }
 
+// As Storage's details card (-storageDetailsMinimumHeight): the scrolling text view gives the card
+// no height, so the minimum is its height, and it follows the text size from 1.0 up.
+- (CGFloat)networksDetailsMinimumHeight {
+    return (ISHWorkspaceUsesPhoneLayout() ? 92.0 : 110.0) * MAX(1.0, self.workspaceTextScale);
+}
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_summaryLabel];
+    _detailsMinimumHeightConstraint.constant = [self networksDetailsMinimumHeight];
+}
+
 @end
 
 // Guest log reads run /bin/sh in the guest via run_guest_command_capture, which repoints
@@ -15170,6 +15352,12 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
     });
     return queue;
 }
+
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). The log is a -workspaceThemeTextView, which the
+// base class re-fonts, in a card that fills the window and scrolls it, so nothing here needs an
+// override. The header stays: the RECENT LOGS caption and the log file's path title the card.
+@interface WorkspaceStatusToolViewController () <WorkspaceTextScalable>
+@end
 
 @implementation WorkspaceStatusToolViewController {
     UILabel *_sourceLabel;
