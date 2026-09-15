@@ -410,8 +410,17 @@ static void cli_pty_restore_host_terminal(void) {
         tcsetattr(STDIN_FILENO, TCSANOW, &cli_pty_saved_termios);
 }
 
+// Which terminal a reader feeds. Not a reference: the reader must not keep the
+// terminal alive after its session is over. See cli_pty_read_thread.
+struct cli_pty_reader {
+    struct tty *tty; // identity only -- compared, never dereferenced
+    int type;
+    int num;
+};
+
 static void *cli_pty_read_thread(void *opaque) {
-    struct tty *tty = opaque;
+    struct cli_pty_reader reader = *(struct cli_pty_reader *) opaque;
+    free(opaque);
     int in = dup(STDIN_FILENO);
     if (in < 0)
         in = STDIN_FILENO;
@@ -419,7 +428,18 @@ static void *cli_pty_read_thread(void *opaque) {
     for (;;) {
         ssize_t n = read(in, &ch, 1);
         if (n == 1) {
+            // The terminal belongs to the session, not to this thread. When the
+            // last descriptor on it closes -- the shell exits, as a restored zsh
+            // that read EIO did -- tty_release frees the struct, and a byte
+            // arriving after that walked the freed tty->fds into poll_wakeup.
+            // Hold a reference across the call instead, re-found by device
+            // number exactly as the app's -sendInput does, and stop once the
+            // terminal is gone: nothing will ever read it again.
+            struct tty *tty = tty_lookup_ref(reader.type, reader.num, reader.tty);
+            if (tty == NULL)
+                return NULL;
             tty_input(tty, &ch, 1, 0);
+            tty_put(tty);
             continue;
         }
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
@@ -445,9 +465,17 @@ static int cli_pty_init(struct tty *tty) {
         cfmakeraw(&raw);
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     }
+    // Called from tty_get under ttys_lock, before the tty is in its slot, so
+    // the reader's first tty_lookup_ref waits for that lock and finds it.
+    struct cli_pty_reader *reader = malloc(sizeof(*reader));
+    if (reader == NULL)
+        return _ENOMEM;
+    *reader = (struct cli_pty_reader) {.tty = tty, .type = tty->type, .num = tty->num};
     pthread_t th;
-    if (pthread_create(&th, NULL, cli_pty_read_thread, tty) != 0)
+    if (pthread_create(&th, NULL, cli_pty_read_thread, reader) != 0) {
+        free(reader);
         return _EIO;
+    }
     pthread_detach(th);
     return 0;
 }
