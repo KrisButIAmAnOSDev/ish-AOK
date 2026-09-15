@@ -11,6 +11,10 @@
 #import "Theme.h"
 #import "ThemeViewController.h"
 #import "UserPreferences.h"
+#import "WorkspaceViewController.h"
+
+@interface ThemesViewController () <WorkspaceTextScaledPage>
+@end
 
 @implementation ThemesViewController {
     BOOL _singleRowEditing;
@@ -150,7 +154,19 @@ enum {
     return [self shouldHideSection:section] ? CGFLOAT_MIN : UITableViewAutomaticDimension;
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Theme" forIndexPath:indexPath];
     
     cell.textLabel.textColor = indexPath.section == ImportSection ? cell.tintColor : nil;

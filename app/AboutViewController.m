@@ -109,10 +109,10 @@ UINavigationController *ISHCreateAboutNavigationController(BOOL recoveryMode, BO
 
 @end
 
-@interface LLMSettingsViewController : UITableViewController
+@interface LLMSettingsViewController : UITableViewController <WorkspaceTextScaledPage>
 @end
 
-@interface LLMProviderPickerViewController : UITableViewController
+@interface LLMProviderPickerViewController : UITableViewController <WorkspaceTextScaledPage>
 @end
 
 // The saved chats, newest first: switch, rename, delete. Presented modally
@@ -125,7 +125,7 @@ UINavigationController *ISHCreateAboutNavigationController(BOOL recoveryMode, BO
 
 // The saved destinations: select, edit, duplicate, delete, add from a preset.
 // Reachable both from the chat's destination menu and from LLM Settings.
-@interface LLMDestinationListViewController : UITableViewController
+@interface LLMDestinationListViewController : UITableViewController <WorkspaceTextScaledPage>
 @property (nonatomic, copy) void (^destinationsChanged)(void);
 @end
 
@@ -152,7 +152,7 @@ BOOL ISHLLMClientEnabled(void) {
     return UserPreferences.shared.shouldEnableLLMClient;
 }
 
-@interface AboutViewController ()
+@interface AboutViewController () <WorkspaceTextScaledPage>
 @property (weak, nonatomic) IBOutlet UITableViewCell *capsLockMappingCell;
 @property (weak, nonatomic) IBOutlet UITableViewCell *themeCell;
 @property (weak, nonatomic) IBOutlet UITableViewCell *initialWindowCell;
@@ -185,11 +185,16 @@ BOOL ISHLLMClientEnabled(void) {
 
 @end
 
+// The report's point size at text scale 1.0. In a Workspace window it follows
+// the window's text size (Cmd+= / Cmd+-).
+static const CGFloat kDiagnosticsFontSize = 12;
+
 // How close to the end counts as "at the end", for deciding whether to follow
-// the tail. One line of the monospaced 12pt font, near enough.
+// the tail. One line of the monospaced 12pt font, near enough; it grows with
+// the font.
 static const CGFloat kDiagnosticsBottomSlack = 16;
 
-@interface DiagnosticsViewController ()
+@interface DiagnosticsViewController () <WorkspaceTextScaledPage>
 // Set when the workspace embeds this in its own window, which already draws a
 // title bar saying "Diagnostics". Without it the pane shows that word twice,
 // stacked.
@@ -199,6 +204,7 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
 @implementation DiagnosticsViewController {
     UITextView *_textView;
     BOOL _everLoaded;         // the first load starts at the top; later ones do not
+    CGFloat _reportFontSize;  // kDiagnosticsFontSize at the window's text scale
 }
 
 - (void)viewDidLoad {
@@ -218,12 +224,11 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     if (@available(iOS 13.0, *)) {
         _textView.backgroundColor = UIColor.systemBackgroundColor;
         _textView.textColor = UIColor.labelColor;
-        _textView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
     } else {
         _textView.backgroundColor = UIColor.whiteColor;
         _textView.textColor = UIColor.blackColor;
-        _textView.font = [UIFont fontWithName:@"Menlo-Regular" size:12] ?: [UIFont systemFontOfSize:12];
     }
+    [self applyReportFont];
     [self.view addSubview:_textView];
 
     self.navigationItem.rightBarButtonItems = @[
@@ -304,7 +309,7 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     CGFloat maxOffset = _textView.contentSize.height - _textView.bounds.size.height + insetBottom;
     if (maxOffset <= 0)
         return YES;   // it all fits; there is nowhere else to be
-    return _textView.contentOffset.y >= maxOffset - kDiagnosticsBottomSlack;
+    return _textView.contentOffset.y >= maxOffset - kDiagnosticsBottomSlack * _reportFontSize / kDiagnosticsFontSize;
 }
 
 // Take a snapshot of the report and show it, without moving the reader.
@@ -364,6 +369,48 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
     _everLoaded = YES;
 }
 
+// The report's font, at the text size of the Workspace window showing it.
+- (void)applyReportFont {
+    _reportFontSize = ISHWorkspaceScaledPointSize(kDiagnosticsFontSize, ISHWorkspaceTextScaleForViewController(self));
+    if (@available(iOS 13.0, *)) {
+        _textView.font = [UIFont monospacedSystemFontOfSize:_reportFontSize weight:UIFontWeightRegular];
+    } else {
+        _textView.font = [UIFont fontWithName:@"Menlo-Regular" size:_reportFontSize] ?: [UIFont systemFontOfSize:_reportFontSize];
+    }
+}
+
+// Cmd+= / Cmd+- in a Workspace window. Only the font changes; the text is not
+// replaced, so a selection survives (viewDidLoad says why that matters here).
+// The reader stays where they were: on the end if they were following it,
+// otherwise on the line that was at the top, which the new size moves.
+- (void)workspaceTextScaleDidChange {
+    if (!_everLoaded) {
+        [self applyReportFont];
+        return;
+    }
+    BOOL follow = [self textViewIsAtBottom];
+    CGFloat insetTop = _textView.adjustedContentInset.top;
+    UITextPosition *top = [_textView closestPositionToPoint:CGPointMake(_textView.textContainerInset.left + 1,
+                                                                        _textView.contentOffset.y + insetTop)];
+    NSInteger topIndex = top != nil ? [_textView offsetFromPosition:_textView.beginningOfDocument toPosition:top] : 0;
+
+    [self applyReportFont];
+    [_textView layoutIfNeeded];   // so contentSize and the caret below describe the NEW size
+
+    CGFloat maxOffset = _textView.contentSize.height - _textView.bounds.size.height + _textView.adjustedContentInset.bottom;
+    CGPoint offset = _textView.contentOffset;
+    if (follow) {
+        offset.y = maxOffset;
+    } else {
+        UITextPosition *position = [_textView positionFromPosition:_textView.beginningOfDocument offset:topIndex];
+        if (position != nil)
+            offset.y = CGRectGetMinY([_textView caretRectForPosition:position]) - _textView.textContainerInset.top - insetTop;
+        offset.y = MIN(offset.y, maxOffset);
+    }
+    offset.y = MAX(offset.y, -insetTop);
+    [_textView setContentOffset:offset animated:NO];
+}
+
 - (void)exportDiagnostics:(id)sender {
     NSError *error = nil;
     NSURL *bundleURL = [ISHDiagnosticsStore prepareExportBundle:&error];
@@ -397,11 +444,13 @@ static const CGFloat kDiagnosticsBottomSlack = 16;
 // Filesystems and Settings already solved this the same way, for the same
 // reason; see their comments in ISHWorkspaceViewControllerForToolIdentifier.
 // The bar's title is suppressed (see embeddedInWorkspaceWindow) because the
-// window's own title bar already says "Diagnostics".
+// window's own title bar already says "Diagnostics". The navigation controller
+// is the Workspace's own class, which carries the window's text size
+// (Cmd+= / Cmd+-) to the report.
 UIViewController *ISHCreateDiagnosticsNavigationController(void) {
     DiagnosticsViewController *diagnostics = [DiagnosticsViewController new];
     diagnostics.embeddedInWorkspaceWindow = YES;
-    return [[UINavigationController alloc] initWithRootViewController:diagnostics];
+    return [[WorkspaceToolNavigationController alloc] initWithRootViewController:diagnostics];
 }
 
 static NSURL *ISHLLMPersistDirectoryURL(void) {
@@ -5092,7 +5141,19 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
     return [NSString stringWithFormat:@"Use a /v1 OpenAI-compatible server, or the Gemini preset. Hosted providers require API keys.\nShell Tools lets an OpenAI-compatible model run commands in the iSH shell (web search via curl, etc.), confirmed per command; not available for Gemini. The command timeout, output limit, and tool call round cap are adjustable above.\n%@\n%@", thinkingNote, destinationsNote];
 }
 
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     if (indexPath.section == 0) {
@@ -5503,7 +5564,19 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
     return @"Choose a provider preset. Custom values can still be edited afterward.";
 }
 
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
     NSString *name = ISHLLMProviderPresets()[indexPath.row][@"name"];
     cell.textLabel.text = name;
@@ -5720,7 +5793,7 @@ static NSString *ISHLLMRelativeDateDescription(double timestamp) {
 // Edits ONE saved destination, active or not. Writes go through
 // ISHLLMSaveDestination, which re-activates the entry if it is the selected
 // one, so editing the destination you are chatting with takes effect at once.
-@interface LLMDestinationEditorViewController : UITableViewController
+@interface LLMDestinationEditorViewController : UITableViewController <WorkspaceTextScaledPage>
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *destination;
 @property (nonatomic, copy) void (^destinationSaved)(void);
 @end
@@ -5757,7 +5830,19 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     return @"A preset fills in the provider, server URL and model; each stays editable. The API key is stored with this destination, in app preferences, the same place the single-endpoint key was always kept.";
 }
 
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     switch ((ISHLLMDestinationEditorRow) indexPath.row) {
@@ -5948,7 +6033,19 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     return @"Tap a destination to chat with it; tap the arrow to edit it. The selected destination is what the chat, Test Connection and Query Models all use. Swipe to duplicate or delete.";
 }
 
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     NSDictionary<NSString *, NSString *> *destination = _destinations[indexPath.row];
     cell.textLabel.text = ISHLLMDestinationDisplayName(destination);
@@ -6432,7 +6529,22 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     return [super tableView:tableView numberOfRowsInSection:section];
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. The
+// version line under the table stays as it is: a table footer view with a fixed
+// 44-point frame, which the table does not re-measure. So do the section headers
+// and footers, which UIKit makes and measures from its own font.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == [self _userAccountSectionIndex])
         return [self _loginAsDefaultUserCell];
     if (indexPath.section == [self _llmSectionIndex]) {
@@ -6462,9 +6574,13 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if ([self _isAppendedSection:indexPath.section])
-        return 44;
-    return [super tableView:tableView heightForRowAtIndexPath:indexPath];
+    CGFloat height = [self _isAppendedSection:indexPath.section]
+        ? 44
+        : [super tableView:tableView heightForRowAtIndexPath:indexPath];
+    // The storyboard's switch and command rows centre their label and control
+    // with nothing above or below, so they stay 44 points tall whatever the text
+    // size, and larger text would be clipped.
+    return ISHWorkspaceTextScaledRowHeight(height, ISHWorkspaceTextScaleForViewController(self));
 }
 
 - (NSInteger)tableView:(UITableView *)tableView indentationLevelForRowAtIndexPath:(NSIndexPath *)indexPath {

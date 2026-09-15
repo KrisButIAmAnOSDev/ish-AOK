@@ -47,6 +47,56 @@ extern NSString *_Nullable ISHWorkspaceToolIdentifierForViewController(UIViewCon
 @property (nonatomic) CGFloat workspaceTextScale;
 @end
 
+// A page of an applet whose window holds a navigation controller -- Settings,
+// Diagnostics, Filesystems -- and whose text follows that window's text size.
+//
+// Those pages are ordinary UIKit screens that iSH-AOK also shows outside the
+// Workspace, so the scale cannot be theirs. The Workspace looks for
+// WorkspaceTextScalable on the window's content view controller, which for
+// these applets is the navigation controller, so that is what holds it. A page
+// reads it with ISHWorkspaceTextScaleForViewController whenever it makes text,
+// which is what sizes a page pushed later and a row scrolled in later. Anywhere
+// else it reads 1.0, and the page's text is not touched.
+@protocol WorkspaceTextScaledPage <NSObject>
+// The window's scale changed. Sent to every page on the stack whose view is
+// loaded, not only the top one: Back shows the others again.
+- (void)workspaceTextScaleDidChange;
+@end
+
+// The navigation controller the Workspace wraps Diagnostics and Filesystems in.
+// Only the Workspace makes one; the same pages anywhere else sit in a plain
+// UINavigationController. (Settings gets a subclass of its storyboard's own
+// navigation controller class instead; see ISHCreateWorkspaceToolViewController.)
+@interface WorkspaceToolNavigationController : UINavigationController <WorkspaceTextScalable>
+@end
+
+// The text scale of the Workspace window `viewController` is shown in: that of
+// the nearest view controller up its parent chain adopting
+// WorkspaceTextScalable. 1.0 anywhere else, including a screen presented
+// modally from inside such a window.
+extern CGFloat ISHWorkspaceTextScaleForViewController(UIViewController *viewController);
+// `size` at `scale`, rounded to half a point as the applets round it.
+extern CGFloat ISHWorkspaceScaledPointSize(CGFloat size, CGFloat scale);
+// Scale a UILabel's or UITextField's font from its unscaled font, which is
+// remembered, so calling it again never compounds. A font set on the view since
+// the last call is taken as the new unscaled font. At 1.0 a view that was never
+// scaled is not touched at all.
+extern void ISHWorkspaceScaleTextFont(UIView *_Nullable view, CGFloat scale);
+// The same for a table cell's labels and text fields. A page calls it on every
+// cell it returns from -tableView:cellForRowAtIndexPath:, which covers reloads,
+// reuse and static cells alike.
+extern void ISHWorkspaceScaleTableViewCell(UITableViewCell *_Nullable cell, CGFloat scale);
+// What -workspaceTextScaleDidChange does for a table page.
+extern void ISHWorkspaceRescaleTableView(UITableView *tableView, CGFloat scale);
+// The font a label or text field had before it was scaled. For code that makes
+// a new font from the current one's size, which would otherwise start from the
+// scaled size and be scaled again.
+extern UIFont *_Nullable ISHWorkspaceUnscaledFont(UIView *view);
+// The row height for a table whose rows keep to the 44-point standard because
+// nothing in them pushes on the height (a label and a switch, each centred).
+// `height` unchanged at 1.0 and below; above, at least 44 points at the scale.
+extern CGFloat ISHWorkspaceTextScaledRowHeight(CGFloat height, CGFloat scale);
+
 // Adopted by an applet whose content should survive an app restart (e.g. the
 // File Manager's current directory, a viewer's open file). The returned
 // dictionary is stored inside the saved window-layout descriptor in

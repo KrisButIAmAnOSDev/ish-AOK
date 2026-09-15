@@ -8,10 +8,11 @@
 #import "AboutExternalKeyboardViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "WorkspaceViewController.h"
 
 const int kCapsLockMappingSection = 0;
 
-@interface AboutExternalKeyboardViewController ()
+@interface AboutExternalKeyboardViewController () <WorkspaceTextScaledPage>
 
 @property (weak, nonatomic) IBOutlet UISwitch *optionMetaSwitch;
 @property (weak, nonatomic) IBOutlet UISwitch *backtickEscapeSwitch;
@@ -73,6 +74,25 @@ const int kCapsLockMappingSection = 0;
         UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
         UserPreferences.shared.capsLockMapping = cell.tag;
     }
+}
+
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+// The switch rows centre their label and switch with nothing above or below,
+// so they stay 44 points tall whatever the text size.
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ISHWorkspaceTextScaledRowHeight([super tableView:tableView heightForRowAtIndexPath:indexPath],
+                                           ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {

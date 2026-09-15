@@ -8,6 +8,7 @@
 #import "ThemeViewController.h"
 
 #import "Theme.h"
+#import "WorkspaceViewController.h"
 
 #define COLORS 16
 
@@ -36,6 +37,9 @@ struct PaletteTextFields {
     UITextField *cursorTextField;
     NSArray<UITextField *> *colorTextFields;
 };
+
+@interface ThemeViewController () <WorkspaceTextScaledPage>
+@end
 
 @implementation ThemeViewController {
     UITextField *_nameTextField;
@@ -224,7 +228,21 @@ enum {
     return [self shouldHideSection:section] ? CGFLOAT_MIN : UITableViewAutomaticDimension;
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. The
+// colour fields being edited are in the rows too, which is why a scale change
+// here re-fonts rows in place rather than reloading while one has the keyboard.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ThemeSetting" forIndexPath:indexPath];
     [[cell viewWithTag:1] removeFromSuperview];
     if (self.isEditable) {
@@ -247,7 +265,9 @@ enum {
             } else {
                 cell.detailTextLabel.text = self.theme.name;
                 if (@available(iOS 13.0, *)) {
-                    cell.detailTextLabel.font = [UIFont systemFontOfSize:cell.detailTextLabel.font.pointSize];
+                    // The size before any Workspace text scale. A reused cell's
+                    // label may carry one, and the new face would be scaled twice.
+                    cell.detailTextLabel.font = [UIFont systemFontOfSize:ISHWorkspaceUnscaledFont(cell.detailTextLabel).pointSize];
                 }
             }
             break;
@@ -287,7 +307,9 @@ enum {
             } else {
                 cell.detailTextLabel.text = detailTextField.text;
                 if (@available(iOS 13.0, *)) {
-                    cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:cell.detailTextLabel.font.pointSize weight:UIFontWeightRegular];
+                    // Unscaled, as for the name above.
+                    cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:ISHWorkspaceUnscaledFont(cell.detailTextLabel).pointSize
+                                                                            weight:UIFontWeightRegular];
                 }
             }
             break;

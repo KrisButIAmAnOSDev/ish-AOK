@@ -9,6 +9,7 @@
 
 #import "FontPickerViewController.h"
 #import "UserPreferences.h"
+#import "WorkspaceViewController.h"
 
 // UIFontPickerViewController can only filter on UIFontDescriptorTraitMonoSpace, and a
 // font that skips that trait is simply absent from it with no way to override. That
@@ -69,7 +70,7 @@ enum {
     NumberOfSections,
 };
 
-@interface FontPickerViewController () <UISearchResultsUpdating>
+@interface FontPickerViewController () <UISearchResultsUpdating, WorkspaceTextScaledPage>
 @end
 
 @implementation FontPickerViewController {
@@ -196,12 +197,20 @@ enum {
         toggle.on = _showsAllFonts;
         [toggle addTarget:self action:@selector(showAllFontsChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = toggle;
+        // At the text size of the Workspace window Settings is in; see
+        // WorkspaceTextScaledPage. Anywhere else the row is left as it is.
+        ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
         return cell;
     }
 
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Font" forIndexPath:indexPath];
     NSString *family = _visibleFamilies[indexPath.row];
-    UIFont *font = [UIFont fontWithName:_previewNames[family] size:18];
+    // Scaled here, before Dynamic Type scales it, rather than by
+    // ISHWorkspaceScaleTableViewCell: this label follows Dynamic Type, and the
+    // Workspace window's text size (1.0 anywhere else) multiplies with that
+    // rather than switching it off.
+    UIFont *font = [UIFont fontWithName:_previewNames[family]
+                                   size:ISHWorkspaceScaledPointSize(18, ISHWorkspaceTextScaleForViewController(self))];
     cell.textLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody] scaledFontForFont:font];
     cell.textLabel.adjustsFontForContentSizeCategory = YES;
     cell.textLabel.text = family;
@@ -221,6 +230,10 @@ enum {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     UserPreferences.shared.fontFamily = _visibleFamilies[indexPath.row];
     [self dismissSearchAndPop];
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
 }
 
 #pragma mark - Actions

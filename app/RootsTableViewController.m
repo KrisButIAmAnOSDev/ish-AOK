@@ -16,14 +16,14 @@
 #import "WorkspaceViewController.h"
 #include "kernel/fs.h"
 
-@interface RootsTableViewController ()
+@interface RootsTableViewController () <WorkspaceTextScaledPage>
 // Archives found in the shared /AOK/persist/roots directory, shown as the
 // "Root Cached Filesystems" section. Cached so the table data source is stable
 // within a reload; refreshed on appear and when roots change.
 @property (nonatomic, copy) NSArray<NSURL *> *cachedRootArchives;
 @end
 
-@interface RootDetailViewController : UITableViewController <UIDocumentPickerDelegate, UITextFieldDelegate>
+@interface RootDetailViewController : UITableViewController <UIDocumentPickerDelegate, UITextFieldDelegate, WorkspaceTextScaledPage>
 
 @property (nonatomic) NSString *rootName;
 @property (nonatomic) NSURL *exportURL;
@@ -377,6 +377,7 @@
         label.textColor = UIColor.grayColor;
     }
     label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    ISHWorkspaceScaleTextFont(label, ISHWorkspaceTextScaleForViewController(self));
     if (Roots.instance.initialBundledRootImportInProgress) {
         label.text = @"Extracting the bundled filesystem.\nThis can take a moment on first launch.";
     } else if (Roots.instance.initialBundledRootImportError != nil) {
@@ -556,7 +557,22 @@ static UIColor *RootRowInUseAccentColor(void) {
     }];
 }
 
+// At the text size of the Workspace window this list is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. Applied
+// after the branch below has set its own fonts, to every branch alike, so a
+// dequeued cell cannot carry one row's size into another.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    [self updateEmptyState];
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self sectionShowsOfficialChoices:indexPath.section] || [self sectionShowsCommunityChoices:indexPath.section]) {
         UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"BundledRootChoice"];
         if (cell == nil)
@@ -663,7 +679,8 @@ static UIColor *RootRowInUseAccentColor(void) {
     //
     // The point sizes match the storyboard prototype (17 and 11); the bold
     // weight and the accent are the only differences, so nothing reflows
-    // between the two states.
+    // between the two states. A Workspace window's text size scales both
+    // alike afterwards, in -tableView:cellForRowAtIndexPath:.
     if (isBootedRoot) {
         cell.backgroundColor = RootRowInUseBackgroundColor();
         cell.textLabel.font = [UIFont boldSystemFontOfSize:17];
@@ -838,7 +855,10 @@ static UIColor *RootRowInUseAccentColor(void) {
 
 @end
 
-@implementation RootDetailViewController
+@implementation RootDetailViewController {
+    CGFloat _nameFieldInset;   // the storyboard's, before any text scale
+    BOOL _hasNameFieldInset;
+}
 
 - (void)viewWillAppear:(BOOL)animated {
     self.nameField.text = self.rootName;
@@ -854,6 +874,47 @@ static UIColor *RootRowInUseAccentColor(void) {
     self.deleteLabel.enabled = !locked;
     self.deleteCell.selectionStyle = !locked ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
     [self.tableView reloadData];
+}
+
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    CGFloat scale = ISHWorkspaceTextScaleForViewController(self);
+    ISHWorkspaceScaleTableViewCell(cell, scale);
+    if ([self.nameField isDescendantOfView:cell])
+        [self scaleNameFieldInset:scale];
+    return cell;
+}
+
+// Every row is one line, but the Name row also lays out its field with
+// constraints that do not reach the bottom of the cell, so its height cannot be
+// trusted to follow the text. 44 points at the scale holds a line at every step.
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ISHWorkspaceTextScaledRowHeight([super tableView:tableView heightForRowAtIndexPath:indexPath],
+                                           ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (void)workspaceTextScaleDidChange {
+    CGFloat scale = ISHWorkspaceTextScaleForViewController(self);
+    [self scaleNameFieldInset:scale];
+    ISHWorkspaceRescaleTableView(self.tableView, scale);
+}
+
+// The storyboard starts the name field 75 points in, room for "Name" at 17
+// points. A larger "Name" would run under a long filesystem name.
+- (void)scaleNameFieldInset:(CGFloat)scale {
+    if (!_hasNameFieldInset && scale <= 1.0)
+        return;
+    for (NSLayoutConstraint *constraint in self.nameField.superview.constraints) {
+        if (constraint.firstItem != self.nameField || constraint.firstAttribute != NSLayoutAttributeLeading)
+            continue;
+        if (!_hasNameFieldInset) {
+            _nameFieldInset = constraint.constant;
+            _hasNameFieldInset = YES;
+        }
+        constraint.constant = _nameFieldInset * MAX(1.0, scale);
+    }
 }
 
 - (IBAction)nameChanged:(id)sender {

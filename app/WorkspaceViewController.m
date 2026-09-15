@@ -1,5 +1,6 @@
 #import "WorkspaceViewController.h"
 
+#import "AboutNavigationController.h"
 #import "AboutViewController.h"
 #import "AppDelegate.h"
 #import "Diagnostics.h"
@@ -20,6 +21,7 @@
 #import "WorkspaceVideoPlayer.h"
 #import "UIApplication+OpenURL.h"
 #import <WebKit/WebKit.h>
+#import <objc/runtime.h>
 #include "kernel/task.h"
 #include "fs/proc/ish.h"
 #include "kernel/checkpoint.h"
@@ -934,9 +936,11 @@ UINavigationController *ISHCreateWorkspaceNavigationControllerForTool(NSString *
     return navigationController;
 }
 
+// Only the Workspace calls this, so the navigation controller is the
+// Workspace's own class, which carries the window's text size to the pages.
 static UINavigationController *ISHCreateRootsNavigationController(void) {
     UIViewController *rootsViewController = [[UIStoryboard storyboardWithName:@"Roots" bundle:nil] instantiateInitialViewController];
-    return [[UINavigationController alloc] initWithRootViewController:rootsViewController];
+    return [[WorkspaceToolNavigationController alloc] initWithRootViewController:rootsViewController];
 }
 
 static UIViewController *ISHCreateRootsViewController(void) {
@@ -2846,6 +2850,10 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 @interface WorkspaceMotePadToolViewController : WorkspaceThemedToolViewController
 @end
 
+// Settings in a Workspace window; see its branch in the factory below.
+@interface WorkspaceSettingsNavigationController : AboutNavigationController <WorkspaceTextScalable>
+@end
+
 static UIViewController *ISHCreateWorkspaceToolViewController(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
         return ISHCreateLLMClientViewController();
@@ -2886,7 +2894,20 @@ static UIViewController *ISHCreateWorkspaceToolViewController(NSString *toolIden
         // top view controller. AboutViewController drills into sub-pages with
         // "if (self.navigationController) push; else present fullscreen;" — stripping the nav
         // controller forced the fullscreen-modal branch, which had no way back to the workspace.
-        return ISHCreateAboutNavigationController(NO, NO);
+        //
+        // The pages move out of the storyboard's navigation controller into a
+        // Workspace-only subclass of its class. The Workspace looks for the
+        // text-size protocol (Cmd+= / Cmd+-) on this object, and the storyboard's
+        // class could not adopt it without Settings adopting it everywhere else
+        // too. A subclass rather than a plain UINavigationController, because
+        // AboutNavigationController is what makes Settings follow the Light/Dark
+        // setting, and nothing else in the Workspace does.
+        UINavigationController *storyboardNavigationController = ISHCreateAboutNavigationController(NO, NO);
+        NSArray<UIViewController *> *pages = storyboardNavigationController.viewControllers;
+        storyboardNavigationController.viewControllers = @[];
+        WorkspaceSettingsNavigationController *navigationController = [WorkspaceSettingsNavigationController new];
+        navigationController.viewControllers = pages;
+        return navigationController;
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
         // Wrapped, like Filesystems and Settings above and for the same reason:
@@ -7591,6 +7612,227 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 @end
+
+// ---- text size for the navigation-controller applets -------------------------
+//
+// Settings, Diagnostics and Filesystems: UIKit screens shared with the rest of
+// iSH-AOK, in a window whose content view controller is a navigation
+// controller. WorkspaceTextScaledPage in the header says how their pages follow
+// the window.
+//
+// Not a preferredContentSizeCategory trait override, though that would reach
+// every page and cell without the pages taking part. Their fonts are fixed
+// sizes (the storyboards' system 17, Menlo 14), which a trait does not move.
+// Making them Dynamic Type fonts would move Settings outside the Workspace too,
+// for anyone whose system text size is not the default. And the categories are
+// not the Workspace's steps -- body text has none below 0.82 -- and they resize
+// the navigation bar as well.
+
+// An associated object rather than an ivar, so that the two classes, whose
+// superclasses differ, share one implementation.
+static char ISHWorkspaceNavigationTextScaleKey;
+
+static CGFloat ISHWorkspaceNavigationControllerTextScale(UINavigationController *navigationController) {
+    NSNumber *scale = objc_getAssociatedObject(navigationController, &ISHWorkspaceNavigationTextScaleKey);
+    return scale != nil ? scale.doubleValue : 1.0;
+}
+
+static void ISHWorkspaceSetNavigationControllerTextScale(UINavigationController *navigationController, CGFloat scale) {
+    CGFloat clamped = ISHWorkspaceClampedTextScale(scale);
+    if (fabs(clamped - ISHWorkspaceNavigationControllerTextScale(navigationController)) < 0.001)
+        return;
+    objc_setAssociatedObject(navigationController, &ISHWorkspaceNavigationTextScaleKey, @(clamped),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // A page whose view is not loaded reads the scale when it loads, and a page
+    // pushed later reads it when it makes its rows.
+    for (UIViewController *page in navigationController.viewControllers) {
+        if (page.isViewLoaded && [page conformsToProtocol:@protocol(WorkspaceTextScaledPage)])
+            [(id<WorkspaceTextScaledPage>) page workspaceTextScaleDidChange];
+    }
+}
+
+@implementation WorkspaceToolNavigationController
+
+- (CGFloat)workspaceTextScale {
+    return ISHWorkspaceNavigationControllerTextScale(self);
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    ISHWorkspaceSetNavigationControllerTextScale(self, workspaceTextScale);
+}
+
+@end
+
+@implementation WorkspaceSettingsNavigationController
+
+- (CGFloat)workspaceTextScale {
+    return ISHWorkspaceNavigationControllerTextScale(self);
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    ISHWorkspaceSetNavigationControllerTextScale(self, workspaceTextScale);
+}
+
+@end
+
+CGFloat ISHWorkspaceTextScaleForViewController(UIViewController *viewController) {
+    for (UIViewController *ancestor = viewController; ancestor != nil; ancestor = ancestor.parentViewController) {
+        if ([ancestor conformsToProtocol:@protocol(WorkspaceTextScalable)])
+            return ((id<WorkspaceTextScalable>) ancestor).workspaceTextScale;
+    }
+    return 1.0;
+}
+
+CGFloat ISHWorkspaceScaledPointSize(CGFloat size, CGFloat scale) {
+    return round(size * scale * 2.0) / 2.0;
+}
+
+CGFloat ISHWorkspaceTextScaledRowHeight(CGFloat height, CGFloat scale) {
+    if (scale <= 1.001)
+        return height;
+    CGFloat scaled = round(44.0 * scale);
+    // UITableViewAutomaticDimension is negative. Rows like these resolve it to
+    // 44 however large their text, since nothing in them pushes on the height.
+    return height > 0 ? MAX(height, scaled) : scaled;
+}
+
+// ISHWorkspaceScaleTextFont's bookkeeping, kept on the view itself: the font its
+// owner gave it, the font set here (to notice when the owner sets another), and
+// the two properties scaling changes, to put back at 1.0.
+static char ISHWorkspaceUnscaledFontKey;
+static char ISHWorkspaceScaledFontKey;
+static char ISHWorkspaceUnscaledMinimumFontSizeKey;
+static char ISHWorkspaceAdjustsForContentSizeKey;
+static char ISHWorkspaceScaledCellKey;
+
+static UIFont *ISHWorkspaceFontOfTextView(UIView *view) {
+    if ([view isKindOfClass:UILabel.class])
+        return ((UILabel *) view).font;
+    if ([view isKindOfClass:UITextField.class])
+        return ((UITextField *) view).font;
+    return nil;
+}
+
+static void ISHWorkspaceSetFontOfTextView(UIView *view, UIFont *font) {
+    if ([view isKindOfClass:UILabel.class])
+        ((UILabel *) view).font = font;
+    else if ([view isKindOfClass:UITextField.class])
+        ((UITextField *) view).font = font;
+}
+
+static void ISHWorkspaceForgetTextScale(UIView *view) {
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledFontKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceScaledFontKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+UIFont *ISHWorkspaceUnscaledFont(UIView *view) {
+    UIFont *font = ISHWorkspaceFontOfTextView(view);
+    UIFont *unscaled = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledFontKey);
+    UIFont *scaled = objc_getAssociatedObject(view, &ISHWorkspaceScaledFontKey);
+    if (unscaled != nil && [font isEqual:scaled])
+        return unscaled;
+    return font;
+}
+
+void ISHWorkspaceScaleTextFont(UIView *view, CGFloat scale) {
+    UIFont *font = ISHWorkspaceFontOfTextView(view);
+    if (font == nil)
+        return;
+    BOOL actualSize = fabs(scale - 1.0) < 0.001;
+    UIFont *unscaled = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledFontKey);
+    UIFont *scaled = objc_getAssociatedObject(view, &ISHWorkspaceScaledFontKey);
+    if (unscaled == nil && actualSize)
+        return;
+    // Not the font set here, so the view's owner has set one since -- a
+    // dequeued cell being configured, a row choosing its own face -- and that
+    // is the unscaled font now.
+    if (unscaled == nil || ![font isEqual:scaled])
+        unscaled = font;
+
+    // UILabel and UITextField both adopt it.
+    id<UIContentSizeCategoryAdjusting> adjusting = (id<UIContentSizeCategoryAdjusting>) view;
+    UITextField *field = [view isKindOfClass:UITextField.class] ? (UITextField *) view : nil;
+    NSNumber *adjusts = objc_getAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey)
+        ?: @(adjusting.adjustsFontForContentSizeCategory);
+    NSNumber *minimumFontSize = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey)
+        ?: @(field.minimumFontSize);
+
+    if (actualSize) {
+        ISHWorkspaceSetFontOfTextView(view, unscaled);
+        adjusting.adjustsFontForContentSizeCategory = adjusts.boolValue;
+        field.minimumFontSize = minimumFontSize.doubleValue;
+        ISHWorkspaceForgetTextScale(view);
+        return;
+    }
+    // Off while scaled. A view following Dynamic Type sets its own size again
+    // whenever its traits change, and a cell moving into the window is such a
+    // change, so the scale would be gone by the time the row is seen.
+    adjusting.adjustsFontForContentSizeCategory = NO;
+    UIFont *target = [unscaled fontWithSize:ISHWorkspaceScaledPointSize(unscaled.pointSize, scale)];
+    ISHWorkspaceSetFontOfTextView(view, target);
+    // A field that shrinks its text to fit would otherwise shrink it back as far
+    // as its old minimum.
+    field.minimumFontSize = ISHWorkspaceScaledPointSize(minimumFontSize.doubleValue, scale);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledFontKey, unscaled, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceScaledFontKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey, minimumFontSize, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey, adjusts, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// The labels and text fields under `view`, returning whether there were any.
+// Not inside any other control: a segmented control's or a button's titles are
+// chrome, and the labels inside them are UIKit's.
+static BOOL ISHWorkspaceScaleTextFontsInView(UIView *view, CGFloat scale) {
+    if ([view isKindOfClass:UILabel.class] || [view isKindOfClass:UITextField.class]) {
+        ISHWorkspaceScaleTextFont(view, scale);
+        return YES;
+    }
+    if ([view isKindOfClass:UIControl.class])
+        return NO;
+    BOOL found = NO;
+    for (UIView *subview in view.subviews) {
+        if (ISHWorkspaceScaleTextFontsInView(subview, scale))
+            found = YES;
+    }
+    return found;
+}
+
+void ISHWorkspaceScaleTableViewCell(UITableViewCell *cell, CGFloat scale) {
+    if (cell == nil)
+        return;
+    BOOL actualSize = fabs(scale - 1.0) < 0.001;
+    // Outside the Workspace, and in it at the default size, there is nothing to
+    // put back, so nothing in the cell is even looked at.
+    if (actualSize && objc_getAssociatedObject(cell, &ISHWorkspaceScaledCellKey) == nil)
+        return;
+    // UIKit may add a built-in style's labels to the content view only when it
+    // lays the cell out, after this has run. The row has set its text by then,
+    // so the labels it uses exist and can be asked for -- but only when the walk
+    // found nothing, so a storyboard cell of the custom style does not grow one.
+    if (!ISHWorkspaceScaleTextFontsInView(cell.contentView, scale)) {
+        ISHWorkspaceScaleTextFont(cell.textLabel, scale);
+        ISHWorkspaceScaleTextFont(cell.detailTextLabel, scale);
+    }
+    objc_setAssociatedObject(cell, &ISHWorkspaceScaledCellKey, actualSize ? nil : @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+void ISHWorkspaceRescaleTableView(UITableView *tableView, CGFloat scale) {
+    // A reload can take a row out of the window, and a text field that loses
+    // first responder that way ends editing, which commits it: a half-typed
+    // launch command, a filesystem rename. With something being typed, the rows
+    // on screen are re-fonted where they are and only re-measured.
+    if (ISHWorkspaceFindFirstResponder(tableView) != nil) {
+        for (UITableViewCell *cell in tableView.visibleCells)
+            ISHWorkspaceScaleTableViewCell(cell, scale);
+        [UIView performWithoutAnimation:^{
+            [tableView performBatchUpdates:nil completion:nil];
+        }];
+        return;
+    }
+    [tableView reloadData];
+}
 
 @implementation WorkspaceThemedToolViewController {
     CAGradientLayer *_backgroundGradientLayer;

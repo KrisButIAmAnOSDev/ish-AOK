@@ -12,8 +12,9 @@
 #import "ThemesViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "WorkspaceViewController.h"
 
-@interface AboutAppearanceViewController ()
+@interface AboutAppearanceViewController () <WorkspaceTextScaledPage>
 @property (strong, nonatomic) IBOutlet UISwitch *blinkCursor;
 @property (strong, nonatomic) IBOutlet UISegmentedControl *cursorStyle;
 @property (strong, nonatomic) IBOutlet UISwitch *hideStatusBar;
@@ -181,12 +182,32 @@ enum {
     if (indexPath.section == PreviewSection && indexPath.row == 0) {
         // Try a best-effort guess as to how big the preview should be.
         return [@"\n\n\n\n\n\n" sizeWithAttributes:@{NSFontAttributeName: UserPreferences.shared.approximateFont}].height + 10;
-    } else {
+    } else if (indexPath.section == PreviewSection) {
         return UITableViewAutomaticDimension;
+    } else {
+        // The Font Size and Line Height rows centre a label and a stepper with
+        // nothing above or below, so they would stay 44 points tall whatever
+        // the text size.
+        return ISHWorkspaceTextScaledRowHeight(UITableViewAutomaticDimension, ISHWorkspaceTextScaleForViewController(self));
     }
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. Not the
+// preview section: a terminal drawn at the terminal's own font size, and the
+// control that switches its colours.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    if (indexPath.section != PreviewSection)
+        ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:[self reuseIdentifierForIndexPath:indexPath] forIndexPath:indexPath];
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     
@@ -215,7 +236,10 @@ enum {
                     break;
                 case 1:
                     cell.detailTextLabel.text = UserPreferences.shared.fontFamilyUserFacingName;
-                    cell.detailTextLabel.font = [UIFont fontWithName:UserPreferences.shared.fontFamily size:cell.detailTextLabel.font.pointSize];
+                    // The size before any Workspace text scale. This label may
+                    // carry one, and the new face would otherwise be scaled twice.
+                    cell.detailTextLabel.font = [UIFont fontWithName:UserPreferences.shared.fontFamily
+                                                                size:ISHWorkspaceUnscaledFont(cell.detailTextLabel).pointSize];
                     break;
                 case 2:
                 case 3: {
