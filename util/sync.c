@@ -8,8 +8,10 @@
 #include <signal.h>
 #include <stdlib.h>
 #include "kernel/task.h"
+#include "kernel/checkpoint.h"
 #include <stdio.h>
 #include "util/sync.h"
+#include "util/timer.h"
 #include "debug.h"
 #include "kernel/errno.h"
 #include <string.h>
@@ -192,12 +194,54 @@ int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
         }
         return _EINTR;
     }
-    int err = wait_for_internal(cond, lock, timeout, true);
-    if (consume_wait_interrupted() || is_signal_pending(lock))
-        return _EINTR;
-    if (err < 0)
-        return _ETIMEDOUT;
-    return 0;
+    // In slices, so a checkpoint freeze cannot be missed.
+    //
+    // The ways out of a wait are a notify, a signal, and the freezer's wake --
+    // and the freezer's wake is host pokes that a device can lose (fs/poll.c
+    // and fs/sock.c cap their host waits for the same reason). A wait with no
+    // deadline, or a long one, then outlives the freeze: a shell in `wait`
+    // (rt_sigsuspend) refused a suspend on an iPad with "did not reach a
+    // syscall boundary within 5000ms (blocked in arm64 syscall 133)", while
+    // the same shell froze on macOS, where the wake lands.
+    //
+    // The caller cannot tell. A slice that ends with nothing to report waits
+    // again, and a caller's own deadline is kept across slices, so only its
+    // real expiry reports _ETIMEDOUT. A freeze reports _EINTR, which is what a
+    // wake that lands produces too, and the dispatcher turns it into a restart.
+    //
+    // Only a wait the freeze is actually holding up reports it. A wait that
+    // was notified, or reached its own deadline, answers as it always did --
+    // a ZERO timeout included. Asking about the freeze first turned native
+    // zsh's describe-yourself-for-the-checkpoint into an endless loop: its
+    // signal poll (rt_sigtimedwait with a zero timeout) came back EINTR, the
+    // shim re-issued it, and the shell never reached the point where it parks.
+    const struct timespec freeze_recheck = {.tv_sec = 1, .tv_nsec = 0};
+    struct timespec deadline = {0};
+    if (timeout != NULL)
+        deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
+    for (;;) {
+        struct timespec slice = freeze_recheck;
+        bool last_slice = false;
+        if (timeout != NULL) {
+            struct timespec left = timespec_subtract(deadline, timespec_now(CLOCK_MONOTONIC));
+            if (!timespec_positive(left))
+                left = (struct timespec) {0};
+            if (left.tv_sec < slice.tv_sec ||
+                    (left.tv_sec == slice.tv_sec && left.tv_nsec <= slice.tv_nsec)) {
+                slice = left;
+                last_slice = true;
+            }
+        }
+        int err = wait_for_internal(cond, lock, &slice, true);
+        if (consume_wait_interrupted() || is_signal_pending(lock))
+            return _EINTR;
+        if (err == 0)
+            return 0;
+        if (last_slice)
+            return _ETIMEDOUT;
+        if (checkpoint_freeze_pending())
+            return _EINTR;
+    }
 }
 
 static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeout, bool interruptible) {

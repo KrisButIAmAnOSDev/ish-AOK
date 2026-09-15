@@ -1160,6 +1160,40 @@ looks free there: DisplayRFBView forwards only Cmd+= + - 0 to the guest, and
 deliberately not Cmd+letter. Confirm it does not also reach the Wayland
 session before claiming it.
 
+### A task blocked OPENING a FIFO still cannot be frozen if its wake is lost
+
+**Established (2026-09-15).** The freezer's wakes (a `pthread_kill` and a
+cond notify) can be lost on a device. `ISH_CHECKPOINT_LOSE_WAKES=1` drops them
+on the CLI, so that failure can be reproduced on a Mac. Every cond-based wait
+in the kernel now checks for a freeze once a second (`wait_for` in
+util/sync.c). With the wakes dropped, a sweep of blocking shapes shows:
+- **Now freeze:** dash/busybox `wait` (rt_sigsuspend), bash `wait` and
+  `waitpid` (wait4), `flock`, a pipe read, and perl `pause`/`sigsuspend`.
+- **Still refuses:** `cat` opening a FIFO nobody has opened for writing:
+  "did not reach a syscall boundary (blocked in arm64 syscall 56)".
+
+A fakefs FIFO is a real host FIFO, and `realfs_open` calls the host `openat`
+without O_NONBLOCK. The task therefore sits in a HOST syscall that only the
+`pthread_kill` can interrupt. No wait slice helps, because the task is not in a
+cond wait.
+
+**Why it was not fixed with the rest.**
+- The writer half is simple: open O_WRONLY|O_NONBLOCK, and retry on ENXIO in
+  short slices that ask about signals and the freeze.
+- The reader half has no faithful emulation. A non-blocking O_RDONLY open
+  succeeds at once, and Darwin offers no way to ask whether a writer exists.
+  Inferring it from Darwin's spurious POLLHUP misses a writer that opens and
+  closes without writing. Linux wakes the blocked reader for that writer, so
+  the inference would change guest-visible behaviour.
+- Cancelling a blocked reader by briefly opening the write end is visible to
+  any other reader of the same FIFO, which would see a writer come and go.
+
+**Next step.** Do the writer half as above. For the reader, look for a Darwin
+query that reports the writer count, or accept the POLLHUP inference only
+where a lost write-and-close cannot happen. Until then this is a
+rarely-hit shape: a checkpoint has to land while a process sits in an unpaired
+FIFO open.
+
 ## Deferred on purpose
 
 ### Suspend and Exit terminates the app, which the HIG discourages

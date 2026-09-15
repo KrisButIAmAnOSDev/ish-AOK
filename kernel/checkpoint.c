@@ -406,8 +406,18 @@ static bool ckpt_task_is_leaving(struct task *t) {
         atomic_load_explicit(&t->exit_finished, memory_order_acquire);
 }
 
+// Set while this thread is inside a program's ckpt_dump. See
+// checkpoint_native_park, which sets it.
+static __thread bool ckpt_dumping;
+
 bool checkpoint_freeze_pending(void) {
     if (atomic_load_explicit(&ckpt_freeze_active, memory_order_relaxed) == 0)
+        return false;
+    // A program describing itself FOR the freeze is doing the freeze's work,
+    // and every wait that asks this question would otherwise end early on its
+    // behalf -- and the shim re-issues an interrupted call, so the description
+    // spins and never finishes, and the task never parks.
+    if (ckpt_dumping)
         return false;
     return current != NULL &&
         atomic_load_explicit(&current->ckpt_freeze_wanted, memory_order_acquire);
@@ -441,8 +451,8 @@ void checkpoint_park_if_frozen(void) {
 // which took the whole app down rather than the shell.
 //
 // __thread rather than a task field, because it is a property of THIS call
-// stack and nothing else can see it.
-static __thread bool ckpt_dumping;
+// stack and nothing else can see it. Declared above checkpoint_freeze_pending,
+// which reads it too.
 
 void checkpoint_native_park(void) {
     // Already describing itself: neither dump again nor park. Parking here

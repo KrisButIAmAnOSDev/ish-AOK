@@ -694,6 +694,18 @@ void task_wake_for_freeze(struct task *task) {
             task->zombie || task->exiting ||
             atomic_load_explicit(&task->exit_finished, memory_order_acquire))
         return;
+    // ISH_CHECKPOINT_LOSE_WAKES=1: every wake below is lost, and the freeze is
+    // announced only by ckpt_freeze_wanted. On macOS these wakes land, so a
+    // blocking path that relies on them freezes on the CLI and refuses on a
+    // device, where they can be lost. With this set the CLI fails the same way,
+    // so such a path can be found and its fix proven where it can be run.
+    static int lose_wakes = -1;
+    if (lose_wakes < 0) {
+        const char *v = getenv("ISH_CHECKPOINT_LOSE_WAKES");
+        lose_wakes = v != NULL && v[0] != '\0' && v[0] != '0';
+    }
+    if (lose_wakes)
+        return;
     __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
     pthread_kill(task->thread, SIGUSR1);
     cpu_poke(&task->cpu);
