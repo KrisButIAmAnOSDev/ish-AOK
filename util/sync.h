@@ -125,6 +125,13 @@ static inline void sigunwind_end(void) {
 void cond_init(cond_t *cond);
 void cond_destroy(cond_t *cond);
 //static bool is_signal_pending(lock_t *lock); // Not used externally to sync.c, doesn't eneed to be exposed
+// Wait on `cond` for at most about a second at a time. Returns 0 when notified
+// OR when a slice ended with nothing to report -- so, like any condition
+// variable, the caller must re-check what it is waiting for and call again --
+// _ETIMEDOUT once the caller's own deadline has passed, and _EINTR for a
+// pending signal or a checkpoint freeze. `timeout` (NULL: no deadline) is
+// relative and is UPDATED to the time left, so waiting again with the same
+// pointer keeps the original deadline. See sync.c for why it slices.
 int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout);
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout);
 void notify(cond_t *cond);
