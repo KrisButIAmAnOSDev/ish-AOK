@@ -168,6 +168,16 @@ struct checkpoint_status {
 };
 void checkpoint_get_status(struct checkpoint_status *out);
 
+// What the last successful restore could not put back as it was -- a socket
+// whose rebuild failed and came back hung up -- as "pid P fd N: why", joined by
+// "; ". Empty when everything came back, or when nothing was restored.
+//
+// A separate call rather than a field of struct checkpoint_status, and that is
+// deliberate: callers keep that struct on their stack, and the Xcode build does
+// not reliably recompile every one of them when this header changes. Growing
+// the struct overran the stack of a stale caller and aborted the app at launch.
+void checkpoint_get_restore_note(char *out, size_t size);
+
 // ---- reading an image WITHOUT loading it --------------------------------
 //
 // What a session picker has to show: which machine, how big, and whether this

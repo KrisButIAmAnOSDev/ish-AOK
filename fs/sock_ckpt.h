@@ -63,6 +63,11 @@ int sock_ckpt_describe(struct fd *sock, struct sock_ckpt_desc *out);
 // failing.
 struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err);
 
+// Why the last sock_ckpt_rebuild could not put a bound or listening socket
+// back as it was (it came back hung up instead), or NULL when it could.
+// Cleared at the start of every rebuild.
+const char *sock_ckpt_rebuild_failure(void);
+
 const char *sock_ckpt_state_name(uint32_t state);
 
 #endif

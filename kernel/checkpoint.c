@@ -87,7 +87,7 @@
 #include "util/sync.h"
 
 #define CKPT_MAGIC "AOKCKPT"
-#define CKPT_VERSION 3
+#define CKPT_VERSION 4   // 4: ckpt_task.native_standin_child
 // How long the freezer waits for a task to reach a syscall boundary.
 //
 // Generous on purpose. Every wait in the guest is broken by the poke, so a
@@ -233,6 +233,10 @@ struct ckpt_task {
     // three blobs below do, in this order, each NUL-terminated.
     uint32_t native;
     uint32_t native_name_len, native_argv_len, native_state_len, native_env_len;
+    // The child a native exec stand-in was waiting on, or 0 (struct task's
+    // native_standin_child). Such a task comes back as that wait, never by
+    // running its program -- and so the command -- a second time.
+    uint32_t native_standin_child;
     uint32_t uid, gid, euid, egid, suid, sgid, fsuid, fsgid;
     uint32_t umask;
     char comm[16];
@@ -467,6 +471,10 @@ void checkpoint_native_park(void) {
     const struct native_program *prog = native_program_running(current);
     if (atomic_load_explicit(&ckpt_restoring, memory_order_acquire) == 0 &&
             prog != NULL && prog->ckpt_dump != NULL &&
+            // A stand-in comes back as its wait, so its program's state would
+            // never be read -- and after a restore this thread is not running
+            // that program at all, so there is no state here to describe.
+            current->native_standin_child == 0 &&
             current->ckpt_native_state == NULL) {
         ckpt_dumping = true;
         current->ckpt_native_state = prog->ckpt_dump();
@@ -696,6 +704,28 @@ static int ckpt_check_scope(void) {
 // lands. Guarded by ckpt_lock like the rest of the status.
 static unsigned long ckpt_natives_restarted;
 static char ckpt_natives_note[192];
+
+// What the restore under way could not put back as it was, read through
+// checkpoint_get_restore_note once it succeeds. The guest runs on regardless, and
+// on a device this is the only place such a degradation can be read -- the
+// printks that used to be the whole report go to fd 555.
+static char ckpt_restore_note[256];
+
+static void ckpt_note_restore(uint32_t pid, uint32_t fd, const char *why) {
+    size_t len = strlen(ckpt_restore_note);
+    if (len + 1 >= sizeof(ckpt_restore_note))
+        return;
+    snprintf(ckpt_restore_note + len, sizeof(ckpt_restore_note) - len,
+             "%spid %u fd %u: %s", len != 0 ? "; " : "", pid, fd, why);
+}
+
+void checkpoint_get_restore_note(char *out, size_t size) {
+    if (out == NULL || size == 0)
+        return;
+    lock(&ckpt_lock, 0);
+    snprintf(out, size, "%s", ckpt_status.restored ? ckpt_restore_note : "");
+    unlock(&ckpt_lock);
+}
 
 static void ckpt_note_restarted_native(const char *name) {
     ckpt_natives_restarted++;
@@ -1190,7 +1220,9 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         // freeze parked it (checkpoint_native_park runs on its own thread,
         // which is the only place its state exists).
         native_state = task->ckpt_native_state != NULL ? task->ckpt_native_state : "";
-        if (native_state[0] == '\0')
+        rec.native_standin_child = task->native_standin_child;
+        // A stand-in is not re-launched at all, so it is not a restart.
+        if (native_state[0] == '\0' && rec.native_standin_child == 0)
             ckpt_note_restarted_native(prog->name);
         native_argv = task->native_cmdline != NULL ? task->native_cmdline : "";
         rec.native = 1;
@@ -1555,6 +1587,7 @@ struct ckpt_restore_state {
     // the program rather than start a guest thread.
     char *native_name, *native_argv, *native_state, *native_env;
     uint32_t native_argv_len, native_env_len;
+    uint32_t native_standin_child;
     // The console the checkpointed guest was on, and the device it expects to
     // find there. create_stdio verifies the major/minor and falls back to an
     // adhoc node if they do not match, so both halves travel.
@@ -1905,6 +1938,7 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         st->native_state = native_state;
         st->native_env = native_env;
         st->native_env_len = rec->native_env_len;
+        st->native_standin_child = rec->native_standin_child;
         // Its session and process group, which the jump below would otherwise
         // skip along with everything that really is emulator-only. Without
         // them the re-launched program kept the brand-new session
@@ -2120,6 +2154,11 @@ descriptors:
                 err = sock_err != 0 ? sock_err : _EIO;
                 goto fds_done;
             }
+            // A listener that could not be put back comes back hung up, and
+            // the session carries on -- so say so where a person can see it.
+            const char *sock_why = sock_ckpt_rebuild_failure();
+            if (sock_why != NULL)
+                ckpt_note_restore(rec->pid, cf.fd, sock_why);
             CKPT_TRACE("    socket %s domain %u type %u proto %u backlog %u\n",
                        sock_ckpt_state_name(desc.state), desc.domain,
                        desc.type, desc.protocol, desc.backlog);
@@ -2289,7 +2328,8 @@ static int ckpt_dispatch_native(struct task *task, struct ckpt_restore_state *st
 
     char fdvar[64] = "";
     struct fd *state_rd = NULL, *state_wr = NULL;
-    if (prog->ckpt_state_var != NULL && st->native_state[0] != '\0') {
+    if (st->native_standin_child == 0 &&
+            prog->ckpt_state_var != NULL && st->native_state[0] != '\0') {
         size_t len = strlen(st->native_state);
         // A GUEST pipe, not a host one. The program reads its state through
         // the shim, which routes every descriptor through the guest's own
@@ -2351,7 +2391,27 @@ static int ckpt_dispatch_native(struct task *task, struct ckpt_restore_state *st
     // reads the mode. Emulated programs are untouched: those are resumed
     // exactly, registers and all, so their raw mode is still theirs and still
     // correct.
-    tty_reset_termios_to_default(task->group != NULL ? task->group->tty : NULL);
+    //
+    // Only for the process that reads the terminal NEXT, though. A task outside
+    // the foreground group -- a shell whose job holds the terminal, or an exec
+    // stand-in waiting on the program it started -- does not read it until
+    // that job is done, and the job may be an emulated program resumed exactly,
+    // raw mode and all. Resetting under it would hand a still-running editor a
+    // cooked terminal.
+    bool reads_terminal_next = false;
+    if (st->native_standin_child == 0 && task->group != NULL) {
+        lock(&task->group->lock, 0);
+        struct tty *ctty = task->group->tty;
+        pid_t_ own_pgid = task->group->pgid;
+        unlock(&task->group->lock);
+        if (ctty != NULL) {
+            lock(&ctty->lock, 0);
+            reads_terminal_next = ctty->fg_group == 0 || ctty->fg_group == own_pgid;
+            unlock(&ctty->lock);
+        }
+    }
+    if (reads_terminal_next)
+        tty_reset_termios_to_default(task->group->tty);
 
     // Recorded rather than run: task_run_current calls native_exec_run_pending
     // on the way in, which is exactly how a native program starts on a fresh
@@ -2359,6 +2419,10 @@ static int ckpt_dispatch_native(struct task *task, struct ckpt_restore_state *st
     struct task *saved = current;
     current = task;
     int err = native_exec_set_pending(prog, (int) argc, argv, envp);
+    // A restore, not an exec: wait for the task's foreground job first, and
+    // bring a stand-in back as its wait (native_exec_run_pending).
+    if (err == 0)
+        native_exec_mark_restored(st->native_standin_child);
     current = saved;
     free(argv);
     free(envp);
@@ -2415,6 +2479,7 @@ static struct task *ckpt_new_task(struct task *parent, pid_t_ pid) {
 }
 
 int checkpoint_restore(const char *host_path) {
+    ckpt_restore_note[0] = '\0';
     FILE *f = fopen(host_path, "rb");
     if (f == NULL)
         return errno_map();
@@ -2514,6 +2579,7 @@ int checkpoint_restore(const char *host_path) {
                    rec.tty_kind == CKPT_TTY_PTS ? "pts" :
                    rec.tty_kind == CKPT_TTY_CONSOLE ? "console" : "none");
         st.native_name = st.native_argv = st.native_state = st.native_env = NULL;
+        st.native_standin_child = 0;
         struct task *saved = current;
         current = task;
         err = ckpt_restore_task(f, &h, &rec, &st);

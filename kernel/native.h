@@ -128,6 +128,20 @@ int native_exec_set_pending(const struct native_program *prog, int argc,
 // and is therefore reached without any execve syscall returning.
 void native_exec_run_pending(void);
 
+// Marks the program just recorded by native_exec_set_pending as one a
+// checkpoint restore is bringing back rather than one being exec'd. Two things
+// change when it runs. A task whose terminal is held by one of its own jobs
+// waits for that job before the program starts, because a re-launched shell
+// has no job table and would otherwise read the terminal out from under it.
+// And a task that was an exec stand-in (standin_child != 0) resumes as that
+// wait instead of running its program at all. Call with current = the task.
+void native_exec_mark_restored(dword_t standin_child);
+
+// The exec stand-in's wait, entered directly: waits for `child`, forwarding
+// signals, and exits with its status word. For a stand-in coming back from a
+// checkpoint. kernel/native_libc.c.
+void nlibc_exec_standin_resume(dword_t child) __attribute__((noreturn));
+
 // Poll for pending signals and group-stops, and act on them.
 //
 // A native program runs as host code on the guest task's thread, so nothing

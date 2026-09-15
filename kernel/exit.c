@@ -1221,8 +1221,17 @@ dword_t sys_waitid_guest(int_t idtype, pid_t_ id, guest_addr_t info_addr, int_t 
 // reaped pid, or a negative errno.
 int task_wait_child(dword_t pid, int *status_out, int options) {
     struct siginfo_ info = {};
-    int idtype = (pid == (dword_t) -1) ? P_ALL_ : P_PID_;
-    int err = do_wait(idtype, (pid_t_) pid, &info, NULL, options | WEXITED_);
+    // A negative pid other than -1 is a process group, as for wait4: a restored
+    // shell waits for its foreground JOB, and a job is a group.
+    int idtype = P_PID_;
+    pid_t_ id = (pid_t_) pid;
+    if (pid == (dword_t) -1) {
+        idtype = P_ALL_;
+    } else if ((sdword_t) pid < -1) {
+        idtype = P_PGID_;
+        id = (pid_t_) -(sdword_t) pid;
+    }
+    int err = do_wait(idtype, id, &info, NULL, options | WEXITED_);
     if (err < 0)
         return err;
     if (status_out != NULL)

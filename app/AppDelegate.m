@@ -3426,8 +3426,17 @@ static TerminalViewController *CreateTerminalViewController(void) {
         checkpoint_set_session(sessionImage.fileSystemRepresentation);
         if ([NSFileManager.defaultManager fileExistsAtPath:sessionImage]) {
             int rerr = checkpoint_restore(sessionImage.fileSystemRepresentation);
-            if (rerr >= 0)
+            if (rerr >= 0) {
                 ishSessionRestoredImage = sessionImage;
+                // Anything that came back degraded -- a listener that could
+                // not be rebound -- recorded where a Diagnostics export can
+                // show it. The guest's own /proc/ish/checkpoint says the same.
+                char restoreNote[256];
+                checkpoint_get_restore_note(restoreNote, sizeof(restoreNote));
+                if (restoreNote[0] != '\0')
+                    [ISHDiagnosticsStore recordBreadcrumb:@"session.restore.degraded"
+                                                  details:@{@"note": @(restoreNote)}];
+            }
             // Consumed here only when nobody chose to keep it.
             //
             // Restoring used to delete the image unconditionally, on the

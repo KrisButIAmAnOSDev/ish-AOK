@@ -1373,6 +1373,9 @@ static void nlibc_exec_forward_signals(dword_t child) {
 // everything that asks HOW the job ended: `jobs`, the "Terminated" line, and
 // any script testing the status word itself.
 static noreturn void nlibc_exec_standin(dword_t child) {
+    // Recorded for a checkpoint: this task is now nothing but the wait below,
+    // and that is what a restore has to rebuild (nlibc_exec_standin_resume).
+    current->native_standin_child = child;
     nlibc_exec_reset_handlers();
     for (;;) {
         int status = 0;
@@ -1386,6 +1389,13 @@ static noreturn void nlibc_exec_standin(dword_t child) {
         nlibc_exec_forward_signals(child);
         native_checkpoint();        // may not return, and that is the point
     }
+}
+
+// The same wait, for a stand-in a checkpoint is bringing back (kernel/native.c,
+// native_exec_run_pending): the program it stood in for is restored as its
+// child, so resuming means waiting again, not running anything.
+void nlibc_exec_standin_resume(dword_t child) {
+    nlibc_exec_standin(child);
 }
 
 // Wait for a child this shim started on the program's behalf, and do not let a

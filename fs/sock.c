@@ -9444,8 +9444,40 @@ static struct fd *sock_ckpt_hungup_fd(const struct sock_ckpt_desc *desc, int *er
     return fd;
 }
 
+// Why the last rebuild could not put a socket back. The printks below go to
+// fd 555, which nothing on a device reads, so a listener that came back hung
+// up looked exactly like one that came back listening until something tried
+// to connect -- an iPad's sshd after a resume.
+static char sock_ckpt_failure[160];
+
+const char *sock_ckpt_rebuild_failure(void) {
+    return sock_ckpt_failure[0] != '\0' ? sock_ckpt_failure : NULL;
+}
+
+static void sock_ckpt_note_failure(const struct sock_ckpt_desc *desc,
+        const char *what, int host_errno) {
+    char host[INET6_ADDRSTRLEN] = "?";
+    unsigned port = 0;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    size_t n = desc->addr_len < sizeof(ss) ? desc->addr_len : sizeof(ss);
+    memcpy(&ss, desc->addr, n);
+    if (n >= sizeof(struct sockaddr_in) && ss.ss_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *) &ss;
+        inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
+        port = ntohs(in->sin_port);
+    } else if (n >= sizeof(struct sockaddr_in6) && ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) &ss;
+        inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
+        port = ntohs(in6->sin6_port);
+    }
+    snprintf(sock_ckpt_failure, sizeof(sock_ckpt_failure), "%s socket, %s %s port %u: %s",
+             sock_ckpt_state_name(desc->state), what, host, port, strerror(host_errno));
+}
+
 struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err) {
     *err = 0;
+    sock_ckpt_failure[0] = '\0';
     if (desc->state == SOCK_CKPT_NETLINK) {
         struct fd *fd = adhoc_fd_create(&socket_fdops);
         if (fd == NULL) {
@@ -9477,8 +9509,10 @@ struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err) {
         return sock_ckpt_hungup_fd(desc, err);
     int s = socket(real_domain, real_type, (int) desc->protocol);
     if (s < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "socket", e);
         printk("WARNING: checkpoint: socket(%d, %d, %d) failed: %s\n",
-               real_domain, real_type, desc->protocol, strerror(errno));
+               real_domain, real_type, desc->protocol, strerror(e));
         return sock_ckpt_hungup_fd(desc, err);
     }
     // The address may still be considered taken -- the same reason
@@ -9492,15 +9526,19 @@ struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err) {
     if (desc->addr_len != 0 &&
             bind(s, (const struct sockaddr *) desc->addr,
                  (socklen_t) desc->addr_len) < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "bind", e);
         printk("WARNING: checkpoint: rebinding a restored socket failed: %s\n",
-               strerror(errno));
+               strerror(e));
         close(s);
         return sock_ckpt_hungup_fd(desc, err);
     }
     if (desc->state == SOCK_CKPT_LISTEN &&
             listen(s, desc->backlog > 0 ? (int) desc->backlog : 128) < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "listen", e);
         printk("WARNING: checkpoint: relistening a restored socket failed: %s\n",
-               strerror(errno));
+               strerror(e));
         close(s);
         return sock_ckpt_hungup_fd(desc, err);
     }

@@ -489,6 +489,16 @@ struct task {
     // sighand->lock: set/cleared by the waiter in poll_wait, read by the signal
     // sender in deliver_signal_unlocked_locked.
     int poll_notify_fd;
+
+    // The child this task's exec stand-in is waiting on (kernel/native_libc.c,
+    // nlibc_exec_standin), or 0. A stand-in is ONLY that wait -- the program it
+    // "became" is running as that child -- so a checkpoint restores it as the
+    // wait and never by running the command that exec'd a second time.
+    //
+    // At the END of the struct on purpose: app code reads task fields, and the
+    // Xcode build does not reliably recompile it when this header changes, so a
+    // field added in the middle shifts every offset under a stale object.
+    dword_t native_standin_child;
 };
 
 // current will always give the process that is currently executing

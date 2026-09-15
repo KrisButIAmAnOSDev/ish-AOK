@@ -16,6 +16,7 @@
 #include "kernel/native_libc.h"
 #include "kernel/native_syscall.h"
 #include "kernel/task.h"
+#include "fs/tty.h"
 #include "debug.h"
 
 // Everything a native program prints has to go through iSH's fd layer, not the
@@ -409,6 +410,9 @@ struct native_exec_pending {
     int argc;
     char **argv;
     char **envp;
+    // Set by native_exec_mark_restored for a task a checkpoint re-launched.
+    bool restored;
+    dword_t standin_child;
 };
 
 static void native_pending_free(struct native_exec_pending *pending) {
@@ -451,6 +455,70 @@ int native_exec_set_pending(const struct native_program *prog, int argc,
     native_exec_discard_pending(current);
     current->native_exec = pending;
     return 0;
+}
+
+void native_exec_mark_restored(dword_t standin_child) {
+    struct native_exec_pending *pending = current != NULL ? current->native_exec : NULL;
+    if (pending == NULL)
+        return;
+    pending->restored = true;
+    pending->standin_child = standin_child;
+}
+
+#define NATIVE_WAIT_UNTRACED (1 << 1)   // WUNTRACED; kernel/exit.c's WUNTRACED_
+
+// A shell coming back from a checkpoint while one of its jobs held the
+// terminal.
+//
+// A native shell is re-launched, not resumed, so it has no job table: it starts
+// at the top, prompts, and reads the terminal. With a job still in the
+// foreground that read is EIO, and an interactive shell exits on it -- which is
+// what took the whole window with it: the shell that owned a restored `ktop`
+// read EIO and quit, and its login was left a zombie with nothing under it.
+//
+// So before the program runs, do what the shell was doing when it was frozen:
+// wait for the foreground job, and take the terminal back once it has finished
+// or stopped. Only for a job made of this task's OWN children -- the wait finds
+// none otherwise, and then the terminal is left alone, because taking it would
+// steal it from a process group that is not ours to reclaim it from. A stopped
+// job stays stopped and is simply no longer in the shell's job table, which is
+// as much as a re-launch can do.
+static void native_restored_wait_for_foreground_job(void) {
+    struct tty *tty;
+    pid_t_ pgid, sid;
+    lock(&current->group->lock, 0);
+    tty = current->group->tty;
+    pgid = current->group->pgid;
+    sid = current->group->sid;
+    unlock(&current->group->lock);
+    if (tty == NULL)
+        return;
+
+    bool waited = false;
+    for (;;) {
+        lock(&tty->lock, 0);
+        pid_t_ fg = tty->fg_group;
+        unlock(&tty->lock);
+        if (fg <= 0 || fg == pgid)
+            return;
+        int status = 0;
+        int res = native_waitpid((dword_t) -fg, &status, NATIVE_WAIT_UNTRACED);
+        if (res == _EINTR) {
+            native_checkpoint();
+            continue;
+        }
+        if (res < 0)
+            break;          // no child of ours left in that group
+        waited = true;
+        if ((status & 0xff) == 0x7f)
+            break;          // stopped: the terminal comes back to the shell
+    }
+    if (!waited)
+        return;
+    lock(&tty->lock, 0);
+    if (tty->session == sid)
+        tty->fg_group = pgid;
+    unlock(&tty->lock);
 }
 
 // argv, flattened the way /proc/<pid>/cmdline is defined: each argument
@@ -499,6 +567,8 @@ void native_exec_run_pending(void) {
     int argc = pending->argc;
     char **argv = pending->argv;
     char **envp = pending->envp;
+    bool restored = pending->restored;
+    dword_t standin_child = pending->standin_child;
     // Detached before running: the program must not see a stale record, and
     // task teardown must not double-free what is about to run.
     current->native_exec = NULL;
@@ -531,6 +601,14 @@ void native_exec_run_pending(void) {
     // through native_program_running() so it can find the ckpt_dump for a task
     // it has frozen, rather than matching argv[0] back against the table.
     current->native_running = prog;
+
+    // Coming back from a checkpoint. A stand-in was only ever a wait, so it
+    // goes straight back to waiting; the program it stood in for is restored
+    // as its child, and running the program here would run the command twice.
+    if (standin_child != 0)
+        nlibc_exec_standin_resume(standin_child);
+    if (restored)
+        native_restored_wait_for_foreground_job();
 
     int status = prog->main(argc, argv, envp);
 

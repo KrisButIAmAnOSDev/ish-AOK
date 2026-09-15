@@ -602,6 +602,12 @@ static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct pro
     if (ck.natives_restarted != 0)
         proc_printf(buf, "restarted       %lu native program(s) re-launched: %s\n",
                     ck.natives_restarted, ck.natives_note);
+    // What the last restore brought back degraded -- a listener that could not
+    // be rebound, say. The session runs on without it, so this is where it shows.
+    char restore_note[256];
+    checkpoint_get_restore_note(restore_note, sizeof(restore_note));
+    if (restore_note[0] != '\0')
+        proc_printf(buf, "restore_note    %s\n", restore_note);
     proc_printf(buf, "\n  echo save /host/path > /proc/ish/checkpoint\n");
     proc_printf(buf, "  ISH_RESTORE=/host/path ish -f <root>   # brings it back\n");
 
