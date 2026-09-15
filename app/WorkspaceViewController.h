@@ -30,6 +30,23 @@ extern NSString *_Nullable ISHWorkspaceToolIdentifierForViewController(UIViewCon
 - (void)workspaceToolDidBecomeFrontmost;
 @end
 
+// Adopted by an applet whose text can be made bigger or smaller: Cmd+= (or
+// Cmd++), Cmd+- and Cmd+0, as a terminal window already does.
+//
+// The Workspace owns the chords and the steps, so an applet declares the
+// protocol and nothing else about keys. The scale is per window: 1.0 is the
+// applet's own default, and the Workspace saves it in the window's layout
+// descriptor ("textScale"), so nothing goes in the applet's own state.
+// WorkspaceThemedToolViewController implements the property; a subclass
+// overrides -workspaceApplyTextScale to re-font its own views.
+//
+// The Workspace also takes keyboard focus away from a background terminal when
+// a window adopting this comes to the front. Otherwise the terminal keeps first
+// responder and its own Cmd+= resizes the terminal instead.
+@protocol WorkspaceTextScalable <NSObject>
+@property (nonatomic) CGFloat workspaceTextScale;
+@end
+
 // Adopted by an applet whose content should survive an app restart (e.g. the
 // File Manager's current directory, a viewer's open file). The returned
 // dictionary is stored inside the saved window-layout descriptor in
@@ -81,6 +98,21 @@ void ISHWorkspaceForgetLayoutForSessionImage(NSString *_Nullable imagePath);
 - (NSDictionary<NSString *, UIColor *> *)workspaceTheme;
 - (void)workspaceApplyTheme;
 
+// The WorkspaceTextScalable implementation, for subclasses that adopt it. 1.0
+// is the default. Setting it re-applies at once when the view is loaded, and
+// again on every appearance.
+@property (nonatomic) CGFloat workspaceTextScale;
+// Re-font for the current workspaceTextScale. The base re-fonts the text views
+// made by -workspaceThemeTextView. A subclass calls super, then scales its own
+// views.
+- (void)workspaceApplyTextScale;
+// `size` scaled by workspaceTextScale, rounded to half a point.
+- (CGFloat)workspaceScaledFontSize:(CGFloat)size;
+// Scale a label whose font the applet set at its unscaled size. Remembers that
+// size, so repeated calls do not compound. A font the applet sets later is
+// taken as the new unscaled size.
+- (void)workspaceScaleLabel:(UILabel *)label;
+
 @end
 
 @interface WorkspaceViewController : UIViewController
@@ -93,6 +125,11 @@ void ISHWorkspaceForgetLayoutForSessionImage(NSString *_Nullable imagePath);
 // identifier has no factory registration.
 - (void)openWorkspaceToolWithIdentifier:(NSString *)toolIdentifier fileGuestPath:(NSString *)guestPath;
 - (void)openWorkspaceToolWithIdentifier:(NSString *)toolIdentifier;
+
+// One text-size step for an applet adopting WorkspaceTextScalable: +1 bigger,
+// -1 smaller, 0 back to the default. What the Cmd+= / Cmd+- / Cmd+0 chords do,
+// for an applet that also offers it as a menu item.
+- (void)adjustTextSizeForToolViewController:(UIViewController *)viewController step:(NSInteger)step;
 
 // Opens a new terminal window and, once its shell is up, injects `command` as a typed line
 // (empty command just opens a fresh shell). Same mechanism a Launcher shortcut's command runs

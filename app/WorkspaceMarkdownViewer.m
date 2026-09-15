@@ -147,6 +147,25 @@ static const NSUInteger kMarkdownViewerMaxBytes = 4 * 1024 * 1024;  // 4 MiB; re
     [self updateContent];  // re-render markdown with the new theme's colors baked in
 }
 
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0. The whole document is re-rendered: every font the
+// renderer uses derives from the base font, so headings, code and quotes all
+// follow. The reading position is kept as a fraction of the document, since
+// the character at the top would need layout that has not happened yet.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_textView == nil)
+        return;
+    CGFloat scrollable = _textView.contentSize.height - CGRectGetHeight(_textView.bounds);
+    CGFloat fraction = scrollable > 0 ? (_textView.contentOffset.y + _textView.adjustedContentInset.top) / scrollable : 0;
+    [self updateContent];
+    [_textView layoutIfNeeded];
+    CGFloat newScrollable = _textView.contentSize.height - CGRectGetHeight(_textView.bounds);
+    if (newScrollable > 0 && fraction > 0)
+        _textView.contentOffset = CGPointMake(0, MIN(1.0, fraction) * newScrollable - _textView.adjustedContentInset.top);
+}
+
 #pragma mark WorkspaceFileOpenable
 
 - (void)workspaceOpenFileAtGuestPath:(NSString *)guestPath {
@@ -257,7 +276,7 @@ static const NSUInteger kMarkdownViewerMaxBytes = 4 * 1024 * 1024;  // 4 MiB; re
     if (_statusMessage != nil) {
         NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
         _textView.attributedText = [[NSAttributedString alloc] initWithString:_statusMessage attributes:@{
-            NSFontAttributeName: [UIFont systemFontOfSize:15.0],
+            NSFontAttributeName: [UIFont systemFontOfSize:[self workspaceScaledFontSize:15.0]],
             NSForegroundColorAttributeName: theme[@"secondary"] ?: UIColor.secondaryLabelColor,
         }];
         return;
@@ -267,7 +286,8 @@ static const NSUInteger kMarkdownViewerMaxBytes = 4 * 1024 * 1024;  // 4 MiB; re
 
 - (NSAttributedString *)renderedMarkdown {
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
-    UIFont *baseFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    UIFont *bodyFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    UIFont *baseFont = [bodyFont fontWithSize:[self workspaceScaledFontSize:bodyFont.pointSize]];
     UIColor *textColor = theme[@"primary"] ?: UIColor.labelColor;
     UIColor *secondaryColor = theme[@"secondary"] ?: UIColor.secondaryLabelColor;
     UIColor *codeBg = [theme[@"cardAlt"] colorWithAlphaComponent:0.5] ?: UIColor.tertiarySystemFillColor;

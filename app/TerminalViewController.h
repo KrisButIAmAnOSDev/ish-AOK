@@ -58,6 +58,12 @@ typedef NS_ENUM(NSInteger, ISHFreshSessionTerminalDisplayMode) {
 // global UserPreferences fontSize. Forwards to the terminal view; used by the
 // workspace host to persist/restore a window's size in the saved layout.
 @property (nonatomic) CGFloat overrideFontSize;
+// The Cmd+= / Cmd+- / Cmd+0 actions. `command` is unused and may be nil. The
+// workspace calls these when the chord is meant for a terminal window that does
+// not hold first responder.
+- (void)increaseFontSize:(UIKeyCommand *)command;
+- (void)decreaseFontSize:(UIKeyCommand *)command;
+- (void)resetFontSize:(UIKeyCommand *)command;
 // Set by the workspace host for an embedded terminal. Invoked (on the main queue) when the
 // shell session ends, so the host closes the contained window instead of the default relaunch
 // of the login shell. Left nil for the main full-screen terminal, which keeps relaunching.

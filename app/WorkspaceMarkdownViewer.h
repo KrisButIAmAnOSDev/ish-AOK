@@ -12,7 +12,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface WorkspaceMarkdownViewerToolViewController : WorkspaceThemedToolViewController <WorkspaceFileOpenable, WorkspaceStatefulTool>
+@interface WorkspaceMarkdownViewerToolViewController : WorkspaceThemedToolViewController <WorkspaceFileOpenable, WorkspaceStatefulTool, WorkspaceTextScalable>
 @end
 
 NS_ASSUME_NONNULL_END

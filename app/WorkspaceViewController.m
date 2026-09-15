@@ -2404,6 +2404,93 @@ static CGFloat ISHWorkspaceThemeFontSize(UIFontTextStyle textStyle) {
     return size;
 }
 
+// The monospaced detail text views (-workspaceThemeTextView), before any
+// per-window text scale.
+static CGFloat ISHWorkspaceThemeTextViewFontSize(void) {
+    return ISHWorkspaceDensityValue(ISHWorkspaceUsesPhoneLayout() ? 8.5 : 9.5,
+                                    ISHWorkspaceUsesPhoneLayout() ? 11.0 : 12.0);
+}
+
+// ---- first responder, and per-window text size ------------------------------
+//
+// UIKit has no way to ask for the first responder. An action sent to nil goes
+// to it, so send one that records its receiver.
+static __weak UIResponder *ISHWorkspaceCapturedFirstResponder;
+
+@interface UIResponder (ISHWorkspaceFirstResponder)
+- (void)ish_workspaceCaptureFirstResponder:(id)sender;
+@end
+
+@implementation UIResponder (ISHWorkspaceFirstResponder)
+- (void)ish_workspaceCaptureFirstResponder:(id)sender {
+    ISHWorkspaceCapturedFirstResponder = self;
+}
+@end
+
+static UIResponder *ISHWorkspaceCurrentFirstResponder(void) {
+    ISHWorkspaceCapturedFirstResponder = nil;
+    [UIApplication.sharedApplication sendAction:@selector(ish_workspaceCaptureFirstResponder:)
+                                             to:nil
+                                           from:nil
+                                       forEvent:nil];
+    UIResponder *responder = ISHWorkspaceCapturedFirstResponder;
+    ISHWorkspaceCapturedFirstResponder = nil;
+    // With no first responder the action falls through to the application (or
+    // its delegate). Neither is "the responder" in any useful sense.
+    if (responder == UIApplication.sharedApplication ||
+            responder == (id) UIApplication.sharedApplication.delegate)
+        return nil;
+    return responder;
+}
+
+// The workspace window a responder lives in -- a view inside it, or a view
+// controller whose view is -- or nil.
+static ISHWorkspaceContainedWindowView *ISHWorkspaceWindowContainingResponder(UIResponder *responder) {
+    UIView *view = nil;
+    if ([responder isKindOfClass:UIView.class])
+        view = (UIView *) responder;
+    else if ([responder isKindOfClass:UIViewController.class] && ((UIViewController *) responder).isViewLoaded)
+        view = ((UIViewController *) responder).view;
+    for (; view != nil; view = view.superview) {
+        if ([view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            return (ISHWorkspaceContainedWindowView *) view;
+    }
+    return nil;
+}
+
+// Safari's zoom levels. Relative steps suit an applet with several text sizes
+// (a Markdown heading and its body grow together) better than the terminal's
+// one point at a time.
+static const CGFloat ISHWorkspaceTextScaleSteps[] = {0.5, 0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0};
+static const size_t ISHWorkspaceTextScaleStepCount = sizeof(ISHWorkspaceTextScaleSteps) / sizeof(ISHWorkspaceTextScaleSteps[0]);
+
+static CGFloat ISHWorkspaceClampedTextScale(CGFloat scale) {
+    if (!(scale > 0))
+        return 1.0;
+    return MAX(ISHWorkspaceTextScaleSteps[0],
+               MIN(ISHWorkspaceTextScaleSteps[ISHWorkspaceTextScaleStepCount - 1], scale));
+}
+
+// The next step above (`step` > 0) or below (`step` < 0) `current`. A current
+// value between two steps -- restored from an older layout, say -- moves to the
+// nearer step in the direction asked.
+static CGFloat ISHWorkspaceSteppedTextScale(CGFloat current, NSInteger step) {
+    current = ISHWorkspaceClampedTextScale(current);
+    if (step > 0) {
+        for (size_t i = 0; i < ISHWorkspaceTextScaleStepCount; i++)
+            if (ISHWorkspaceTextScaleSteps[i] > current + 0.001)
+                return ISHWorkspaceTextScaleSteps[i];
+        return ISHWorkspaceTextScaleSteps[ISHWorkspaceTextScaleStepCount - 1];
+    }
+    if (step < 0) {
+        for (size_t i = ISHWorkspaceTextScaleStepCount; i > 0; i--)
+            if (ISHWorkspaceTextScaleSteps[i - 1] < current - 0.001)
+                return ISHWorkspaceTextScaleSteps[i - 1];
+        return ISHWorkspaceTextScaleSteps[0];
+    }
+    return 1.0;
+}
+
 static void ISHWorkspaceSetCurrentDensity(CGFloat density) {
     CGFloat clamped = MAX(0.0, MIN(1.0, density));
     [NSUserDefaults.standardUserDefaults setDouble:clamped forKey:ISHWorkspaceToolDensityPreferenceKey];
@@ -3334,6 +3421,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             UIViewController *contentViewController = [strongSelf contentViewControllerForDesktopWindow:strongWindowView];
             if ([contentViewController conformsToProtocol:@protocol(WorkspaceFocusable)])
                 [(id<WorkspaceFocusable>) contentViewController workspaceToolDidBecomeFrontmost];
+            [strongSelf claimKeyboardFocusForTextScalableWindow:strongWindowView];
         }
         [strongSelf refreshDockButtons];
     };
@@ -3531,6 +3619,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             NSDictionary<NSString *, id> *state = [(id<WorkspaceStatefulTool>) contentViewController workspaceToolStateForSaving];
             if (state.count > 0)
                 descriptor[@"state"] = state;
+        }
+        // The window's text size, beside its state rather than inside it, so
+        // an applet does not have to save it. The terminal branch above saves
+        // its own size as "fontSize" in the same way.
+        if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)]) {
+            CGFloat textScale = ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale;
+            if (textScale > 0 && fabs(textScale - 1.0) > 0.001)
+                descriptor[@"textScale"] = @(textScale);
         }
         return descriptor;
     }
@@ -4352,6 +4448,12 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                                    toWindow:windowView
                                fallbackSize:ISHWorkspacePreferredToolContentSize(toolIdentifier)];
             [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
+            // Before the state: a restored viewer opens its file from the state,
+            // and should render it at the size it had.
+            NSNumber *textScale = [descriptor[@"textScale"] isKindOfClass:NSNumber.class] ? descriptor[@"textScale"] : nil;
+            UIViewController *scalableViewController = [self contentViewControllerForDesktopWindow:windowView];
+            if (textScale != nil && [scalableViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+                ((id<WorkspaceTextScalable>) scalableViewController).workspaceTextScale = textScale.doubleValue;
             NSDictionary<NSString *, id> *toolState = [descriptor[@"state"] isKindOfClass:NSDictionary.class] ? descriptor[@"state"] : nil;
             if (toolState != nil) {
                 UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
@@ -4513,7 +4615,10 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (windowView == nil)
         return;
     [self.desktopSurfaceView bringSubviewToFront:windowView];
-    [windowView.hostedTerminalViewController focusTerminal];
+    if (windowView.hostedTerminalViewController != nil)
+        [windowView.hostedTerminalViewController focusTerminal];
+    else
+        [self claimKeyboardFocusForTextScalableWindow:windowView];
     [self refreshDockButtons];
 }
 
@@ -5226,7 +5331,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // regardless of what's focused (see there for why): the branch lives here in the action instead.
 - (void)hotkeyPreviousDesktop:(UIKeyCommand *)command {
     UIView *responder = ISHWorkspaceFindFirstResponder(self.view);
-    if ([responder isKindOfClass:UITextView.class]) {
+    // EDITABLE text only. A read-only text view (the Markdown reader, the
+    // Diagnostics report) takes first responder when tapped, and a caret move
+    // there does nothing visible -- the chord would simply stop switching
+    // Desktops.
+    if ([responder isKindOfClass:UITextView.class] && ((UITextView *) responder).isEditable) {
         UITextView *textView = (UITextView *)responder;
         NSRange line = ISHWorkspaceLineRangeContainingIndex(textView.text, textView.selectedRange.location);
         textView.selectedRange = NSMakeRange(line.location, 0);
@@ -5237,7 +5346,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)hotkeyNextDesktop:(UIKeyCommand *)command {
     UIView *responder = ISHWorkspaceFindFirstResponder(self.view);
-    if ([responder isKindOfClass:UITextView.class]) {
+    if ([responder isKindOfClass:UITextView.class] && ((UITextView *) responder).isEditable) {
         UITextView *textView = (UITextView *)responder;
         NSRange line = ISHWorkspaceLineRangeContainingIndex(textView.text, textView.selectedRange.location);
         textView.selectedRange = NSMakeRange(NSMaxRange(line), 0);
@@ -5257,6 +5366,83 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // iOS app switcher (system-reserved, unwinnable), and the guest terminal
 // doesn't claim Ctrl+Tab (plain Tab passes through; the RFB applet registers
 // unmodified \t only).
+// ---- text size: Cmd+= / Cmd++ / Cmd+- / Cmd+0 --------------------------------
+//
+// Terminal windows (TerminalViewController) and the Wayland display
+// (DisplayRFBView) bind these chords themselves. When one of them holds first
+// responder it is the nearer responder, so it wins and these never run. What
+// reaches here is everything else: an applet's text view, an applet that is
+// first responder itself, or the Workspace.
+
+// The Workspace takes first responder when a text-scalable applet with nothing
+// focused of its own comes to the front. Without that, a terminal in another
+// window kept first responder, and Cmd+= resized the terminal.
+- (BOOL)canBecomeFirstResponder {
+    return YES;
+}
+
+- (nullable id<WorkspaceTextScalable>)textScalableForDesktopWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
+    if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        return (id<WorkspaceTextScalable>) contentViewController;
+    return nil;
+}
+
+// Called when a non-terminal window comes to the front. Leaves focus alone when
+// the window already holds it -- MotePad's editor, a text field being typed in
+// -- or when the applet has no text to scale, so tapping a Clock does not take
+// the keyboard from a terminal.
+- (void)claimKeyboardFocusForTextScalableWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    if (windowView == nil || [self textScalableForDesktopWindow:windowView] == nil)
+        return;
+    if (ISHWorkspaceWindowContainingResponder(ISHWorkspaceCurrentFirstResponder()) == windowView)
+        return;
+    [self becomeFirstResponder];
+}
+
+// The window a text-size chord is for: the one holding first responder, else
+// the frontmost window on the active Desktop.
+- (nullable ISHWorkspaceContainedWindowView *)textSizeTargetWindow {
+    ISHWorkspaceContainedWindowView *focused = ISHWorkspaceWindowContainingResponder(ISHWorkspaceCurrentFirstResponder());
+    if (focused != nil && focused != self.dockWindow && !focused.hidden &&
+            focused.superview == self.desktopSurfaceView)
+        return focused;
+    for (UIView *view in self.desktopSurfaceView.subviews.reverseObjectEnumerator) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        if (windowView == self.dockWindow || windowView.hidden)
+            continue;
+        return windowView;
+    }
+    return nil;
+}
+
+- (void)adjustTextSizeForToolViewController:(UIViewController *)viewController step:(NSInteger)step {
+    if (![viewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        return;
+    id<WorkspaceTextScalable> scalable = (id<WorkspaceTextScalable>) viewController;
+    scalable.workspaceTextScale = ISHWorkspaceSteppedTextScale(scalable.workspaceTextScale, step);
+}
+
+- (void)hotkeyTextSize:(UIKeyCommand *)command {
+    NSInteger step = [command.input isEqualToString:@"-"] ? -1 : [command.input isEqualToString:@"0"] ? 0 : 1;
+    ISHWorkspaceContainedWindowView *windowView = [self textSizeTargetWindow];
+    if (windowView == nil)
+        return;
+    TerminalViewController *terminal = windowView.hostedTerminalViewController;
+    if (terminal != nil) {
+        if (step > 0)
+            [terminal increaseFontSize:nil];
+        else if (step < 0)
+            [terminal decreaseFontSize:nil];
+        else
+            [terminal resetFontSize:nil];
+        return;
+    }
+    [self adjustTextSizeForToolViewController:[self contentViewControllerForDesktopWindow:windowView] step:step];
+}
+
 - (void)hotkeyCycleWindows:(UIKeyCommand *)command {
     NSMutableArray<ISHWorkspaceContainedWindowView *> *windows = [NSMutableArray array];
     for (UIView *view in self.desktopSurfaceView.subviews) {
@@ -5278,7 +5464,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
-    BOOL textEditing = [ISHWorkspaceFindFirstResponder(self.view) isKindOfClass:UITextView.class];
+    UIView *editingResponder = ISHWorkspaceFindFirstResponder(self.view);
+    BOOL textEditing = [editingResponder isKindOfClass:UITextView.class] && ((UITextView *) editingResponder).isEditable;
     UIKeyCommand *previous = [UIKeyCommand keyCommandWithInput:UIKeyInputLeftArrow
                                                  modifierFlags:UIKeyModifierCommand
                                                         action:@selector(hotkeyPreviousDesktop:)
@@ -5316,7 +5503,25 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         cycleForward.wantsPriorityOverSystemBehavior = YES;
         cycleBackward.wantsPriorityOverSystemBehavior = YES;
     }
-    return @[previous, next, cycleForward, cycleBackward];
+    // Text size. Always present, by the rule above; only the titles vary. A
+    // focused terminal lists its own identical commands in the Cmd-hold HUD,
+    // so these go untitled then rather than appearing twice.
+    UIResponder *firstResponder = ISHWorkspaceCurrentFirstResponder();
+    BOOL terminalFocused = ISHWorkspaceWindowContainingResponder(firstResponder).hostedTerminalViewController != nil;
+    NSMutableArray<UIKeyCommand *> *commands = [@[previous, next, cycleForward, cycleBackward] mutableCopy];
+    NSArray<NSArray<NSString *> *> *textSizeChords = @[@[@"+", @"Increase Text Size"], @[@"=", @""],
+                                                      @[@"-", @"Decrease Text Size"], @[@"0", @"Reset Text Size"]];
+    for (NSArray<NSString *> *chord in textSizeChords) {
+        UIKeyCommand *textSize = [UIKeyCommand keyCommandWithInput:chord[0]
+                                                     modifierFlags:UIKeyModifierCommand
+                                                            action:@selector(hotkeyTextSize:)];
+        if (!terminalFocused && chord[1].length > 0)
+            textSize.discoverabilityTitle = chord[1];
+        if (@available(iOS 15, *))
+            textSize.wantsPriorityOverSystemBehavior = YES;
+        [commands addObject:textSize];
+    }
+    return commands;
 }
 
 // A brief "Desktop N / M" toast so the swipe-only switch stays oriented.
@@ -7295,6 +7500,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     NSMutableArray<UILabel *> *_trackedAccentLabels;
     NSMutableArray<UITextView *> *_trackedTextViews;
     NSMutableArray<UIProgressView *> *_trackedProgressViews;
+    CGFloat _workspaceTextScale;   // 0 until set, which reads as 1.0
+    // -workspaceScaleLabel: bookkeeping: the unscaled font each label was given,
+    // and the font this class last set, to notice when the applet sets another.
+    NSMapTable<UILabel *, UIFont *> *_textScaleBaseFonts;
+    NSMapTable<UILabel *, UIFont *> *_textScaleAppliedFonts;
 }
 
 - (void)viewDidLoad {
@@ -7343,6 +7553,62 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     // UILabel's default color until a theme-change notification happens to fire (the bug that
     // left the Clock readout invisible on dark themes).
     [self workspaceApplyTheme];
+    // The same for a text size set before the subclass had built its views --
+    // a restore can set it that early.
+    if (fabs(self.workspaceTextScale - 1.0) > 0.001)
+        [self workspaceApplyTextScale];
+}
+
+- (CGFloat)workspaceTextScale {
+    return _workspaceTextScale > 0 ? _workspaceTextScale : 1.0;
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    CGFloat clamped = ISHWorkspaceClampedTextScale(workspaceTextScale);
+    if (fabs(clamped - self.workspaceTextScale) < 0.001)
+        return;
+    _workspaceTextScale = clamped;
+    if (self.isViewLoaded)
+        [self workspaceApplyTextScale];
+}
+
+- (CGFloat)workspaceScaledFontSize:(CGFloat)size {
+    return round(size * self.workspaceTextScale * 2.0) / 2.0;
+}
+
+- (void)workspaceApplyTextScale {
+    [self workspaceApplyTrackedTextViewFonts];
+}
+
+- (void)workspaceScaleLabel:(UILabel *)label {
+    if (label.font == nil)
+        return;
+    if (_textScaleBaseFonts == nil) {
+        _textScaleBaseFonts = [NSMapTable weakToStrongObjectsMapTable];
+        _textScaleAppliedFonts = [NSMapTable weakToStrongObjectsMapTable];
+    }
+    UIFont *base = [_textScaleBaseFonts objectForKey:label];
+    UIFont *applied = [_textScaleAppliedFonts objectForKey:label];
+    if (base == nil || applied == nil || ![label.font isEqual:applied])
+        base = label.font;
+    UIFont *scaled = [base fontWithSize:[self workspaceScaledFontSize:base.pointSize]];
+    label.font = scaled;
+    [_textScaleBaseFonts setObject:base forKey:label];
+    [_textScaleAppliedFonts setObject:scaled forKey:label];
+}
+
+// The monospaced text views -workspaceThemeTextView makes. One place for their
+// size, shared by the factory, the theme and the text scale -- the theme used
+// to reset it without the scale (and without the factory's phone sizes).
+- (void)workspaceApplyTrackedTextViewFonts {
+    CGFloat pointSize = [self workspaceScaledFontSize:ISHWorkspaceThemeTextViewFontSize()];
+    for (UITextView *textView in _trackedTextViews) {
+        if (@available(iOS 13.0, *)) {
+            textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
+        } else {
+            textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
+        }
+    }
 }
 
 - (void)dealloc {
@@ -7424,14 +7690,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     textView.editable = NO;
     textView.alwaysBounceVertical = YES;
     textView.backgroundColor = UIColor.clearColor;
-    CGFloat pointSize = ISHWorkspaceDensityValue(ISHWorkspaceUsesPhoneLayout() ? 8.5 : 9.5,
-                                                 ISHWorkspaceUsesPhoneLayout() ? 11.0 : 12.0);
-    if (@available(iOS 13.0, *)) {
-        textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
-    } else {
-        textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
-    }
     [_trackedTextViews addObject:textView];
+    [self workspaceApplyTrackedTextViewFonts];
     return textView;
 }
 
@@ -7628,13 +7888,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     for (UILabel *label in _trackedAccentLabels) {
         label.textColor = theme[@"accent"];
     }
+    [self workspaceApplyTrackedTextViewFonts];
     for (UITextView *textView in _trackedTextViews) {
-        CGFloat pointSize = ISHWorkspaceDensityValue(9.5, 12.0);
-        if (@available(iOS 13.0, *)) {
-            textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
-        } else {
-            textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
-        }
         textView.textColor = theme[@"primary"];
         textView.tintColor = theme[@"accent"];
     }
@@ -9853,6 +10108,9 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 // logical line (paragraph), aligned to that line's first laid-out fragment, and the editor
 // asks it to redraw on scroll/edit/wrap/font changes. Word-wrapped continuation fragments
 // get no number, matching a desktop editor.
+// The editor's size at text scale 1.0 (WorkspaceTextScalable).
+static const CGFloat kMotePadDefaultFontSize = 14.0;
+
 @interface MotePadLineNumberGutterView : UIView
 @property (nonatomic, weak) UITextView *textView;
 @property (nonatomic, strong) UIColor *numberColor;
@@ -10135,7 +10393,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 @end
 
 
-@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable, WorkspaceStatefulTool>
+@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable, WorkspaceStatefulTool, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceMotePadToolViewController {
@@ -10182,6 +10440,35 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 // inside it again (viewDidAppear's initial grab only fires once).
 - (void)workspaceToolDidBecomeFrontmost {
     [_textView becomeFirstResponder];
+}
+
+// WorkspaceTextScalable: Cmd+= / Cmd+- / Cmd+0 and the View menu's
+// Bigger / Smaller / Actual Size. Only the document text scales; the menu bar,
+// title and status bar are chrome. -fontWithSize: keeps the face, so a font
+// picked with Show Fonts survives, and the picker in turn keeps the size.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_textView == nil)
+        return;
+    CGFloat size = [self workspaceScaledFontSize:kMotePadDefaultFontSize];
+    UIFont *font = _textView.font ?: [UIFont monospacedSystemFontOfSize:size weight:UIFontWeightRegular];
+    // Setting the font is not an edit: no dirty flag, no draft, no undo.
+    _textView.font = [font fontWithSize:size];
+    [self updateGutterWidth];
+    [_gutter setNeedsDisplay];
+    [_textView scrollRangeToVisible:_textView.selectedRange];
+}
+
+- (void)mpBiggerText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:1];
+}
+
+- (void)mpSmallerText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:-1];
+}
+
+- (void)mpActualSizeText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:0];
 }
 
 - (void)viewDidLoad {
@@ -10236,7 +10523,8 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
     _textView.translatesAutoresizingMaskIntoConstraints = NO;
     _textView.delegate = self;
     _textView.editable = YES;
-    _textView.font = [UIFont fontWithName:@"Courier" size:14] ?: [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+    _textView.font = [UIFont fontWithName:@"Courier" size:kMotePadDefaultFontSize]
+        ?: [UIFont monospacedSystemFontOfSize:kMotePadDefaultFontSize weight:UIFontWeightRegular];
     _textView.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _textView.autocorrectionType = UITextAutocorrectionTypeNo;
     _textView.smartQuotesType = UITextSmartQuotesTypeNo;
@@ -10428,6 +10716,10 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
     return @[ @[
         [self toggle:@"Status Bar" shortcut:@"⌥⌘S" checked:_statusBarVisible handler:^{ [ws mpToggleStatusBar]; }],
         [self toggle:@"Line Numbers" shortcut:@"⌥⌘L" checked:_lineNumbersVisible handler:^{ [ws mpToggleLineNumbers]; }],
+    ], @[
+        [self row:@"Bigger" shortcut:@"⌘+" handler:^{ [ws mpBiggerText]; }],
+        [self row:@"Smaller" shortcut:@"⌘−" handler:^{ [ws mpSmallerText]; }],
+        [self row:@"Actual Size" shortcut:@"⌘0" handler:^{ [ws mpActualSizeText]; }],
     ] ];
 }
 
