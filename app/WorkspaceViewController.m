@@ -7803,15 +7803,21 @@ void ISHWorkspaceScaleTableViewCell(UITableViewCell *cell, CGFloat scale) {
     if (cell == nil)
         return;
     BOOL actualSize = fabs(scale - 1.0) < 0.001;
-    // Outside the Workspace, and in it at the default size, there is nothing to
-    // put back, so nothing in the cell is even looked at.
-    if (actualSize && objc_getAssociatedObject(cell, &ISHWorkspaceScaledCellKey) == nil)
-        return;
+    // Walked even at 1.0 in a cell never scaled. Whether a view needs putting
+    // back is recorded on the view, not the cell, and the two part company when
+    // a page keeps a view and moves it into whichever cell shows its row, as the
+    // Theme editor does with its name and colour fields: one scaled in another
+    // row can land in a cell already put back. A view never scaled costs a font
+    // read and is left alone, so outside the Workspace nothing changes.
+    BOOL found = ISHWorkspaceScaleTextFontsInView(cell.contentView, scale);
     // UIKit may add a built-in style's labels to the content view only when it
     // lays the cell out, after this has run. The row has set its text by then,
     // so the labels it uses exist and can be asked for -- but only when the walk
-    // found nothing, so a storyboard cell of the custom style does not grow one.
-    if (!ISHWorkspaceScaleTextFontsInView(cell.contentView, scale)) {
+    // found nothing, so a storyboard cell of the custom style does not grow one,
+    // and at 1.0 only in a cell that was scaled, since those labels are the
+    // cell's own and could not have been scaled anywhere else.
+    BOOL cellWasScaled = objc_getAssociatedObject(cell, &ISHWorkspaceScaledCellKey) != nil;
+    if (!found && (!actualSize || cellWasScaled)) {
         ISHWorkspaceScaleTextFont(cell.textLabel, scale);
         ISHWorkspaceScaleTextFont(cell.detailTextLabel, scale);
     }
