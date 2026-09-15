@@ -270,7 +270,15 @@ int Terminal_debugSendInputUTF8Sync(int type, int number, const char *input) {
                                              @"firstByte": [NSString stringWithFormat:@"%#x", first]}];
         }
 
-        tty_input(terminal.tty, copy, length, 0);
+        // A reference across the call, as -sendInput takes: terminal.tty is an
+        // unowned back-pointer that tty_release can free under us.
+        struct tty *tty = tty_lookup_ref(terminal.type, terminal.number, terminal.tty);
+        if (tty == NULL) {
+            free(copy);
+            return -3;
+        }
+        tty_input(tty, copy, length, 0);
+        tty_put(tty);
         free(copy);
         return 0;
     }
