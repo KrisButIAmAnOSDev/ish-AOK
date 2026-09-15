@@ -101,7 +101,9 @@ UINavigationController *ISHCreateAboutNavigationController(BOOL recoveryMode, BO
 @interface DiagnosticsViewController : UIViewController
 @end
 
-@interface LLMClientViewController : UIViewController <UITextViewDelegate, UITableViewDataSource, UITableViewDelegate>
+// WorkspaceTextScalable: the Workspace window's Cmd+= / Cmd+- / Cmd+0. Shown
+// modally from a terminal instead, nothing sets it and the chat stays at 1.0.
+@interface LLMClientViewController : UIViewController <UITextViewDelegate, UITableViewDataSource, UITableViewDelegate, WorkspaceTextScalable>
 
 @property (nonatomic, copy) NSString *initialPrompt;
 
@@ -2114,6 +2116,10 @@ static UIFont *ISHLLMMonospaceFont(CGFloat size) {
 // Called when the "Thinking" disclosure is tapped; the controller flips its
 // stored expansion state for the message and reloads the row.
 @property (nonatomic, copy, nullable) void (^thinkingToggleHandler)(void);
+// The chat's text scale (0 reads as 1.0). The fonts arrive already scaled;
+// this only moves the fixed minimum a thought's text is kept above, which
+// would otherwise stop it shrinking with the rest of the bubble.
+@property (nonatomic) CGFloat textScale;
 // Must be called BEFORE -configureWithBlocks: -- the thought disclosure is
 // appended to the same stack, so ordering it first is what puts it above the
 // answer (and what stops -configureWithBlocks: adding its empty-bubble
@@ -2214,7 +2220,9 @@ static UIFont *ISHLLMMonospaceFont(CGFloat size) {
     BOOL canExpand = text.length > 0;
     expanded = expanded && canExpand;
 
-    UIFont *labelFont = [baseFont fontWithSize:MAX(11.0, baseFont.pointSize - 2.0)];
+    CGFloat scale = self.textScale > 0 ? self.textScale : 1.0;
+    CGFloat minimumSize = round(11.0 * scale * 2.0) / 2.0;
+    UIFont *labelFont = [baseFont fontWithSize:MAX(minimumSize, baseFont.pointSize - 2.0)];
     UIButton *toggle = [UIButton buttonWithType:UIButtonTypeSystem];
     toggle.translatesAutoresizingMaskIntoConstraints = NO;
     NSString *disclosure = canExpand ? (expanded ? @"▾ " : @"▸ ") : @"";
@@ -2445,7 +2453,12 @@ static UIFont *ISHLLMMonospaceFont(CGFloat size) {
 
 @end
 
+// At text scale 1.0. The cap is a number of lines, so it scales with the font.
 static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
+static const CGFloat kISHLLMTranscriptEstimatedRowHeight = 60.0;
+// The Workspace's text-scale range (WorkspaceTextScalable).
+static const CGFloat kISHLLMMinimumTextScale = 0.5;
+static const CGFloat kISHLLMMaximumTextScale = 3.0;
 
 // UITextView that remembers the modifier flags of the most recent hardware key
 // press. UIKit reports plain Return and Shift+Return identically through
@@ -2521,6 +2534,8 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
     BOOL _sending; // authoritative in-flight flag; see -isBusy
     NSURLSessionDataTask *_auxiliaryTask; // /models probes, kept out of _activeTask so Stop still owns the reply
     double _lastKnownSessionUpdate; // "updated" stamp this instance last wrote, to spot another window's edits
+    CGFloat _workspaceTextScale; // 0 until set, which reads as 1.0
+    NSLayoutConstraint *_promptFieldMaxHeightConstraint; // follows the text scale
 }
 
 - (void)viewDidLoad {
@@ -2546,7 +2561,7 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
     _transcriptTable.delegate = self;
     _transcriptTable.separatorStyle = UITableViewCellSeparatorStyleNone;
     _transcriptTable.rowHeight = UITableViewAutomaticDimension;
-    _transcriptTable.estimatedRowHeight = 60.0;
+    _transcriptTable.estimatedRowHeight = kISHLLMTranscriptEstimatedRowHeight * self.workspaceTextScale;
     _transcriptTable.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     [_transcriptTable registerClass:ISHLLMChatMessageCell.class forCellReuseIdentifier:@"message"];
     if (@available(iOS 13.0, *))
@@ -2557,7 +2572,7 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
     _emptyStateLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _emptyStateLabel.numberOfLines = 0;
     _emptyStateLabel.textAlignment = NSTextAlignmentCenter;
-    _emptyStateLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    _emptyStateLabel.font = [self scaledBodyFont];
     _emptyStateLabel.hidden = YES;
     if (@available(iOS 13.0, *))
         _emptyStateLabel.textColor = UIColor.secondaryLabelColor;
@@ -2572,7 +2587,7 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
     // view; only the Send button submits.
     _promptField = [LLMPromptTextView new];
     _promptField.translatesAutoresizingMaskIntoConstraints = NO;
-    _promptField.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    _promptField.font = [self scaledBodyFont];
     _promptField.textContainerInset = UIEdgeInsetsMake(8.0, 6.0, 8.0, 6.0);
     _promptField.scrollEnabled = NO; // NO lets intrinsicContentSize drive auto-grow below the max-height cap
     _promptField.layer.cornerRadius = 8.0;
@@ -2653,6 +2668,7 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
     [self.view addSubview:statusRow];
 
     _toolbarHeightConstraint = [_toolbarStackView.heightAnchor constraintGreaterThanOrEqualToConstant:32.0];
+    _promptFieldMaxHeightConstraint = [_promptField.heightAnchor constraintLessThanOrEqualToConstant:[self promptFieldMaxHeight]];
 
     UILayoutGuide *safeArea = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -2684,7 +2700,7 @@ static const CGFloat kISHLLMPromptFieldMaxHeight = 120.0;
         [_promptField.topAnchor constraintEqualToAnchor:inputBar.topAnchor constant:4.0],
         [_promptField.bottomAnchor constraintEqualToAnchor:inputBar.bottomAnchor constant:-4.0],
         [_promptField.heightAnchor constraintGreaterThanOrEqualToConstant:36.0],
-        [_promptField.heightAnchor constraintLessThanOrEqualToConstant:kISHLLMPromptFieldMaxHeight],
+        _promptFieldMaxHeightConstraint,
         [_sendButton.leadingAnchor constraintEqualToAnchor:_promptField.trailingAnchor constant:8.0],
         [_sendButton.trailingAnchor constraintEqualToAnchor:inputBar.trailingAnchor],
         [_sendButton.centerYAnchor constraintEqualToAnchor:_promptField.centerYAnchor],
@@ -3592,6 +3608,98 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
     [self scrollTranscriptToBottomAnimated:NO];
 }
 
+#pragma mark - WorkspaceTextScalable
+
+// Not a WorkspaceThemedToolViewController, so the property is implemented
+// here, to the same rules: 1.0 is the default, the Workspace owns the steps
+// and saves the value, and a value set before the views exist is picked up
+// when -viewDidLoad builds them from -scaledBodyFont.
+- (CGFloat)workspaceTextScale {
+    return _workspaceTextScale > 0 ? _workspaceTextScale : 1.0;
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    CGFloat clamped = workspaceTextScale > 0
+        ? MAX(kISHLLMMinimumTextScale, MIN(kISHLLMMaximumTextScale, workspaceTextScale))
+        : 1.0;
+    if (fabs(clamped - self.workspaceTextScale) < 0.001)
+        return;
+    _workspaceTextScale = clamped;
+    if (self.isViewLoaded)
+        [self applyTextScale];
+}
+
+// Every transcript and prompt font derives from this, and always from the
+// unscaled Body style, so re-applying never compounds. At 1.0 it is the
+// style's own font, untouched.
+- (UIFont *)scaledBodyFont {
+    UIFont *bodyFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    CGFloat scale = self.workspaceTextScale;
+    if (fabs(scale - 1.0) < 0.001)
+        return bodyFont;
+    return [bodyFont fontWithSize:round(bodyFont.pointSize * scale * 2.0) / 2.0];
+}
+
+- (CGFloat)promptFieldMaxHeight {
+    return round(kISHLLMPromptFieldMaxHeight * self.workspaceTextScale);
+}
+
+// The toolbar row, status line, Send button and the Copy chips are chrome and
+// stay fixed: the toolbar is four equal buttons that already crush on a
+// narrow window. The bubbles and the prompt are what a person reads.
+- (void)applyTextScale {
+    if (_transcriptTable == nil)
+        return;
+    UIFont *font = [self scaledBodyFont];
+    _emptyStateLabel.font = font;
+    _promptField.font = font;
+    _promptPlaceholderLabel.font = font;
+    _promptFieldMaxHeightConstraint.constant = [self promptFieldMaxHeight];
+    // After the cap check, which can flip scrollEnabled and with it whether
+    // the field sizes to its text.
+    [self promptFieldTextDidChange];
+    [_promptField invalidateIntrinsicContentSize];
+    _transcriptTable.estimatedRowHeight = kISHLLMTranscriptEstimatedRowHeight * self.workspaceTextScale;
+
+    // Keep the reading position. -refreshTranscript would jump to the bottom,
+    // which is right only for someone already there (a streaming reply).
+    // Otherwise the row at the top stays at the top, at the same fraction of
+    // its height, since every row above it changes height too.
+    UITableView *table = _transcriptTable;
+    UIEdgeInsets insets = table.adjustedContentInset;
+    CGFloat visibleTop = table.contentOffset.y + insets.top;
+    CGFloat bottomGap = table.contentSize.height + insets.bottom - (table.contentOffset.y + CGRectGetHeight(table.bounds));
+    BOOL atBottom = bottomGap <= 20.0;
+    NSIndexPath *anchor = nil;
+    CGFloat anchorFraction = 0.0;
+    if (!atBottom) {
+        NSArray<NSIndexPath *> *visibleRows = [table.indexPathsForVisibleRows sortedArrayUsingSelector:@selector(compare:)];
+        for (NSIndexPath *path in visibleRows) {
+            CGRect rect = [table rectForRowAtIndexPath:path];
+            if (CGRectGetMaxY(rect) > visibleTop) {
+                anchor = path;
+                anchorFraction = rect.size.height > 0 ? MAX(0.0, (visibleTop - rect.origin.y) / rect.size.height) : 0.0;
+                break;
+            }
+        }
+    }
+
+    [table reloadData];
+    [self.view layoutIfNeeded];
+    if (anchor == nil || anchor.row >= [table numberOfRowsInSection:0]) {
+        [self scrollTranscriptToBottomAnimated:NO];
+        return;
+    }
+    // Scrolled to first so the row is measured rather than estimated.
+    [table scrollToRowAtIndexPath:anchor atScrollPosition:UITableViewScrollPositionTop animated:NO];
+    [table layoutIfNeeded];
+    CGRect rect = [table rectForRowAtIndexPath:anchor];
+    insets = table.adjustedContentInset;
+    CGFloat maxOffset = MAX(-insets.top, table.contentSize.height + insets.bottom - CGRectGetHeight(table.bounds));
+    CGFloat offset = MIN(maxOffset, MAX(-insets.top, rect.origin.y + anchorFraction * rect.size.height - insets.top));
+    table.contentOffset = CGPointMake(table.contentOffset.x, offset);
+}
+
 - (void)scrollTranscriptToBottomAnimated:(BOOL)animated {
     NSInteger rows = [_transcriptTable numberOfRowsInSection:0];
     if (rows <= 0)
@@ -3635,8 +3743,11 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
     NSString *content = [message[@"content"] isKindOfClass:NSString.class] ? message[@"content"] : @"";
     BOOL isAssistant = [role isEqualToString:@"assistant"];
 
-    UIFont *baseFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    // Read on every configure, so a reload after a text-size change re-renders
+    // each bubble from its raw content at the new size.
+    UIFont *baseFont = [self scaledBodyFont];
     UIFont *codeFont = ISHLLMMonospaceFont(baseFont.pointSize - 1.0);
+    cell.textScale = self.workspaceTextScale;
     UIColor *textColor = UIColor.blackColor;
     UIColor *secondaryColor = UIColor.grayColor;
     UIColor *assistantBubbleColor = [UIColor colorWithWhite:0.9 alpha:1.0];
@@ -4572,7 +4683,7 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
 - (void)promptFieldTextDidChange {
     _promptPlaceholderLabel.hidden = _promptField.text.length > 0;
     CGSize fitSize = [_promptField sizeThatFits:CGSizeMake(_promptField.bounds.size.width, CGFLOAT_MAX)];
-    _promptField.scrollEnabled = fitSize.height > kISHLLMPromptFieldMaxHeight;
+    _promptField.scrollEnabled = fitSize.height > [self promptFieldMaxHeight];
 }
 
 - (void)setPromptFieldText:(NSString *)text {
