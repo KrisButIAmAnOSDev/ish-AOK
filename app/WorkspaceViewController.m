@@ -2834,7 +2834,7 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 - (CGSize)launcherContentSizeForDisplayedLevel;
 @end
 
-@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WorkspaceStatefulTool>
+@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WorkspaceStatefulTool, WorkspaceTextScalable>
 @end
 
 @interface WorkspaceThemesToolViewController : WorkspaceThemedToolViewController
@@ -11947,7 +11947,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 
 @end
 
-@interface WorkspaceAudioPlayerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceFileOpenable>
+@interface WorkspaceAudioPlayerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceFileOpenable, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceAudioPlayerToolViewController {
@@ -12139,7 +12139,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     _tableView.dataSource = self;
     _tableView.delegate = self;
     _tableView.backgroundColor = UIColor.clearColor;
-    _tableView.rowHeight = 38;
+    _tableView.rowHeight = [self trackRowHeight];
     _tableView.alwaysBounceVertical = YES;
     _tableView.showsVerticalScrollIndicator = YES;
     [self.toolContentView addSubview:_tableView];
@@ -12531,6 +12531,35 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0 scale the queue list: track titles and artists are what
+// a person reads here. The device (its screen's title, counter and times, the
+// wheel) is a drawing of a player in fixed-size boxes, and stays as it is.
+// cellForRow derives both fonts from the theme sizes each time, so a reload is
+// the whole re-apply and cell reuse cannot compound them.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_tableView == nil)
+        return;
+    _tableView.rowHeight = [self trackRowHeight];
+    [_tableView reloadData];
+}
+
+// 38pt at scale 1.0. The rows are a fixed height, so the height has to grow
+// with the fonts or a two-line row clips; rounded up so it is never a fraction
+// short.
+- (CGFloat)trackRowHeight {
+    return ceil(38.0 * self.workspaceTextScale);
+}
+
+// Not -workspaceScaledFontSize:, which rounds to half a point. The theme sizes
+// follow the density slider (and shrink on a phone), so they are rarely on one,
+// and rounding would change the list at scale 1.0.
+- (CGFloat)trackListFontSize:(UIFontTextStyle)textStyle {
+    return ISHWorkspaceThemeFontSize(textStyle) * self.workspaceTextScale;
+}
+
 #pragma mark Table
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -12552,10 +12581,10 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     UIColor *accent = self.workspaceTheme[@"accent"] ?: UIColor.systemBlueColor;
     UIColor *primary = self.workspaceTheme[@"primary"] ?: UIColor.labelColor;
     cell.textLabel.textColor = isCurrent ? accent : primary;
-    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
+    cell.textLabel.font = [UIFont systemFontOfSize:[self trackListFontSize:UIFontTextStyleSubheadline]
                                             weight:isCurrent ? UIFontWeightSemibold : UIFontWeightRegular];
     cell.detailTextLabel.textColor = self.workspaceTheme[@"secondary"] ?: UIColor.secondaryLabelColor;
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption2)];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:[self trackListFontSize:UIFontTextStyleCaption2]];
     return cell;
 }
 
@@ -13795,6 +13824,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     webView.layer.cornerRadius = ISHWorkspaceUsesPhoneLayout() ? 12.0 : 16.0;
     webView.layer.masksToBounds = YES;
     webView.scrollView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    // A tab opened after Cmd+= starts at its window's size, not at 100%.
+    webView.pageZoom = self.workspaceTextScale;
     [webView addObserver:self forKeyPath:@"estimatedProgress" options:NSKeyValueObservingOptionNew context:nil];
     return webView;
 }
@@ -13803,6 +13834,19 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     if (_selectedTabIndex < 0 || _selectedTabIndex >= (NSInteger) _tabWebViews.count)
         return nil;
     return _tabWebViews[_selectedTabIndex];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0 zoom the pages, as Safari's do. pageZoom rather than
+// re-fonting: a page sets its own sizes in CSS, and pageZoom reflows it like the
+// CSS zoom property, where pinch zoom only magnifies. Every tab follows, so
+// switching tabs does not change the size. The address field and the toolbar
+// and tab buttons are chrome in fixed-size boxes, and stay as they are.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    for (WKWebView *webView in _tabWebViews)
+        webView.pageZoom = self.workspaceTextScale;
 }
 
 #pragma mark WorkspaceStatefulTool
@@ -14420,6 +14464,15 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     (void) navigation;
     if (webView == [self currentBrowserWebView])
         [self refreshBrowserChrome];
+}
+
+// The zoom belongs to the web view, and WebKit carries it from page to page.
+// Setting it again as each page commits is a guard rather than the mechanism:
+// a page in any tab, background ones included, shows at its window's size even
+// if some navigation path brings it up at the default.
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation {
+    (void) navigation;
+    webView.pageZoom = self.workspaceTextScale;
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
