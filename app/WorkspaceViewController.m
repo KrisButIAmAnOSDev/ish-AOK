@@ -2445,6 +2445,22 @@ static CGSize ISHWorkspaceInfoContentSizeForTextScale(CGFloat textScale) {
     return size;
 }
 
+// The size an applet's window should have with its text at `textScale`: Info's and Monitor's grow
+// with the text, and every other applet's is its preferred size whatever the scale. Anything that
+// sizes a window back to "its" size has to ask this, not ISHWorkspacePreferredToolContentSize, or
+// it undoes the growth and adjustsFontSizeToFitWidth shrinks the larger text back again.
+// At 1.0 it is the preferred size exactly: the scaled width rounds up, and a fractional Monitor
+// width would otherwise move the compact-sizing threshold by a fraction of a point.
+static CGSize ISHWorkspacePreferredToolContentSizeForTextScale(NSString *toolIdentifier, CGFloat textScale) {
+    if (fabs(textScale - 1.0) < 0.001)
+        return ISHWorkspacePreferredToolContentSize(toolIdentifier);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
+        return ISHWorkspaceInfoContentSizeForTextScale(textScale);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
+        return ISHWorkspaceMonitorContentSizeForTextScale(textScale);
+    return ISHWorkspacePreferredToolContentSize(toolIdentifier);
+}
+
 static CGFloat ISHWorkspaceDensityValue(CGFloat compact, CGFloat roomy) {
     return compact + ((roomy - compact) * ISHWorkspaceCurrentDensity());
 }
@@ -6678,16 +6694,20 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         if (!ISHWorkspaceUsesPhoneLayout() && [toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
             continue;
 
-        CGSize targetSize = ISHWorkspacePreferredToolContentSize(toolIdentifier);
+        // At the window's text size: this runs after a restore has applied the saved scale, and on
+        // every theme and density change, and shrinking an Info or Monitor that grew for its text
+        // back to the 1.0 size shrank the text back with it.
+        UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
+        CGFloat textScale = [contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)]
+            ? ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale : 1.0;
+        CGSize targetSize = ISHWorkspacePreferredToolContentSizeForTextScale(toolIdentifier, textScale);
         // The Launcher's preferred size is its root level at text size 1.0.
         // This pass runs on every theme change, resume and appearance, and the
         // Launcher only autosizes when its list changes, so shrinking to that
         // size left a scaled or drilled-into list cut off until the next edit.
-        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier]) {
-            UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
-            if ([contentViewController isKindOfClass:WorkspaceLauncherToolViewController.class])
-                targetSize = [(WorkspaceLauncherToolViewController *) contentViewController launcherContentSizeForDisplayedLevel];
-        }
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier] &&
+                [contentViewController isKindOfClass:WorkspaceLauncherToolViewController.class])
+            targetSize = [(WorkspaceLauncherToolViewController *) contentViewController launcherContentSizeForDisplayedLevel];
         CGRect currentFrame = windowView.frame;
         BOOL shouldShrinkWidth = CGRectGetWidth(currentFrame) > targetSize.width + 24.0;
         BOOL shouldShrinkHeight = CGRectGetHeight(currentFrame) > targetSize.height + 24.0;
@@ -14621,23 +14641,26 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 @end
 
-// Info's and Monitor's window follows the text size only while it still has the size the applet
-// gave it -- its size at the previous scale. A window someone has resized keeps their frame, and so
-// does a restored one: the Workspace applies the saved frame before the saved scale, and that frame
-// already has the size it had at that scale. The scroll view shows whatever no longer fits.
+// Info's and Monitor's window follows the text size only while it still has a size the applet
+// gave it -- its size at the previous scale, or its 1.0 size. A window someone has resized keeps
+// their frame, and so does a restored one: the Workspace applies the saved frame before the saved
+// scale, and that frame already has the size it had at that scale. The scroll view shows whatever
+// no longer fits. The 1.0 size counts because it is the size the window opens at, and the one a
+// window from before its text grew was saved at; a window found there grows on the next step.
 // `autosizedSize` is the frame the last resize produced, because the Desktop clamps a size larger
-// than its room and the clamped frame then matches neither computed size.
-static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewController *viewController,
+// than its room and the clamped frame then matches none of the computed sizes.
+static BOOL ISHWorkspaceSizesMatch(CGSize a, CGSize b) {
+    return fabs(a.width - b.width) < 1.0 && fabs(a.height - b.height) < 1.0;
+}
+
+static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewController *viewController, CGSize defaultSize,
                                                  CGSize previousSize, CGSize size, CGSize *autosizedSize) {
     ISHWorkspaceContainedWindowView *windowView = ISHWorkspaceWindowContainingResponder(viewController);
     if (windowView == nil)
         return;
     CGSize current = windowView.frame.size;
-    BOOL atPreviousSize = fabs(current.width - previousSize.width) < 1.0 &&
-                          fabs(current.height - previousSize.height) < 1.0;
-    BOOL atAutosizedSize = fabs(current.width - autosizedSize->width) < 1.0 &&
-                           fabs(current.height - autosizedSize->height) < 1.0;
-    if (!atPreviousSize && !atAutosizedSize)
+    if (!ISHWorkspaceSizesMatch(current, previousSize) && !ISHWorkspaceSizesMatch(current, *autosizedSize) &&
+        !ISHWorkspaceSizesMatch(current, defaultSize))
         return;
     [(id) viewController.workspaceHostViewController resizeDesktopWindow:windowView toSize:size animated:YES];
     *autosizedSize = windowView.frame.size;
@@ -14836,7 +14859,8 @@ static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewControll
     _appliedTextScale = self.workspaceTextScale;
     if (fabs(_appliedTextScale - previousScale) < 0.001)
         return;
-    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspaceInfoContentSizeForTextScale(previousScale),
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolInfoIdentifier),
+                                         ISHWorkspaceInfoContentSizeForTextScale(previousScale),
                                          ISHWorkspaceInfoContentSizeForTextScale(_appliedTextScale),
                                          &_autosizedWindowSize);
 }
@@ -15196,7 +15220,8 @@ static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewControll
     _appliedTextScale = self.workspaceTextScale;
     if (fabs(_appliedTextScale - previousScale) < 0.001)
         return;
-    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspaceMonitorContentSizeForTextScale(previousScale),
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolMonitorIdentifier),
+                                         ISHWorkspaceMonitorContentSizeForTextScale(previousScale),
                                          ISHWorkspaceMonitorContentSizeForTextScale(_appliedTextScale),
                                          &_autosizedWindowSize);
 }
