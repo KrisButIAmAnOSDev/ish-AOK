@@ -1103,6 +1103,63 @@ rows actually added, so the two styles cannot drift apart again -- the same
 bug will recur the next time a button is added to one branch and not the
 other.
 
+## Suspend and resume across the three modes
+
+The goal: a suspend or checkpoint comes back exactly as it was, whether it was
+taken in shell, Workspace or Wayland mode, with every applet in it (the Wayland
+display included). Terminal and applet restoration are done. These three are
+open. All were reported 2026-09-15.
+
+### Saving takes a long time when a Wayland applet is open
+
+**Established.** Nothing yet. The user reported that a suspend with a Wayland
+applet open is slow on the SAVE side. It has not been measured and the cause is
+not known. Candidates, none checked:
+- the freezer waiting for the compositor's or RFB client's tasks to park, up to
+  the freeze timeout in kernel/checkpoint.c;
+- a much larger image, because a Wayland session keeps framebuffers in guest
+  memory;
+- the app side of the save (ISHWorkspaceCaptureLayoutForSuspend, and
+  DisplayViewController tearing down its RFB connection).
+
+**Next step.** Time the phases. Save the same session with and without the
+Wayland applet open, and compare the image size, the `session.*` breadcrumb
+timestamps in Diagnostics, and an `ISH_CHECKPOINT_DEBUG` trace of which task
+the freezer waits on.
+
+### Restore should come back in the mode it was saved in
+
+**Established.**
+- The launch mode comes only from the Settings "Initial Window" preference.
+  SceneDelegate.m reads it through `ISHShouldLaunchWaylandDisplayAtStartup()`
+  and `ISHShouldLaunchWorkspaceAtStartup()`.
+- A suspend records the Workspace arrangement next to its image
+  (`ISHWorkspaceCaptureLayoutForSuspend`). It does not record which mode was on
+  screen.
+- So a session saved in Wayland mode and resumed with the preference set to
+  Workspace comes back in Workspace, and the reverse.
+
+**Next step.** Record the on-screen mode (shell, Workspace, or standalone
+Wayland) beside the image, the same way the layout is filed. On a resume,
+choose the window from that record instead of the preference, and use the
+preference only for a fresh boot.
+
+### Wayland mode has no quick way to suspend or checkpoint
+
+**Established.** Shell mode has a Save Session button and a Cmd+S key command
+(TerminalViewController.m, TerminalView.m). Workspace has "Save Session" in its
+root menu (WorkspaceViewController.m). The standalone Wayland display
+(DisplayViewController) has neither. Its only suspend path is backgrounding the
+app with Suspend to Disk on.
+
+**Next step.** Give the standalone display the same two actions the others
+have, "Save Session Now" and "Suspend and Exit" (`ISHSuspendSessionSaveNow`,
+`ISHSuspendSessionSuspendAndExit`). Offer them as an on-screen control that
+does not cover the desktop, plus a key command. Cmd+S matches shell mode and
+looks free there: DisplayRFBView forwards only Cmd+= + - 0 to the guest, and
+deliberately not Cmd+letter. Confirm it does not also reach the Wayland
+session before claiming it.
+
 ## Deferred on purpose
 
 ### Suspend and Exit terminates the app, which the HIG discourages
