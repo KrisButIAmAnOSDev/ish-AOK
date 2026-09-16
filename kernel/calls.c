@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include "debug.h"
@@ -5230,19 +5231,39 @@ static void dump_arm64_fault_memdump(const struct cpu_state *cpu) {
     }
 }
 
+// snprintf that appends at *pos and never lets *pos run past the buffer, so a
+// truncated register dump stays a terminated string instead of an overflow.
+static void fault_event_append(char *buf, size_t size, size_t *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void fault_event_append(char *buf, size_t size, size_t *pos, const char *fmt, ...) {
+    if (*pos + 1 >= size)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + *pos, size - *pos, fmt, args);
+    va_end(args);
+    if (n < 0)
+        return;
+    *pos = *pos + (size_t) n < size ? *pos + (size_t) n : size - 1;
+}
+
 static void record_guest_fault_event(const char *kind, const struct cpu_state *cpu,
                                      guest_addr_t fault_addr, bool is_write) {
     char summary[512];
-    char detail[1024];
+    char detail[2048];
     char opcode[128];
     size_t opcode_pos = 0;
     guest_addr_t ip = current_fault_ip(cpu);
+    // current_fault_ip already dereferences current, so it is not NULL here.
+    // The label used to be "amd64" or else "i386", which named every arm64
+    // and riscv64 fault i386 and printed the i386 register file for it -- a
+    // file an arm64 task never uses, rewritten from host scratch registers by
+    // the shared jit_exit's save_regs, so its values were noise.
+    enum guest_abi abi = current->abi;
 
     snprintf(summary, sizeof(summary),
              "pid=%d comm=%s abi=%s ip=%#llx fault_addr=%#llx access=%s",
-             current != NULL ? current->pid : -1,
-             current != NULL ? current->comm : "?",
-             (current != NULL && current->abi == GUEST_ABI_AMD64) ? "amd64" : "i386",
+             current->pid, current->comm, guest_abi_name(abi),
              (unsigned long long) ip,
              (unsigned long long) fault_addr,
              is_write ? "write" : "read");
@@ -5264,7 +5285,43 @@ static void record_guest_fault_event(const char *kind, const struct cpu_state *c
     }
     opcode[opcode_pos < sizeof(opcode) ? opcode_pos : sizeof(opcode) - 1] = '\0';
 
-    if (current != NULL && current->abi == GUEST_ABI_AMD64) {
+    if (abi == GUEST_ABI_ARM64) {
+        // Fixed-width little-endian instructions: the previous one, the
+        // faulting one in brackets, and the next two, as objdump prints them.
+        // The byte window above brackets one byte and splits the faulting word.
+        opcode_pos = 0;
+        opcode[0] = '\0';
+        for (int i = -1; i < 3; i++) {
+            uint32_t insn = 0;
+            char word[9] = "????????";
+            if (!user_get(ip + (guest_addr_t) (4 * i), insn))
+                snprintf(word, sizeof(word), "%08x", insn);
+            fault_event_append(opcode, sizeof(opcode), &opcode_pos, "%s%s%s%s",
+                               i == 0 ? "[" : "", word, i == 0 ? "]" : "",
+                               i != 2 ? " " : "");
+        }
+        size_t pos = 0;
+        fault_event_append(detail, sizeof(detail), &pos, "opcode window: %s\n", opcode);
+        for (int i = 0; i < 31; i++)
+            fault_event_append(detail, sizeof(detail), &pos, "x%d=%#llx%s", i,
+                               (unsigned long long) cpu->arm64_regs[i],
+                               (i % 4 == 3 || i == 30) ? "\n" : " ");
+        fault_event_append(detail, sizeof(detail), &pos,
+                           "sp=%#llx pc=%#llx nzcv=%#x tpidr=%#llx",
+                           (unsigned long long) cpu->arm64_sp,
+                           (unsigned long long) cpu->arm64_pc,
+                           (unsigned) cpu->arm64_nzcv,
+                           (unsigned long long) cpu->arm64_tpidr);
+    } else if (abi == GUEST_ABI_RISCV64) {
+        size_t pos = 0;
+        fault_event_append(detail, sizeof(detail), &pos, "opcode window: %s\n", opcode);
+        for (int i = 0; i < 32; i++)
+            fault_event_append(detail, sizeof(detail), &pos, "x%d=%#llx%s", i,
+                               (unsigned long long) cpu->riscv64_regs[i],
+                               i % 4 == 3 ? "\n" : " ");
+        fault_event_append(detail, sizeof(detail), &pos, "pc=%#llx",
+                           (unsigned long long) cpu->riscv64_pc);
+    } else if (abi == GUEST_ABI_AMD64) {
         snprintf(detail, sizeof(detail),
                  "opcode window: %s\n"
                  "rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx\n"
