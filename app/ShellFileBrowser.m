@@ -399,9 +399,11 @@ NSString *ISHShellQuoteArgument(NSString *argument) {
                                        identifier:nil
                                           handler:^(UIAction *action) { [weakSelf reload]; }];
     UIMenu *menu = [UIMenu menuWithTitle:@"" children:@[newFolder, hidden, refresh]];
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"]
-                                          menu:menu];
+    UIBarButtonItem *overflow = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"]
+                                                                  menu:menu];
+    // The same name as the workspace File Manager's identical menu.
+    overflow.accessibilityLabel = @"More Actions";
+    self.navigationItem.rightBarButtonItem = overflow;
 }
 
 - (void)toggleShowsHiddenFiles {
