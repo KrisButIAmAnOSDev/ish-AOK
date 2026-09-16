@@ -853,9 +853,11 @@ backing file's current size at fault time, which means carrying the file
 identity into the page fault path rather than just the host memory.
 
 **`remap_file_pages` is ENOSYS.** Linux has emulated it over mmap since 3.16
-and a linear remap returns 0. Implementing the emulation means splitting a
-mapping into per-page mappings with independent offsets, which the reservation
-model (never split -- see `struct mem_lazy_map`) is built to avoid.
+and a linear remap returns 0. Linux's emulation is a `MAP_FIXED` shared mapping
+of the same backing over the subrange at the new offset. Lazy reservations are
+no obstacle: every page-table entry already carries its own `data` and
+`offset`, and a large shared anonymous mapping that is still reserved can be
+materialised first, as `mprotect` does. What is missing is the syscall itself.
 
 ### PROT_EXEC is never enforced -- no NX for guest pages
 

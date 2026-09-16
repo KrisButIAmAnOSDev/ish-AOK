@@ -866,8 +866,27 @@ static int proc_pid_sched_show(struct proc_entry *entry, struct proc_data *buf) 
     return 0;
 }
 
+// Lazy reservations have no page-table entries, so a walk of the page table
+// cannot see them -- but the guest has them mapped, and readers of maps and
+// smaps (the JVM sizes itself from maps; sanitizers and debuggers parse both)
+// must be told. Collects a copy sorted by address into `pending`
+// (MEM_LAZY_MAX long) for the walk to merge in: both files are in address
+// order and parsers rely on that. Caller holds the mem lock.
+static unsigned collect_pending_reservations(struct mem *mem, struct mem_lazy_map *pending) {
+    unsigned pending_n = 0;
+    for (unsigned i = 0; i < mem->lazy_count; i++)
+        if (mem->lazy[i].start < mem->lazy[i].end)
+            pending[pending_n++] = mem->lazy[i];
+    for (unsigned i = 1; i < pending_n; i++)
+        for (unsigned j = i; j > 0 && pending[j - 1].start > pending[j].start; j--) {
+            struct mem_lazy_map t = pending[j - 1];
+            pending[j - 1] = pending[j]; pending[j] = t;
+        }
+    return pending_n;
+}
+
 // Emit any lazy reservation starting before `limit`, keeping proc_maps_dump's
-// output in address order. See its caller for why reservations must appear.
+// output in address order.
 static void emit_pending_maps(struct proc_data *buf, struct mem_lazy_map *pending,
                               unsigned pending_n, unsigned *pending_i, page_t limit) {
     while (*pending_i < pending_n && pending[*pending_i].start < limit) {
@@ -890,21 +909,9 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
 
     mem_read_lock_quiesce_aware(mem);
 
-    // Lazy reservations have no page-table entries, so the walk below cannot
-    // see them -- but the guest has them mapped, and readers of this file (the
-    // JVM sizes itself from it; sanitizers and debuggers parse it) must be
-    // told. Merge a sorted copy in: /proc/maps is in address order and parsers
-    // rely on that.
+    // See collect_pending_reservations.
     struct mem_lazy_map pending[MEM_LAZY_MAX];
-    unsigned pending_n = 0;
-    for (unsigned i = 0; i < mem->lazy_count; i++)
-        if (mem->lazy[i].start < mem->lazy[i].end)
-            pending[pending_n++] = mem->lazy[i];
-    for (unsigned i = 1; i < pending_n; i++)
-        for (unsigned j = i; j > 0 && pending[j - 1].start > pending[j].start; j--) {
-            struct mem_lazy_map t = pending[j - 1];
-            pending[j - 1] = pending[j]; pending[j] = t;
-        }
+    unsigned pending_n = collect_pending_reservations(mem, pending);
     unsigned pending_i = 0;
 
     page_t page = 0;
@@ -1119,6 +1126,42 @@ static void proc_smaps_region(struct proc_data *buf, page_t start, page_t end,
     }
 }
 
+// A lazy reservation, as smaps shows it: mapped, never touched, so nothing of
+// it is resident, shared or swapped. Its size, page sizes and flags are set; every count is 0.
+// Without this smaps left out every reservation that maps lists: an untouched
+// 128M mmap was in maps and missing here, and once splits stopped materialising
+// the rest of a reservation, a JVM heap with one committed page was three
+// regions in maps and one here.
+static void proc_smaps_reservation(struct proc_data *buf, const struct mem_lazy_map *l,
+                                   bool print_header) {
+    if (!print_header)
+        return;
+    uint64_t size_kb = (uint64_t) (l->end - l->start) * (PAGE_SIZE / 1024);
+    bool shared = (l->flags & P_SHARED) != 0;
+    proc_printf(buf, "%08llx-%08llx %c%c%c%c %08lx 00:00 %-10d \n",
+            (unsigned long long) (l->start << PAGE_BITS), (unsigned long long) (l->end << PAGE_BITS),
+            l->flags & P_READ ? 'r' : '-',
+            l->flags & P_WRITE ? 'w' : '-',
+            l->flags & P_EXEC ? 'x' : '-',
+            shared ? 's' : 'p',
+            0ul, 0);
+    proc_printf(buf, "Size:           %8"PRIu64" kB\n", size_kb);
+    proc_printf(buf, "KernelPageSize: %8u kB\n", PAGE_SIZE / 1024);
+    proc_printf(buf, "MMUPageSize:    %8u kB\n", PAGE_SIZE / 1024);
+    static const char *const zero_rows[] = {
+        "Rss:            ", "Pss:            ", "Shared_Clean:   ", "Shared_Dirty:   ",
+        "Private_Clean:  ", "Private_Dirty:  ", "Referenced:     ", "Anonymous:      ",
+        "AnonHugePages:  ", "Swap:           ", "Locked:         ",
+    };
+    for (size_t i = 0; i < sizeof(zero_rows) / sizeof(zero_rows[0]); i++)
+        proc_printf(buf, "%s%8d kB\n", zero_rows[i], 0);
+    proc_printf(buf, "VmFlags:%s%s%s%s\n",
+            l->flags & P_READ ? " rd" : "",
+            l->flags & P_WRITE ? " wr" : "",
+            l->flags & P_EXEC ? " ex" : "",
+            shared ? " sh" : "");
+}
+
 static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollup) {
     struct mm *mm = proc_task_mm_retain(task);
     struct mem *mem = mm ? &mm->mem : NULL;
@@ -1135,6 +1178,11 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
     bool count_swapped = swap_enabled();
 
     mem_read_lock_quiesce_aware(mem);
+    // Reservations are regions too, merged in by address as proc_maps_dump
+    // does, so the two files list the same regions.
+    struct mem_lazy_map pending[MEM_LAZY_MAX];
+    unsigned pending_n = collect_pending_reservations(mem, pending);
+    unsigned pending_i = 0;
     page_t page = 0;
     while (page < mem->page_limit) {
         while (page < mem->page_limit && mem_pt(mem, page) == NULL) {
@@ -1185,6 +1233,12 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         }
         page_t end = page;
 
+        for (; pending_i < pending_n && pending[pending_i].start < start; pending_i++) {
+            if (!any_region)
+                rollup_start = pending[pending_i].start;
+            any_region = true;
+            proc_smaps_reservation(buf, &pending[pending_i], !rollup);
+        }
         if (!any_region)
             rollup_start = start;
         rollup_end = end;
@@ -1202,6 +1256,13 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         }
 
         proc_smaps_region(buf, start, end, start_pt, data, path, !rollup, swapped_pages, &totals);
+    }
+    for (; pending_i < pending_n; pending_i++) {
+        if (!any_region)
+            rollup_start = pending[pending_i].start;
+        any_region = true;
+        rollup_end = pending[pending_i].end;
+        proc_smaps_reservation(buf, &pending[pending_i], !rollup);
     }
     mem_read_unlock_quiesce_aware(mem);
 

@@ -156,7 +156,10 @@ first -- as root every `mlock` simply succeeds.
 `mlockall(MCL_FUTURE)` is accepted and recorded but not yet acted on: it would
 have to reach the page-table layer, which knows nothing about a process's
 flags. `MCL_CURRENT` locks everything already mapped, which is the half that
-works today.
+works today. That includes large mappings nothing has touched yet: as on Linux,
+their readable or writable parts are populated and locked at once, and
+`PROT_NONE` ones, or every one under `MCL_ONFAULT`, have each page locked when
+it is first touched. `mlock` populates the range it locks, as on Linux.
 
 ## `ISH_GUEST_SWAP_FAIL_READS`
 

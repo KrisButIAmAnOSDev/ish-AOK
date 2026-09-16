@@ -119,18 +119,48 @@ static void __attribute__((constructor)) init_futex_hash(void) {
         list_init(&futex_hash[i]);
 }
 
+// What a futex in shared memory is keyed by, with the word's offset in the
+// page's struct data: a SysV segment's key, a file mapping's struct fd, or for
+// anonymous shared memory the struct data itself. fork and an mremap alias
+// share the struct data, and nothing replaces it while the page is mapped, so a
+// wait and a wake through two mappings of the page, or from two processes, name
+// the same futex.
+//
+// Anonymous shared memory was keyed by the address space instead, with the
+// offset in the struct data. A process waiting in a MAP_SHARED|MAP_ANONYMOUS
+// page never saw its forked child's wake. And offsets repeat across struct
+// datas: a large mapping materialises in 2 MiB chunks, one struct data each,
+// so two words 2 MiB apart were one futex, and a wake for one could go to a
+// waiter on the other and leave its own waiter asleep.
 static uintptr_t futex_shared_identity(guest_addr_t addr, guest_addr_t *shared_addr) {
     uintptr_t identity = 0;
-    mem_read_lock_quiesce_aware(current->mem);
-    struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
+    struct mem *mem = current->mem;
+    mem_read_lock_quiesce_aware(mem);
+    struct pt_entry *entry = mem_pt(mem, PAGE(addr));
+    // A reserved page (emu/memory.h, struct mem_lazy_map) has no struct data
+    // yet. The wait's own load is about to materialise it, and a wake after
+    // that would find one, so materialise it here the same way (mem_ptr's
+    // fault, under this read lock as futex_load does) or a wait before the
+    // first touch and a wake after it name different futexes. Since splits
+    // leave the rest of a reservation reserved, that includes the untouched
+    // part of a shared mapping someone has unmapped a hole in.
+    if (entry == NULL) {
+        struct mem_lazy_map *lazy = mem_lazy_find(mem, PAGE(addr));
+        if (lazy != NULL && (lazy->flags & P_SHARED)) {
+            (void) mem_ptr(mem, addr, MEM_READ);
+            entry = mem_pt(mem, PAGE(addr));
+        }
+    }
     if (entry != NULL && (entry->flags & P_SHARED)) {
         identity = entry->data->shared_key;
         if (identity == 0 && entry->data->fd != NULL)
             identity = (uintptr_t) entry->data->fd;
+        if (identity == 0)
+            identity = (uintptr_t) entry->data;
         if (shared_addr != NULL)
             *shared_addr = entry->offset + PGOFFSET(addr);
     }
-    mem_read_unlock_quiesce_aware(current->mem);
+    mem_read_unlock_quiesce_aware(mem);
     return identity;
 }
 

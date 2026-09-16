@@ -204,22 +204,85 @@ address range recorded in a fixed array on `struct mem`.
 
 ```c
 struct mem_lazy_map { page_t start, end; unsigned flags; };
-#define MEM_LAZY_MAX 32
+#define MEM_LAZY_MAX 64
+#define MEM_LAZY_SPLIT_LIMIT 32
 ```
 
-The design's whole character comes from one invariant, stated in capitals in
-the header: **a reservation is never split.** Materializing a fault takes the
-entire prefix up to the end of the faulting chunk and trims the front, so a
-reservation only ever shrinks from the left or vanishes. Anything that would
-punch a hole in one — an `munmap` in the middle, an `mprotect` of a subrange —
-materializes it in full first, at a call site where mapping is safe.
+Two rules hold it together, and the header states both.
 
-That invariant is doing a lot of work. Without it you need slot allocation when
-a split runs the array out of entries, atomicity for a partial update, and a
-lock-ordering story for the recursion a split provokes. With it, the failure
-modes disappear: the worst case is a fault at the far end of a reservation
-materializing everything before it, which is precisely the old eager behavior
-and no worse.
+**A page is either mapped or reserved, never both.** A reservation is consulted
+only where a page has no page-table entry, so one recorded over existing entries
+is silently ignored. That is how JVMs running `-XX:+UseSerialGC` or
+`-XX:+UseParallelGC` died (issue #572). The JVM reserves its whole heap `PROT_NONE`
+and commits the old generation part way in with `MAP_FIXED`. The commit
+materialized the `PROT_NONE` reservation and then recorded a read-write
+reservation on top of those entries, so `mmap` succeeded and every page of the
+commit faulted `SEGV_ACCERR`. Three paths keep the rule: `pt_map` drops the
+reservation coverage of whatever it maps; `mem_lazy_reserve` drops coverage and
+also unmaps any real entries in its range, which is the half that was missing;
+and `mem_init` clears the table that a fork's whole-struct copy inherited.
+
+**A fault never splits a reservation.** Materializing a fault takes the entire
+prefix up to the end of the faulting chunk and trims the front, so a fault only
+ever shrinks a reservation from the left or makes it vanish. It never needs a
+free slot and never leaves half an update behind. The worst case is a fault at
+the far end of a reservation materializing everything before it, which is
+precisely the old eager behavior and no worse.
+
+Dropping coverage is another matter. The design first shipped with no splits at
+all: anything that would punch a hole in a reservation — an `munmap` in the
+middle, a `MAP_FIXED` commit into it — materialized it in full first, at a call
+site where mapping is safe. For a JVM that means page tables for the whole
+`-Xmx` heap in order to commit its first generation, which is the very cost the
+design exists to avoid. So a drop from the middle now splits the reservation, by
+range arithmetic alone. It maps nothing, so it cannot recurse into a lock, and
+it cannot fail half way.
+
+Splits take slots, though, and slots are what keep large mappings lazy. With
+nothing limiting them, a heap fragmented by non-adjacent commits filled the
+table, and the next large `mmap` found no slot and went eager: 31 commits of
+4 MB into a 4 GB heap, followed by an untouched 32 GB `mmap`, held 544 MB of
+host memory where never splitting held 77 MB. The answer is a limit, not a
+cleverer allocator. The table has 64 slots, and a split may take one only while
+fewer than 32 are in use. Past that the split is refused, and the caller
+materializes that one reservation in full, as every split used to. Once all 64
+slots are in use, at least 32 of the live reservations were made after the last
+split, so the old 32-slot table would have been full as well. Splitting never
+turns a mapping eager that never splitting would have kept lazy, and the same
+probe now holds 24 MB.
+
+Splitting also changed who has to know about reservations. The remainders a
+split leaves stay reserved, where materializing used to give them page-table
+entries, so code that had only ever read entries now met reservations in the
+middle of ordinary address spaces. Three places did, and each broke a JVM-shaped
+address space that had worked before: `mremap` demanded an entry for every
+source page and returned `EFAULT`; a checkpoint walked entries only, so a
+restored process lost its reserved heap and the next `mmap` could land inside
+it; and `/proc/pid/smaps` listed one region where `maps` listed three. `mremap`
+is the instructive one. The obvious fix, materializing the source first as
+`mprotect` does, spends exactly what the design exists to save, on the path
+`realloc` takes to grow a large block: growing a 256 MB block touched in one
+chunk to 512 MB built page tables for all 512 MB. So `pt_move` carries reserved
+pages to the destination as reservations, a grown tail joins the reserved end
+of its mapping, and a move that would add slots is held to the same limit as a
+split. A checkpoint writes a reservation as a range with no bytes, and the
+restore reserves it again.
+
+Two more readers turned up after that. `mlock` wanted an entry for every page,
+so locking a remainder, or the tail `mremap` grew, returned `ENOMEM` where it
+had worked, and `mlockall` locked only the entries it found. Linux populates
+what `mlock` and `mlockall` lock where it can, so AOK materializes those
+reservations too, and for `mlock` only the range, splitting a reservation around
+it. What Linux leaves unpopulated, a `PROT_NONE` mapping or anything under
+`MCL_ONFAULT`, stays reserved with a mark, so the entries it materializes later
+are locked when they are made. The futex table keyed a shared futex through the
+page-table entry, which a reserved page does not have yet: a thread waiting on
+an untouched page of a shared remainder was keyed one way, and the wake that
+came after the page was written was keyed another, so the waiter slept on. A
+shared anonymous futex is now keyed by the page's `struct data`, which is
+materialized first if it has to be. Keyed by address space, a wake had never
+reached a waiter in another process that shared the memory through `fork`
+either, and this fixes that too.
 
 Two constants set the boundaries, both from measurement rather than taste.
 `MEM_LAZY_MIN_PAGES` is 64 MB: below that the eager path is kept, because
@@ -235,8 +298,10 @@ as a plain range, so reserving it is O(1) and `fork` has nothing extra to walk.
 `pt_is_hole` and `pt_find_hole` treat it as occupied; `sys_brk_guest` claims
 prefixes of it by mapping real pages and advancing the start.
 
-The rule that falls out, and that the header states as an invariant: **a page is
-either mapped or reserved, never both, and a reservation is never split.**
+The rules that fall out, and that the header states: **a page is either mapped or
+reserved, never both. A fault never splits a reservation; a drop may, but only
+while the slot limit allows, and a refused split materializes the reservation
+instead. Anything that reads page-table entries has to read reservations too.**
 
 ## 5.6 Sharing, copying, and three ways a shared mapping stopped being shared
 
@@ -378,7 +443,7 @@ implementation of a floating-point format nobody makes hardware for any more.
 Nothing in that list is exotic. What is unusual is how much of the design is
 about *not* materializing things: not computing flags, not building page tables
 for untouched reservations, not padding a struct that profiling says gains
-nothing, not splitting a range because splitting is where the bugs live. The
+nothing, not splitting a range where a split could cost more than it saves. The
 guest machine is defined as much by what it declines to allocate as by what it
 holds.
 

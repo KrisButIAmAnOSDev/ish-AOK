@@ -14,6 +14,7 @@ struct jit;
 #endif
 
 struct pt_directory_chunk;
+struct data;
 
 // A reserved-but-unmaterialised anonymous range: address space the guest has
 // mapped, for which no page-table entries exist yet.
@@ -24,22 +25,75 @@ struct pt_directory_chunk;
 // GB for a 64 GiB reservation -- with no ceiling below the 256 TiB page limit,
 // so one mmap can get the app OOM-killed. Linux makes the same call free.
 //
-// INVARIANT, and the reason this design is shaped the way it is: a reservation
-// is NEVER split. Materialising a fault takes the whole prefix up to the end of
-// the faulting chunk and trims the front, so a reservation only ever shrinks
-// from the left or disappears. Anything that would punch a hole in one
-// materialises it in full first, at a call site where mapping is safe. That
-// removes slot exhaustion, partial-update atomicity, and the lock recursion
-// that a splitting version has to get right.
+// INVARIANT: a range is never both mapped and reserved. pt_map drops the
+// reservation coverage of what it maps; mem_lazy_reserve drops it AND unmaps
+// any real entries, since a reservation over them is never consulted; mem_init
+// clears the table a fork's whole-struct copy inherited.
 //
-// The cost of never splitting: a fault at the far end of a reservation
-// materialises everything before it, i.e. exactly today's eager behaviour and
-// no worse. The win is every case that reserves and touches little or nothing.
+// A fault never splits a reservation: it materialises the whole prefix up to
+// the end of the faulting chunk and trims the front. The cost: a fault at the
+// far end of a reservation materialises everything before it, i.e. exactly the
+// eager behaviour and no worse. The win is every case that reserves and
+// touches little or nothing.
+//
+// Dropping coverage from the MIDDLE of one (a MAP_FIXED commit into a PROT_NONE
+// heap, a munmap of a hole) does split it, by range arithmetic alone: it maps
+// nothing, so it cannot recurse into a lock, and it cannot fail half way. A
+// split is refused when MEM_LAZY_SPLIT_LIMIT slots are already in use, and the
+// caller then materialises that one reservation in full instead, at a call site
+// where mapping is safe.
+//
+// So a split leaves its remainders RESERVED, where materialising used to give
+// them entries, and everything that reads entries has to read reservations too
+// (the list is at the top of the lazy section in emu/memory.c). pt_move, and so
+// mremap, carries reserved pages to the destination as reservations; one that
+// would add slots is held to the same limit as a split and otherwise
+// materialises just the range it moves. A checkpoint saves reservations as
+// reservations, and /proc/pid/maps and smaps list them. mlock and mlockall
+// populate what they lock, as Linux does, so the pages have entries to carry
+// the lock; what Linux leaves unpopulated (PROT_NONE, MCL_ONFAULT) is marked
+// MEM_LAZY_LOCKED instead, so the entries it materialises later are locked as
+// they are made. A shared futex key names the page's struct data, so the futex
+// code materialises a shared reserved page before it keys it.
 struct mem_lazy_map {
     page_t start, end;   // empty iff start >= end
-    unsigned flags;      // pt flags the pages get when materialised
+    unsigned flags;      // pt flags the pages get when materialised, and
+                         // MEM_LAZY_LOCKED
 };
-#define MEM_LAZY_MAX 32
+// Not a pt flag. A reservation mlock or mlockall locked without populating it:
+// what it materialises gets locked entries, as Linux locks a page faulted into
+// a VM_LOCKED mapping. Materialising strips it from the entries' flags, and a
+// split or move keeps it on each piece. munlock and munlockall clear it.
+#define MEM_LAZY_LOCKED (1u << 31)
+// A new reservation may take any free slot; a split, a move that leaves more
+// reservations than it found, or an mlock or munlock that marks or unmarks part
+// of a reservation, only while that keeps the count within
+// MEM_LAZY_SPLIT_LIMIT.
+//
+// Splits must not starve new reservations. Before splits existed the table had
+// 32 slots and a split materialised its reservation, which freed one. With
+// splits free to take any slot, a heap fragmented by non-adjacent commits
+// filled the table and the next large mmap went eager. Measured: 31 commits of
+// 4 MiB into a 4 GiB PROT_NONE heap, then an untouched 32 GiB mmap, held 544 MB
+// of host memory, against 77 MB without splits and 24 MB with this limit.
+//
+// With the limit, once all MEM_LAZY_MAX slots are in use, at least 32 of the
+// live reservations were made after the last split (or other change that adds
+// slots: a move, an mlock or munlock), so the old 32-slot table would have been
+// full too: a split never turns a mapping eager that would otherwise have
+// stayed lazy. A refused split materialises only the reservation that holds the
+// range, never more than the old code did.
+//
+// Rejected alternatives. Keeping a few slots free for new reservations only
+// moves the cliff: the mapping after those few goes eager where the old table
+// kept it lazy. Merging adjacent reservations with equal flags does not help:
+// the commits that fragment a heap are small, hence eager, so no reservation
+// lies beside the pieces to merge with. Materialising the smallest reservation
+// to make room would have to run on the growth fast path, beside sibling
+// threads under the read lock, where clearing a reservation leaves its pages
+// briefly neither reserved nor mapped under a sibling that is reading them.
+#define MEM_LAZY_MAX 64
+#define MEM_LAZY_SPLIT_LIMIT 32
 // Below this the eager path is kept: ordinary programs touch 36-72% of what
 // they map (measured: bash 36%, python3 52%, gcc 72%) over mappings of a few
 // MB, where per-page faulting would cost more than the batch loop, and their
@@ -107,7 +161,7 @@ struct mem {
 
     // Lazy anonymous reservations -- same idea as brk_reserve above (a plain
     // range, no page-table entries) but there can be several. See
-    // struct mem_lazy_map's comment for the no-split invariant.
+    // struct mem_lazy_map's comment for the invariant and when one splits.
     struct mem_lazy_map lazy[MEM_LAZY_MAX];
     unsigned lazy_count;
     _Atomic int quiesce_requested;
@@ -229,15 +283,54 @@ struct pt_entry *mem_pt(struct mem *mem, page_t page);
 // Lazy anonymous reservations; see struct mem_lazy_map above.
 struct mem_lazy_map *mem_lazy_find(struct mem *mem, page_t page);
 bool mem_lazy_overlaps(struct mem *mem, page_t start, page_t end);
+// Record [start, start + pages) as a reservation, replacing whatever was there;
+// false (and the caller maps eagerly) below MEM_LAZY_MIN_PAGES, when the table
+// is full, or when a reservation strictly containing the range cannot split.
 bool mem_lazy_reserve(struct mem *mem, page_t start, pages_t pages, unsigned flags);
+// The same without the size threshold, for a range that was already a
+// reservation somewhere: a piece pt_move carries, one a checkpoint restores, a
+// grown tail that joins the reserved tail of its mapping.
+bool mem_lazy_reserve_any_size(struct mem *mem, page_t start, pages_t pages, unsigned flags);
+// Merge the reservation ending at `page` with the one starting there, if their
+// flags match. Pure range arithmetic; frees a slot.
+void mem_lazy_join(struct mem *mem, page_t page);
+// The flags shared by every page of [start, start + pages), ignoring P_COW,
+// reading a reserved page as the entry it would materialise to. False when a
+// page is neither mapped nor reserved or the flags differ. *data is the first
+// page's struct data, NULL when that page is reserved.
+bool mem_range_flags(struct mem *mem, page_t start, pages_t pages,
+                     unsigned *flags, struct data **data);
 // Materialise every reservation overlapping [start, end), IN FULL. Maps, so it
 // must not be called with the JIT invalidate lock held.
 void mem_lazy_materialize_range(struct mem *mem, page_t start, page_t end);
-// Drop reservation coverage of [start, end) without mapping. Only valid when
-// the range does not punch a hole in a reservation; callers use
-// mem_lazy_would_split() first.
-void mem_lazy_drop(struct mem *mem, page_t start, page_t end);
-bool mem_lazy_would_split(struct mem *mem, page_t start, page_t end);
+// Give [start, end) entries and leave the rest of each reservation it overlaps
+// reserved. A reservation strictly containing the range is split around it
+// while MEM_LAZY_SPLIT_LIMIT allows, and materialised whole otherwise. Maps:
+// the same locking rule as mem_lazy_materialize_range.
+void mem_lazy_populate(struct mem *mem, page_t start, page_t end);
+// mlock and munlock of [start, end), for reserved pages; pt_set_locked does the
+// entries. A lock populates the part of the range in an accessible reservation,
+// as Linux populates what it locks, and marks the part in a PROT_NONE one,
+// which Linux cannot populate. An unlock clears the mark and populates nothing.
+// Marking part of a reservation splits it at the range's edges; when
+// MEM_LAZY_SPLIT_LIMIT refuses that, the part in range is populated instead, for
+// pt_set_locked to lock or unlock. Changes nothing and returns false when a page
+// of the range is neither mapped nor reserved, since that call fails ENOMEM and
+// must not populate first. Needs the write lock, and may map.
+// mem_lazy_lock_range_needed says, under the read lock, whether a call would do
+// anything, so the caller takes the barrier only then.
+bool mem_lazy_lock_range(struct mem *mem, page_t start, page_t end, bool locked);
+bool mem_lazy_lock_range_needed(struct mem *mem, page_t start, page_t end, bool locked);
+// mlockall(MCL_CURRENT) and munlockall, for reservations; pt_set_locked_all
+// does the entries. A lock marks every reservation MEM_LAZY_LOCKED and, with
+// `populate` (no MCL_ONFAULT), materialises every one that is not PROT_NONE,
+// as Linux populates the mappings it can. An unlock clears the marks. Needs
+// the write lock, and maps when populating.
+void mem_lazy_lock_all(struct mem *mem, bool locked, bool populate);
+// Drop reservation coverage of [start, end) without mapping, splitting a
+// reservation that strictly contains it. False, with nothing changed, when that
+// split is refused (MEM_LAZY_SPLIT_LIMIT).
+bool mem_lazy_drop(struct mem *mem, page_t start, page_t end);
 // Increment *page, skipping over unallocated page directories. Intended to be
 // used as the incremenent in a for loop to traverse mappings.
 void mem_next_page(struct mem *mem, page_t *page);
@@ -566,12 +659,14 @@ page_t pt_find_hole(struct mem *mem, pages_t size);
 int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t offset, unsigned flags);
 // Map empty space into fake memory
 int pt_map_nothing(struct mem *mem, page_t page, pages_t pages, unsigned flags);
-// Move an existing mapped range into a hole.
+// Move an existing mapped range into a hole. Reserved pages in it stay
+// reserved at the destination (see struct mem_lazy_map).
 int pt_move(struct mem *mem, page_t old_start, page_t new_start, pages_t pages);
 // Like pt_move, but leaves the source mapped: both addresses end up aliasing
 // the same pages. Only valid for shared mappings -- see the definition.
 int pt_dup(struct mem *mem, page_t old_start, page_t new_start, pages_t pages);
-// Unmap fake memory, return -1 if any part of the range isn't mapped and 0 otherwise
+// Unmap fake memory, return -1 if any part of the range isn't mapped (or
+// reserved) and 0 otherwise
 int pt_unmap(struct mem *mem, page_t start, pages_t pages);
 // like pt_unmap but doesn't care if part of the range isn't mapped
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages);
@@ -584,6 +679,8 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 // them. Returns the number of pages whose locked state actually CHANGED, or
 // _ENOMEM if any page of the range is unmapped -- in which case nothing is
 // changed at all, because mlock is all-or-nothing about the range existing.
+// A reserved page is mapped, and has no entry to change: the caller runs
+// mem_lazy_lock_range first.
 //
 // The caller charges RLIMIT_MEMLOCK BEFORE calling, by the whole request rather
 // than by this return value: a lock that had to be undone was never granted, so
@@ -595,7 +692,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 // a guest that never enables swap exactly what the old range check did.
 long pt_set_locked(struct mem *mem, page_t start, pages_t pages, bool locked);
 // Lock or unlock every mapped page, for mlockall(2)/munlockall(2). Returns the
-// number of pages now locked.
+// number of pages now locked. Entries only; mem_lazy_lock_all does reservations.
 long pt_set_locked_all(struct mem *mem, bool locked);
 // Pages currently pinned, for RLIMIT_MEMLOCK accounting and /proc.
 size_t mem_locked_page_count(struct mem *mem);

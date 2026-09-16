@@ -22,7 +22,10 @@ mutexes, condition variables, semaphores, Go's scheduler, Rust's `std::sync`,
 Java's monitors.
 
 AOK implements the operation set on a hash table of wait queues keyed by guest
-address. The interesting parts are all in the corners.
+address. A futex in anonymous shared memory is keyed instead by the page's
+`struct data` and the word's offset in it, which every mapping of the page
+shares, so a wait and a wake meet through an `mremap` alias or from two
+processes after `fork`. The interesting parts are all in the corners.
 
 > **The bug that taught us this**
 >

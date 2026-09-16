@@ -816,6 +816,49 @@ static int mremap_map_file_extra(struct mem *mem, page_t start, pages_t pages,
     return 0;
 }
 
+// Map the freshly-grown tail of an ANONYMOUS mapping at [start, start + pages),
+// a hole, the way mmap would have mapped a mapping of the new size.
+//
+// When the mapping's last page (start - 1, or the page the caller is about to
+// move there) is reserved, the tail is reserved too and the caller joins the
+// two, whatever the tail's size: one mapping, one reservation, as an mmap of
+// the new size would be. Otherwise a tail of MEM_LAZY_MIN_PAGES or more is a
+// reservation of its own, and a smaller one gets entries. Growing a large
+// untouched block by realloc used to build page tables for the whole tail.
+//
+// Only for the flags mmap itself reserves with; anything else (P_GROWSDOWN,
+// P_WIPEONFORK) keeps the eager map it always had.
+static int mremap_map_anon_extra(struct mem *mem, page_t start, pages_t pages,
+        unsigned pt_flags, bool tail_reserved) {
+    unsigned flags = pt_flags & ~P_COW;
+    if ((flags & ~(P_RWX | P_SHARED | P_ANONYMOUS)) == 0) {
+        unsigned lazy_flags = flags & ~P_ANONYMOUS;
+        if (tail_reserved
+                ? mem_lazy_reserve_any_size(mem, start, pages, lazy_flags)
+                : mem_lazy_reserve(mem, start, pages, lazy_flags))
+            return 0;
+    }
+    return pt_map_nothing(mem, start, pages, flags);
+}
+
+// True iff `page` is reserved, i.e. has no entry and lies in a reservation.
+static bool mremap_page_reserved(struct mem *mem, page_t page) {
+    return mem_pt(mem, page) == NULL && mem_lazy_find(mem, page) != NULL;
+}
+
+// Once the mapping's pages are in place below it, join a reserved tail to the
+// mapping's reserved end. A tail reserved only for that join, below the size
+// mmap would reserve, whose mapping ended up with entries there after all --
+// pt_move materialises a range it cannot move as reservations -- gets the
+// entries mmap would have given it, rather than keeping a slot.
+static void mremap_join_anon_extra(struct mem *mem, page_t start, pages_t pages) {
+    mem_lazy_join(mem, start);
+    struct mem_lazy_map *lazy = mem_lazy_find(mem, start);
+    if (pages < MEM_LAZY_MIN_PAGES && lazy != NULL &&
+            lazy->start == start && lazy->end == start + pages)
+        mem_lazy_materialize_range(mem, start, start + pages);
+}
+
 guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_len, dword_t flags,
         guest_addr_t new_addr) {
     STRACE("mremap(%#llx, %#llx, %#llx, %d, %#llx)", (unsigned long long) addr,
@@ -861,11 +904,12 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     // the caller lost coherence with the original and was told it had not.
     if (old_pages == 0) {
         struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
-        if (entry == NULL) {
+        struct mem_lazy_map *lazy = entry == NULL ? mem_lazy_find(current->mem, PAGE(addr)) : NULL;
+        if (entry == NULL && lazy == NULL) {
             res = _EFAULT;
             goto out;
         }
-        if (!(entry->flags & P_SHARED)) {
+        if (!((entry != NULL ? entry->flags : lazy->flags) & P_SHARED)) {
             res = _EINVAL;
             goto out;
         }
@@ -883,6 +927,13 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
                 goto out;
             }
         }
+        // An alias shares the pages themselves -- pt_dup copies entries -- so
+        // whatever it covers of a large shared mapping that is still reserved,
+        // untouched or only partly faulted in, has to become entries first.
+        // Only what it covers, and only once the destination is settled, so a
+        // 16 MiB alias of an untouched 1 GiB mapping does not build page tables
+        // for the gigabyte, and one refused for its destination builds none.
+        mem_lazy_populate(current->mem, PAGE(addr), PAGE(addr) + new_pages);
         int dup_err = pt_dup(current->mem, PAGE(addr), dest, new_pages);
         res = dup_err < 0 ? (guest_addr_t) dup_err : (guest_addr_t) (dest << PAGE_BITS);
         goto out;
@@ -902,19 +953,14 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             goto out;
         }
 
-        struct pt_entry *entry = mem_pt(current->mem, src_page);
-        if (entry == NULL) {
+        // Every page mapped or reserved, all with one set of flags: a
+        // reservation reads as the entry it would materialise to, since a
+        // split or a partial fault leaves one mapping in both states.
+        unsigned pt_flags;
+        struct data *backing_data;
+        if (!mem_range_flags(current->mem, src_page, old_pages, &pt_flags, &backing_data)) {
             res = _EFAULT;
             goto out;
-        }
-        dword_t pt_flags = entry->flags;
-        struct data *backing_data = entry->data;
-        for (page_t page = src_page; page < src_page + old_pages; page++) {
-            entry = mem_pt(current->mem, page);
-            if (entry == NULL || (entry->flags & ~P_COW) != (pt_flags & ~P_COW)) {
-                res = _EFAULT;
-                goto out;
-            }
         }
 
         // Clear whatever's currently mapped at the destination -- MREMAP_FIXED
@@ -925,6 +971,9 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             res = _EFAULT;
             goto out;
         }
+        // Asked after that unmap, which can materialise a reservation holding
+        // both ranges when it may not split it.
+        bool tail_reserved = mremap_page_reserved(current->mem, src_page + old_pages - 1);
 
         if (new_pages > old_pages) {
             bool is_file = !(pt_flags & P_ANONYMOUS);
@@ -939,7 +988,7 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             pages_t extra_pages = new_pages - old_pages;
             err = is_file
                     ? mremap_map_file_extra(current->mem, dest_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags)
-                    : pt_map_nothing(current->mem, dest_page + old_pages, extra_pages, pt_flags & ~P_COW);
+                    : mremap_map_anon_extra(current->mem, dest_page + old_pages, extra_pages, pt_flags, tail_reserved);
             if (err < 0) {
                 res = err;
                 goto out;
@@ -955,6 +1004,8 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             res = err;
             goto out;
         }
+        if (new_pages > old_pages && (pt_flags & P_ANONYMOUS))
+            mremap_join_anon_extra(current->mem, dest_page + old_pages, new_pages - old_pages);
         if (new_pages < old_pages) {
             err = pt_unmap(current->mem, src_page + move_pages, old_pages - move_pages);
             if (err < 0) {
@@ -979,24 +1030,19 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
         goto out;
     }
 
-    struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
-    if (entry == NULL) {
-        res = _EFAULT;
-        goto out;
-    }
-    dword_t pt_flags = entry->flags;
-    struct data *backing_data = entry->data; // capture before the loop reassigns `entry`
     // P_COW is internal per-page copy-on-write state: it legitimately differs across a
     // single mapping after fork() + partial writes -- exactly how apt's anonymous
     // DynamicMMap looks when it tries to grow. Require only the mapping's type and
-    // permission bits to match, not COW state.
-    for (page_t page = PAGE(addr); page < PAGE(addr) + old_pages; page++) {
-        entry = mem_pt(current->mem, page);
-        if (entry == NULL || (entry->flags & ~P_COW) != (pt_flags & ~P_COW)) {
-            res = _EFAULT;
-            goto out;
-        }
+    // permission bits to match, not COW state. mem_range_flags ignores P_COW, and
+    // reads a reserved page as the entry it would materialise to: a lazy mapping
+    // that is partly touched, or a remainder a split left, is still one mapping.
+    unsigned pt_flags;
+    struct data *backing_data;
+    if (!mem_range_flags(current->mem, PAGE(addr), old_pages, &pt_flags, &backing_data)) {
+        res = _EFAULT;
+        goto out;
     }
+    bool tail_reserved = mremap_page_reserved(current->mem, PAGE(addr) + old_pages - 1);
     // File-backed grow: map the extra tail pages from the same fd. Only fd-backed
     // mappings whose fd we retained (data->fd) are growable this way.
     bool is_file = !(pt_flags & P_ANONYMOUS);
@@ -1015,7 +1061,9 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     if (extra_is_hole) {
         int err = is_file
                 ? mremap_map_file_extra(current->mem, extra_start, extra_pages, backing_fd, extra_file_offset, pt_flags)
-                : pt_map_nothing(current->mem, extra_start, extra_pages, pt_flags & ~P_COW);
+                : mremap_map_anon_extra(current->mem, extra_start, extra_pages, pt_flags, tail_reserved);
+        if (err == 0 && !is_file)
+            mremap_join_anon_extra(current->mem, extra_start, extra_pages);
         res = err < 0 ? err : addr;
         goto out;
     }
@@ -1034,11 +1082,13 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     }
     int err = is_file
             ? mremap_map_file_extra(current->mem, new_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags)
-            : pt_map_nothing(current->mem, new_page + old_pages, extra_pages, pt_flags & ~P_COW);
+            : mremap_map_anon_extra(current->mem, new_page + old_pages, extra_pages, pt_flags, tail_reserved);
     if (err == 0) {
         err = pt_move(current->mem, PAGE(addr), new_page, old_pages);
         if (err < 0)
             pt_unmap_always(current->mem, new_page + old_pages, extra_pages);
+        else if (!is_file)
+            mremap_join_anon_extra(current->mem, new_page + old_pages, extra_pages);
     }
     if (err < 0) {
         if (err == _ENOMEM)
@@ -1462,8 +1512,44 @@ static int_t mlock_apply(guest_addr_t addr, qword_t len, bool locked) {
         }
     }
 
-    long changed = pt_set_locked(current->mem, start, pages, locked);
+    // A reserved page (emu/memory.h, struct mem_lazy_map) is mapped, with no
+    // entry to carry the lock. mlock populates it, as Linux populates what it
+    // locks, or marks it when PROT_NONE; munlock clears the mark. Without this
+    // both were ENOMEM on reserved memory, which since splits includes the
+    // remainders of a split reservation and a grown mremap tail, pages that
+    // used to get entries. It changes the reservation table, so it takes the
+    // barrier, and only when the read-locked question says a reservation needs
+    // it: an mlock of anything else costs what it always did.
+    struct mem *mem = current->mem;
+    page_t end = start + pages;
+    if (end > start && end <= mem->page_limit) {
+        mem_read_lock_quiesce_aware(mem);
+        bool needed = mem_lazy_lock_range_needed(mem, start, end, locked);
+        mem_read_unlock_quiesce_aware(mem);
+        if (needed) {
+            mem_write_lock_with_pokes(mem);
+            bool mapped = mem_lazy_lock_range(mem, start, end, locked);
+            mem_write_unlock_with_pokes(mem);
+            if (!mapped)
+                return _ENOMEM;
+        }
+    }
+
+    long changed = pt_set_locked(mem, start, pages, locked);
     return changed < 0 ? (int_t) changed : 0;
+}
+
+// mlockall's and munlockall's part for reservations; see mem_lazy_lock_all.
+static void mlock_reservations(bool locked, bool populate) {
+    struct mem *mem = current->mem;
+    mem_read_lock_quiesce_aware(mem);
+    bool any = mem_lazy_overlaps(mem, 0, mem->page_limit);
+    mem_read_unlock_quiesce_aware(mem);
+    if (!any)
+        return;
+    mem_write_lock_with_pokes(mem);
+    mem_lazy_lock_all(mem, locked, populate);
+    mem_write_unlock_with_pokes(mem);
 }
 
 int_t sys_mlock_guest(guest_addr_t addr, qword_t len) {
@@ -1501,8 +1587,18 @@ int_t sys_mlockall_guest(qword_t flags) {
     // that silently did nothing would be worse than one that is written down.
     // Recorded rather than refused because the flag combination is legal and
     // programs pass MCL_CURRENT|MCL_FUTURE together as a matter of course.
-    if ((flags & MCL_CURRENT_) != 0)
+    //
+    // A reservation is part of what is mapped now. Without MCL_ONFAULT Linux
+    // populates every mapping it can access, so the accessible reservations are
+    // materialised and locked with the rest. A PROT_NONE one is not populated
+    // there either, and under MCL_ONFAULT nothing is: those keep a mark that
+    // locks each entry they materialise later, as a page faulted into a locked
+    // mapping is locked on Linux. Reservations first: a page a sibling thread
+    // materialises before the entry walk below is then locked either way.
+    if ((flags & MCL_CURRENT_) != 0) {
+        mlock_reservations(true, (flags & MCL_ONFAULT_) == 0);
         pt_set_locked_all(current->mem, true);
+    }
     return 0;
 }
 
@@ -1512,6 +1608,7 @@ int_t sys_mlockall(dword_t flags) {
 
 int_t sys_munlockall_guest(void) {
     current->mm->mlockall_flags = 0;
+    mlock_reservations(false, false);
     pt_set_locked_all(current->mem, false);
     return 0;
 }

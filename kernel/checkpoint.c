@@ -87,7 +87,8 @@
 #include "util/sync.h"
 
 #define CKPT_MAGIC "AOKCKPT"
-#define CKPT_VERSION 4   // 4: ckpt_task.native_standin_child
+#define CKPT_VERSION 5   // 4: ckpt_task.native_standin_child
+                         // 5: ckpt_map.kind, reservations saved as reservations
 // How long the freezer waits for a task to reach a syscall boundary.
 //
 // Generous on purpose. Every wait in the guest is broken by the poke, so a
@@ -259,8 +260,24 @@ struct ckpt_task {
 struct ckpt_map {
     uint64_t start;    // guest address
     uint64_t pages;
-    uint32_t flags;    // P_*
-    uint32_t reserved;
+    uint32_t flags;    // P_*; for CKPT_MAP_RESERVED, struct mem_lazy_map's
+    uint32_t kind;     // enum ckpt_map_kind. Was `reserved`, always 0, in v4.
+};
+
+// What follows a map record. A lazy anonymous reservation (emu/memory.h,
+// struct mem_lazy_map) is address space the guest has mapped with no page-table
+// entries yet, so a walk of the entries does not see it. Version 4 walked only
+// the entries, and a restored process lost every reservation: a JVM's PROT_NONE
+// heap came back as a hole that the next mmap could land in (SEGV_MAPERR where
+// the heap had given SEGV_ACCERR), and the untouched tail of a large RW mapping
+// faulted on the first write. That got worse when splits began leaving the
+// remainders of a reservation reserved rather than materialised. Writing them
+// out as zero pages instead would be correct and cost the whole reservation in
+// the image -- 537 MB for one committed page in a 512 MB heap -- so a
+// reservation travels as a range, with no bytes, and is reserved again.
+enum ckpt_map_kind {
+    CKPT_MAP_PAGES = 0,       // `pages` pages of bytes follow
+    CKPT_MAP_RESERVED = 1,    // nothing follows
 };
 
 struct ckpt_fd {
@@ -960,6 +977,25 @@ static int ckpt_for_each_map(struct mem *mem,
     return 0;
 }
 
+// And each reservation, which has no entries for the walk above to find.
+// Caller holds the mem lock.
+static int ckpt_for_each_reservation(struct mem *mem,
+        int (*emit)(void *ctx, page_t start, pages_t pages, unsigned flags),
+        void *ctx) {
+    for (unsigned i = 0; i < mem->lazy_count; i++) {
+        struct mem_lazy_map l = mem->lazy[i];
+        if (l.start >= l.end)
+            continue;
+        // Without mlockall's mark: the image does not carry an entry's lock
+        // either, so a restored process holds no locks at all rather than
+        // locks on only the pages that were still reserved.
+        int err = emit(ctx, l.start, l.end - l.start, l.flags & ~MEM_LAZY_LOCKED);
+        if (err < 0)
+            return err;
+    }
+    return 0;
+}
+
 struct ckpt_count_ctx { uint32_t maps; uint64_t pages; };
 static int ckpt_count_map(void *vctx, page_t UNUSED(start), pages_t pages,
         unsigned UNUSED(flags)) {
@@ -969,13 +1005,36 @@ static int ckpt_count_map(void *vctx, page_t UNUSED(start), pages_t pages,
     return 0;
 }
 
+static int ckpt_count_reservation(void *vctx, page_t UNUSED(start), pages_t UNUSED(pages),
+        unsigned UNUSED(flags)) {
+    struct ckpt_count_ctx *c = vctx;
+    c->maps++;      // a record, but no pages in the image
+    return 0;
+}
+
 struct ckpt_emit_ctx { struct ckpt_writer *w; struct mem *mem; };
+
+static int ckpt_emit_reservation(void *vctx, page_t start, pages_t pages, unsigned flags) {
+    struct ckpt_emit_ctx *c = vctx;
+    struct ckpt_map m = {
+        .start = (uint64_t) start << PAGE_BITS,
+        .pages = pages,
+        .flags = flags,
+        .kind = CKPT_MAP_RESERVED,
+    };
+    CKPT_TRACE("  save reservation %#llx +%llu pages flags %#x\n",
+               (unsigned long long) m.start, (unsigned long long) pages, flags);
+    wr(c->w, &m, sizeof(m));
+    return c->w->err;
+}
+
 static int ckpt_emit_map(void *vctx, page_t start, pages_t pages, unsigned flags) {
     struct ckpt_emit_ctx *c = vctx;
     struct ckpt_map m = {
         .start = (uint64_t) start << PAGE_BITS,
         .pages = pages,
         .flags = flags,
+        .kind = CKPT_MAP_PAGES,
     };
     wr(c->w, &m, sizeof(m));
     for (pages_t i = 0; i < pages && c->w->err == 0; i++) {
@@ -1270,6 +1329,7 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
         mem = task->mem;
         read_lock(&mem->lock);
         ckpt_for_each_map(mem, ckpt_count_map, &counts);
+        ckpt_for_each_reservation(mem, ckpt_count_reservation, &counts);
         rec.n_maps = counts.maps;
         rec.brk = mm->brk; rec.start_brk = mm->start_brk;
         rec.vdso = mm->vdso; rec.stack_start = mm->stack_start;
@@ -1316,6 +1376,7 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
 
         struct ckpt_emit_ctx emit = { .w = w, .mem = mem };
         ckpt_for_each_map(mem, ckpt_emit_map, &emit);
+        ckpt_for_each_reservation(mem, ckpt_emit_reservation, &emit);
         read_unlock(&mem->lock);
         mem = NULL;
         *pages_out += counts.pages;
@@ -1995,6 +2056,28 @@ static int ckpt_restore_task(FILE *f, const struct ckpt_header *h,
         if ((err = rd(f, &m, sizeof(m))) < 0)
             return err;
         page_t start_page = (page_t) (m.start >> PAGE_BITS);
+        if (m.kind == CKPT_MAP_RESERVED) {
+            // Reserved again, not materialised: see enum ckpt_map_kind. Any
+            // size, since a fault or a split can leave one below the threshold
+            // a fresh mmap needs. Records never overlap, so this cannot split
+            // or clear anything the image put back; failing that (a table
+            // somehow full) the pages are still owed, and get entries.
+            write_lock(&mem->lock);
+            // pt_unmap_always also rejects a range outside the address space,
+            // which a reservation would otherwise record unchecked.
+            err = pt_unmap_always(mem, start_page, (pages_t) m.pages) < 0 ? _ENOMEM : 0;
+            if (err == 0 && !mem_lazy_reserve_any_size(mem, start_page, (pages_t) m.pages, m.flags))
+                err = pt_map_nothing(mem, start_page, (pages_t) m.pages, m.flags);
+            write_unlock(&mem->lock);
+            CKPT_TRACE("  load reservation %#llx +%llu pages flags %#x%s\n",
+                       (unsigned long long) m.start, (unsigned long long) m.pages,
+                       m.flags, err < 0 ? " (failed)" : "");
+            if (err < 0)
+                return err;
+            continue;
+        }
+        if (m.kind != CKPT_MAP_PAGES)
+            return _EINVAL;
         write_lock(&mem->lock);
         // A fresh mm is not empty -- mm_new maps the vdso -- and the image is
         // the complete truth about this address space, so anything already

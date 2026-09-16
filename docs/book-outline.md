@@ -173,8 +173,9 @@ which is why this outline is worth trusting:
   TLB in `emu/tlb.c`, and why a TLB matters more here than a page table walk
   costs on real hardware.
 - **Lazy anonymous mmap**: reservations versus page tables — a mapping is either
-  reserved or materialized, never both, and never split. The invariant and why
-  violating it produced the bugs it did.
+  reserved or materialized, never both. A fault never splits a reservation; a
+  drop may, under a slot limit that keeps splits from starving new
+  reservations. The invariant and why violating it produced the bugs it did.
 - Copy-on-write, `MAP_SHARED`, and the three separate ways a shared mapping quietly
   stopped being shared.
 - Floating point: `float80.c` and the x87 80-bit problem on hosts that do not have

@@ -18,7 +18,7 @@
 set -e
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-ISH=$REPO/build/ish
+ISH=${ISH:-$REPO/build/ish}
 ROOT=${1:-$REPO/build/devuan-arm64-test}
 IMG=${TMPDIR:-/tmp}/aok-checkpoint-$$.img
 SH=/bin/dash
@@ -512,5 +512,83 @@ else
     rm -f "$PIMG"
     echo "  hungup  | (poll leg skipped: no image)"
 fi
+
+# ---- reserved address space ------------------------------------------------
+#
+# A large anonymous mapping is a RESERVATION with no page-table entries
+# (emu/memory.h, struct mem_lazy_map), so a save that walked only entries lost
+# every one: a JVM-style PROT_NONE heap came back a hole that new mmaps landed
+# in, and the untouched tail of a large RW mapping faulted on its first write.
+# Writing reserved pages out as zeroes would be correct and put the whole
+# reservation in the image, so the image must also stay small.
+# checkpoint_lazy_reservation.c checks both lives and says which it is in.
+echo "  ---- reserved address space ----"
+RIMG=${TMPDIR:-/tmp}/aok-ckpt-lazy-$$.img
+rm -f "$RIMG"
+lazy_build=$("$ISH" -f "$ROOT" $SH -c '
+command -v cc > /dev/null || { echo NO-CC; exit 0; }
+cc -O1 -o /tmp/ckpt_lazy_reservation /AOK/tests/checkpoint_lazy_reservation.c && echo BUILT' 2>&1 || true)
+case $lazy_build in
+    *BUILT*)
+        # `|| true`: the probe exits 1 on a failed check, which set -e would
+        # otherwise turn into a silent exit before the verdict below.
+        lz_save=$(ISH_GUEST_CHECKPOINT=1 "$ISH" -f "$ROOT" /tmp/ckpt_lazy_reservation "$RIMG" 2>&1 || true)
+        echo "$lz_save" | sed 's/^/  lazy    | /'
+        case $lz_save in
+            *"life: original"*"RESULT: PASS"*) ;;
+            *) echo "FAIL: reserved address space was wrong before the save"; rm -f "$RIMG"; exit 1;;
+        esac
+        [ -s "$RIMG" ] || { echo "FAIL: no image for the reserved address space"; exit 1; }
+        lz_size=$(wc -c < "$RIMG" | tr -d ' ')
+        # 640 MB is reserved and a few MB touched.
+        if [ "$lz_size" -ge 104857600 ]; then
+            echo "FAIL: the image holds reserved pages as bytes ($lz_size bytes)"; rm -f "$RIMG"; exit 1
+        fi
+        echo "  lazy    | image $lz_size bytes"
+        lz_back=$(ISH_RESTORE="$RIMG" "$ISH" -f "$ROOT" 2>&1 || true)
+        rm -f "$RIMG"
+        echo "$lz_back" | sed 's/^/  lazy    | /'
+        case $lz_back in
+            *A-BEFORE-SAVE*) echo "FAIL: the restored guest re-ran rather than continued"; exit 1;;
+        esac
+        case $lz_back in
+            *"life: restored"*"RESULT: PASS"*) echo "  lazy    | reservations came back reserved" ;;
+            *) echo "FAIL: reserved address space did not survive the restore"; exit 1;;
+        esac
+        # And from outside the guest, the app's path: checkpoint_save_external.
+        rm -f "$RIMG" "$RIMG.log"
+        lz_ext=$(ISH_CHECKPOINT_AFTER=2:"$RIMG" "$ISH" -f "$ROOT" \
+            /tmp/ckpt_lazy_reservation --sleep 5 2>&1 || true)
+        echo "$lz_ext" | sed 's/^/  lazy    | outside: /'
+        case $lz_ext in
+            *"life: original"*"RESULT: PASS"*) ;;
+            *) echo "FAIL: reserved address space was wrong around an external save"; rm -f "$RIMG" "$RIMG.log"; exit 1;;
+        esac
+        case $(cat "$RIMG.log" 2>/dev/null) in
+            written*) ;;
+            *) echo "FAIL: external checkpoint of reserved address space: $(cat "$RIMG.log" 2>/dev/null)"
+               rm -f "$RIMG" "$RIMG.log"; exit 1;;
+        esac
+        rm -f "$RIMG.log"
+        lz_size=$(wc -c < "$RIMG" | tr -d ' ')
+        if [ "$lz_size" -ge 104857600 ]; then
+            echo "FAIL: the external image holds reserved pages as bytes ($lz_size bytes)"; rm -f "$RIMG"; exit 1
+        fi
+        lz_back=$(ISH_RESTORE="$RIMG" "$ISH" -f "$ROOT" 2>&1 || true)
+        rm -f "$RIMG"
+        echo "$lz_back" | sed 's/^/  lazy    | outside: /'
+        case $lz_back in
+            *A-BEFORE-SAVE*) echo "FAIL: the externally restored guest re-ran rather than continued"; exit 1;;
+        esac
+        case $lz_back in
+            *"life: restored"*"RESULT: PASS"*) echo "  lazy    | and from outside the guest, image $lz_size bytes" ;;
+            *) echo "FAIL: reserved address space did not survive an external save"; exit 1;;
+        esac
+        ;;
+    *NO-CC*)
+        echo "  lazy    | (skipped: no cc in $ROOT)" ;;
+    *)
+        echo "FAIL: could not build checkpoint_lazy_reservation"; echo "  got: $lazy_build"; exit 1;;
+esac
 
 echo "PASS: continued from the instruction after the checkpoint, same file, same offset"

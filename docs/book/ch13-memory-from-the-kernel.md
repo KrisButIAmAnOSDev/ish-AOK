@@ -332,7 +332,8 @@ most of the interesting logic in `kernel/swap.c` is about declining to work.
   fails, because a caller that gives up on one `ENOMEM` never gets a second.
 
 And two promises the pager owes the guest: memory the guest has `mlock`ed is
-never evicted, and a slot that cannot be read back delivers `SIGBUS` with
+never evicted, including memory that was still a lazy reservation when it was
+locked (Chapter 5), and a slot that cannot be read back delivers `SIGBUS` with
 `BUS_ADRERR` — the address is valid, the hardware could not deliver it — rather
 than `SIGSEGV`.
 
@@ -450,6 +451,12 @@ rather than rebuilding them:
 
 > preserves both `MAP_SHARED` contents and any `MAP_PRIVATE`/COW data already
 > written. Mirrors the fd path in `do_mmap()`.
+
+Part of a large anonymous mapping may have no entries to move at all: it is
+still a lazy reservation (Chapter 5), whether never touched or left over from a
+split. Those pages move as a reservation, and the grown tail joins it, so
+`realloc` growing a big, mostly untouched block builds no page tables for the
+part nobody has written.
 
 `MREMAP_FIXED` additionally clears whatever is currently mapped at the
 destination, which is what makes it dangerous and why it requires
