@@ -514,12 +514,12 @@ stp_gadget stp32, 64, 4, w17, w25
     ldr x10, [_cpu, x9]        // base from precomputed rn_slot
     add x7, x10, x19
     read_prep \bits, \name
-    \ldr_reg1, [_addr]
-    \ldr_reg2, [_addr, #\bytes]
+    ldr \ldr_reg1, [_addr]
+    ldr \ldr_reg2, [_addr, #\bytes]
     and x9, x8, #0xffff        // rt_slot (low 16 bits)
-    str \ldr_reg1, [_cpu, x9]  // store to precomputed rt_slot
-    ubfx x9, x8, #16, #16     // rt2_slot (high 16 bits)
-    str \ldr_reg2, [_cpu, x9]  // store to precomputed rt2_slot
+    str x17, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
+    ubfx x9, x8, #16, 16      // rt2_slot (high 16 bits)
+    str x25, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
     gret
     read_bullshit \bits, \name
 .endm
