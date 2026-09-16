@@ -47,10 +47,11 @@
 #                      immediately instead of only ever reporting its own
 #                      generic "timed out waiting" after the full deadline.
 #
-# Fixed for v1 (matches wayland_workspace_plan.md phase 2.5): the headless
-# output is wlroots' default size (1280x720); the applet's native RFB client
-# (DisplayRFBClient/DisplayRFBView) scales to fit. Per-session resizable
-# output is a follow-up, not built here.
+# The headless output starts at wlroots' default size (1280x720). Once the
+# applet's native RFB client (DisplayRFBClient/DisplayRFBView) connects, it asks
+# for a desktop the size of the surface showing it, and again whenever that
+# surface is resized (RFB SetDesktopSize, which wayvnc forwards to the headless
+# output). A server that refuses keeps 1280x720, scaled to fit.
 #
 # First-run only, a labwc setup gets seeded under $HOME/.config/labwc/ and
 # $HOME/.local/share/themes/ (see below): a right-click root menu (New

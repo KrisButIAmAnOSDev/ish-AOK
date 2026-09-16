@@ -64,11 +64,12 @@ writing this plan:
 
 - In the existing `viewWillTransitionToSize:` completion block: compute the
   target resolution and call `requestDesktopSizeWidth:height:`.
-  v1 policy: fixed pair — 1280x720 landscape, 720x1280 portrait (matches
-  the wlroots headless default area; avoids deriving odd sizes from every
-  device's aspect). Standalone mode only for v1; the windowed Workspace
-  applet keeps its fixed canvas (its window is freely user-resizable —
-  following that continuously is a possible v2, same primitive).
+  v1 policy was a fixed pair — 1280x720 landscape, 720x1280 portrait,
+  standalone mode only. **Superseded (4131facd, #483/#482):** the size now
+  follows the display surface in both standalone and Workspace mode — one
+  desktop pixel per point, short side at least 480, long side at most 2560,
+  even dimensions — requested on connect and after each resize settles
+  (0.4 s), once per size per connection. See DisplayDesktopSizeForViewSize.
 
 ### No changes: start-wayland.sh, setup-wayland.sh, guest packages, emulator core.
 
