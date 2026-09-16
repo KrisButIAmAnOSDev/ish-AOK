@@ -2184,9 +2184,16 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
 #pragma clang diagnostic pop
     }
 
+    // The status bar is the only thing above the terminal in full screen, but not
+    // in an iPadOS 26 window: the window's close/minimize/zoom controls sit over its
+    // top-leading corner, lower than the status bar height reaches, and they drew
+    // over the terminal's first rows (#580). Keep clear of whichever is lower. In
+    // full screen the controls live in the menu bar, the helper returns 0, and the
+    // inset is the status bar's as before.
+    CGFloat requiredTopInset = MAX(statusBarHeight, ISHWindowingControlsTopInset(self.view));
     CGFloat baseTopInset = MAX(0, self.view.safeAreaInsets.top - self.additionalSafeAreaInsets.top);
     UIEdgeInsets extraInsets = self.additionalSafeAreaInsets;
-    extraInsets.top = MAX(0, statusBarHeight - baseTopInset);
+    extraInsets.top = MAX(0, requiredTopInset - baseTopInset);
     if (!UIEdgeInsetsEqualToEdgeInsets(self.additionalSafeAreaInsets, extraInsets)) {
         self.additionalSafeAreaInsets = extraInsets;
     }
@@ -2200,6 +2207,18 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
 - (void)viewSafeAreaInsetsDidChange {
     [super viewSafeAreaInsetsDidChange];
     [self _updateSafeAreaCompensation];
+}
+
+// Resizing a window, or taking it full screen and back, does not always change
+// the safe area this controller sees -- and whether the window controls cover the
+// content depends on the window's size (see ISHWindowingControlsTopInset), so the
+// top inset has to be worked out again once the new size is in place.
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak typeof(self) weakSelf = self;
+    [coordinator animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+        [weakSelf _updateSafeAreaCompensation];
+    }];
 }
 
 - (void)keyboardDidSomething:(NSNotification *)notification {

@@ -68,6 +68,33 @@ BOOL ISHActionSheetUsesMacPresentation(void) {
     return info.isiOSAppOnMac || info.isMacCatalystApp;
 }
 
+CGFloat ISHWindowingControlsTopInset(UIView *view) {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
+    if (@available(iOS 26.0, *)) {
+        UIWindow *window = view.window;
+        if (window == nil)
+            return 0;
+        // A window that covers its whole screen is full screen, where the controls
+        // are in the menu bar, not over the content. Decided from the geometry
+        // rather than from the corner inset because that inset can be stale: an
+        // app that launched in a window and then went full screen with the green
+        // button still read a 10pt safe area and a 53pt corner inset in a
+        // screen-sized window, measured on the iOS 26.5 simulator. Trusting it
+        // there left a 21pt gap under the status bar.
+        UIScreen *screen = window.windowScene.screen;
+        if (screen != nil &&
+            fabs(CGRectGetWidth(window.bounds) - CGRectGetWidth(screen.bounds)) < 1 &&
+            fabs(CGRectGetHeight(window.bounds) - CGRectGetHeight(screen.bounds)) < 1)
+            return 0;
+        UIViewLayoutRegion *region = [UIViewLayoutRegion safeAreaLayoutRegionWithCornerAdaptation:UIViewLayoutRegionAdaptivityAxisVertical];
+        CGFloat windowTop = [window edgeInsetsForLayoutRegion:region].top;
+        CGFloat viewTop = [view convertPoint:CGPointZero toView:window].y;
+        return MAX(0, windowTop - viewTop);
+    }
+#endif
+    return 0;
+}
+
 @interface ISHActionSheetItem : NSObject
 @property (nonatomic, strong) UIAlertAction *action;
 @property (nonatomic, copy, nullable) void (^handler)(UIAlertAction *action);

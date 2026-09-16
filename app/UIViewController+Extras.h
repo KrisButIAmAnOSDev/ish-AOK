@@ -97,4 +97,25 @@ NS_ASSUME_NONNULL_BEGIN
 // Mac Catalyst, or ISH_FORCE_MAC_SHEETS=1.
 BOOL ISHActionSheetUsesMacPresentation(void);
 
+// How far down, in `view`'s own coordinates, content has to start to stay clear
+// of the system's window controls (close, minimize, zoom).
+//
+// iPadOS 26 draws those controls over the top-leading corner of a window, and
+// the plain safe area does not account for them: a windowed scene reports a
+// top safe area of 10pt while the controls reach ~50pt down. The status bar is
+// no guide either -- the status bar manager still reports its 32pt for a window
+// that is nowhere near the status bar. The window's safe area with vertical
+// corner adaptation is the value that includes the controls, so that is what
+// this returns (#580).
+//
+// It is measured on the WINDOW, not on `view`, deliberately: a view
+// controller's own additionalSafeAreaInsets feed into its view's safe area, so
+// asking the view would read back the inset being computed from it.
+//
+// It is 0 wherever the controls are not over the content: a window that covers
+// its screen (full screen, where they live in the menu bar; iPhone), iOS before
+// 26, or a view that is not in a window. So taking the larger of this and an
+// existing top inset changes nothing in those cases.
+CGFloat ISHWindowingControlsTopInset(UIView *view);
+
 NS_ASSUME_NONNULL_END

@@ -909,6 +909,15 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
         self.restoreFrameBeforeZoom = ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRectIntegral(self.frame));
         self.zoomedToFullscreen = YES;
         CGRect fullscreenFrame = self.superview.bounds;
+        // In an iPadOS 26 window the system's window controls sit over the top-leading
+        // corner, exactly where this window's close button lands when it fills the
+        // desktop (#580). Start below them there. They only reach lower than the safe
+        // area in a window, so full screen still zooms to the whole desktop.
+        CGFloat controlsTop = ISHWindowingControlsTopInset(self.superview);
+        if (controlsTop > self.superview.safeAreaInsets.top) {
+            fullscreenFrame.origin.y += controlsTop;
+            fullscreenFrame.size.height -= controlsTop;
+        }
         self.frame = ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRectIntegral(fullscreenFrame));
         didRestore = NO;
     }
@@ -3183,6 +3192,12 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 
 - (CGRect)desktopUsableBounds {
     UIEdgeInsets insets = self.view.safeAreaInsets;
+    // In an iPadOS 26 window the system's close/minimize/zoom controls cover the
+    // desktop's top-leading corner, well below the 10pt top safe area a window
+    // reports, so a window placed at the top of the desktop sat with its title bar,
+    // close button included, under them (#580). In full screen this is 0, so
+    // nothing moves there.
+    insets.top = MAX(insets.top, ISHWindowingControlsTopInset(self.view));
     CGRect bounds = self.desktopSurfaceView.bounds;
     if (ISHWorkspaceUsesPhoneLayout()) {
         return UIEdgeInsetsInsetRect(bounds, UIEdgeInsetsMake(insets.top, insets.left, insets.bottom, insets.right));
