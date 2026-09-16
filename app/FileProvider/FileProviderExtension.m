@@ -9,10 +9,12 @@
 #import "FileProviderItem.h"
 #import "FileProviderEnumerator.h"
 #import "NSError+ISHErrno.h"
+#import "ISHFileProviderDomainCleanup.h"
 #import "../AppGroup.h"
 #include "fs/fake-db.h"
 #include "fs/fake-path.h"
 #import <os/log.h>
+#include <unistd.h>
 
 // The extension's breadcrumbs go to a JSON file in the app group container and
 // every write there is passed error:nil, so a failure is completely silent --
@@ -350,6 +352,175 @@ static NSURL *ISHFileProviderPersistMetadataURL(void) {
 // Closing while we are still running and untimed makes that checkpoint free of
 // any deadline.
 static const NSTimeInterval kISHFileProviderMountIdleSeconds = 3.0;
+
+#pragma mark - Retirement on a Mac
+
+// On a Mac this extension can never serve a request (see
+// ISHFileProviderRunningOnMac), and removing domains from the app is not enough:
+// the app does that when it launches (Roots.m), but fileproviderd launches the
+// extension on its own schedule, seconds after a wake, dark wakes included.
+// Build 554 has the app-side removal and still aborted this way on two Macs.
+//
+// So on a Mac the extension retires before NSExtensionMain runs. It removes this
+// provider's registered domains, notes that it did, and exits cleanly. The
+// request that would abort is never received, so it does not matter how or when
+// a given macOS checks the principal class. This is a C constructor, not +load
+// or +initialize: by now dyld has initialised every framework we link and no
+// objc runtime lock is held. The framework has not started a request either, so
+// the removal cannot wait on anything this process holds for one. It can still
+// wait on fileproviderd, though, which launched us to serve a domain and may be
+// waiting on this launch while we ask it to remove that domain. Nothing here
+// rules that out; the 3 s bound on the removal is what covers it. The attempt is
+// then abandoned, and the failure record says whether getDomains had answered by
+// the deadline. If it had not, this launch requests no removal at all, even if
+// the answer arrives in the moment before we exit: the deadline and the answer
+// are taken under one lock, and whichever comes second knows about the first.
+// If it had, the removals were requested, and fileproviderd may still finish
+// them after we exit.
+//
+// A removal that comes back complete and error-free is final: a marker in this
+// extension's defaults says so, and later launches -- for instance for the
+// default domain fileproviderd keeps per provider and will not remove -- exit
+// without asking fileproviderd anything. A Mac where it never comes back clean
+// (a timeout every time, a removal fileproviderd refuses) must not pay up to 4 s
+// and a breadcrumb on every launch, hour after hour, indefinitely. So failures
+// are counted in the same defaults: after three, launches exit at once until the
+// last attempt is a day old, then try once more, and a new build starts the count
+// over. The breadcrumb, which shares a 200-entry file with the app's own,
+// is written only when an attempt's outcome differs from the previous one's;
+// os_log gets every launch.
+static NSString *const kISHFileProviderRetiredOnMacKey = @"ISHFileProviderRetiredOnMac";
+static NSString *const kISHFileProviderRetireFailuresKey = @"ISHFileProviderRetireOnMacFailures";
+static const int64_t kISHFileProviderRetireRemovalTimeoutMs = 3000;
+static const int64_t kISHFileProviderRetireRecordTimeoutMs = 1000;
+static const NSInteger kISHFileProviderRetireFailuresBeforeBackoff = 3;
+static const NSTimeInterval kISHFileProviderRetireBackoffSeconds = 24 * 60 * 60;
+
+__attribute__((constructor))
+static void ISHFileProviderRetireOnMac(void) {
+    @autoreleasepool {
+        if (!ISHFileProviderRunningOnMac())
+            return;
+
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if ([defaults objectForKey:kISHFileProviderRetiredOnMacKey] != nil) {
+            os_log(ISHFileProviderLog(), "Mac retirement: retired on an earlier launch, exiting");
+            _exit(0);
+        }
+
+        // Earlier failures, for this build only. Types are checked: an exception
+        // thrown here would abort the process, which is what this is avoiding.
+        NSString *build = NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] ?: @"unknown";
+        NSDictionary *failures = [defaults objectForKey:kISHFileProviderRetireFailuresKey];
+        if (![failures isKindOfClass:NSDictionary.class] || ![failures[@"build"] isEqual:build])
+            failures = nil;
+        NSNumber *failedCount = failures[@"count"];
+        NSInteger failed = [failedCount isKindOfClass:NSNumber.class] ? failedCount.integerValue : 0;
+        NSDate *lastFailure = failures[@"last"];
+        if (failed >= kISHFileProviderRetireFailuresBeforeBackoff && [lastFailure isKindOfClass:NSDate.class]) {
+            NSTimeInterval since = -lastFailure.timeIntervalSinceNow;
+            // A negative age means the clock went back; try rather than wait.
+            if (since >= 0 && since < kISHFileProviderRetireBackoffSeconds) {
+                os_log(ISHFileProviderLog(), "Mac retirement: %ld attempts have failed, the last %.1f h ago; next attempt when that is 24 h old, exiting",
+                       (long) failed, since / 3600.0);
+                _exit(0);
+            }
+        }
+        NSInteger attempt = failed + 1;
+
+        os_log(ISHFileProviderLog(), "Mac retirement: this extension cannot run on a Mac; removing registered domains, then exiting");
+        NSTimeInterval start = NSDate.date.timeIntervalSinceReferenceDate;
+        dispatch_semaphore_t answered = dispatch_semaphore_create(0);
+        __block NSDictionary<NSString *, id> *summary = nil;
+        // What getDomains returned, filled in when it answers, and whether this
+        // launch has stopped waiting. The answer can come after the deadline, so
+        // both are only touched under the listing's lock. An answer that finds
+        // the deadline already passed requests no removal, so a record that says
+        // listed = NO always means this launch asked for none.
+        NSMutableDictionary<NSString *, id> *listing = [NSMutableDictionary dictionary];
+        __block BOOL gaveUp = NO;
+        ISHFileProviderRemoveRegisteredDomains(^BOOL(NSDictionary<NSString *, id> *list) {
+            BOOL proceed;
+            @synchronized (listing) {
+                proceed = !gaveUp;
+                if (proceed)
+                    [listing addEntriesFromDictionary:list];
+            }
+            if (!proceed)
+                os_log(ISHFileProviderLog(), "Mac retirement: getDomains answered after the deadline; no removal requested");
+            return proceed;
+        }, ^(NSDictionary<NSString *, id> *result) {
+            summary = result;
+            dispatch_semaphore_signal(answered);
+        });
+        BOOL timedOut = dispatch_semaphore_wait(answered, dispatch_time(DISPATCH_TIME_NOW, kISHFileProviderRetireRemovalTimeoutMs * (int64_t) NSEC_PER_MSEC)) != 0;
+
+        // What this attempt found, without its timing, so that it can be
+        // compared with the previous attempt's. After a timeout `summary` may
+        // still be written by the completion, so it is not read at all.
+        NSMutableDictionary<NSString *, id> *outcome = [NSMutableDictionary dictionary];
+        if (timedOut) {
+            outcome[@"timedOut"] = @YES;
+            // What it gave up waiting for. Not listed: getDomains had not
+            // answered, and with gaveUp set it cannot start a removal later.
+            // Listed: the removals (if domains > 0) were requested, and not all
+            // of them had answered.
+            @synchronized (listing) {
+                gaveUp = YES;
+                outcome[@"listed"] = listing.count != 0 ? @YES : @NO;
+                [outcome addEntriesFromDictionary:listing];
+            }
+        } else {
+            [outcome addEntriesFromDictionary:summary];
+        }
+        // Only a complete answer with nothing left registered is final.
+        BOOL retired = !timedOut && summary[@"listError"] == nil && summary[@"errors"] == nil;
+        outcome[@"retired"] = @(retired);
+        // A recorded outcome is never a retired one, so a retirement always
+        // counts as a change.
+        BOOL outcomeChanged = ![failures[@"outcome"] isEqual:outcome];
+
+        NSMutableDictionary<NSString *, id> *details = [outcome mutableCopy];
+        details[@"attempt"] = @(attempt);
+        details[@"duration_ms"] = ISHFileProviderDurationMilliseconds(start);
+        // Logged before anything is recorded: a launch whose log has no details
+        // line was stopped before it recorded anything, and does not count
+        // towards the backoff.
+        os_log(ISHFileProviderLog(), "Mac retirement: %{public}@", details);
+
+        if (retired) {
+            [defaults setObject:@{
+                @"date": NSDate.date,
+                @"build": build,
+                @"domains": summary[@"domains"] ?: @0,
+            } forKey:kISHFileProviderRetiredOnMacKey];
+            [defaults removeObjectForKey:kISHFileProviderRetireFailuresKey];
+        } else {
+            [defaults setObject:@{
+                @"build": build,
+                @"count": @(attempt),
+                @"last": NSDate.date,
+                @"outcome": outcome.copy,
+            } forKey:kISHFileProviderRetireFailuresKey];
+        }
+        // The write reaches cfprefsd asynchronously, and _exit won't wait.
+        dispatch_group_t recorded = dispatch_group_create();
+        dispatch_group_async(recorded, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [defaults synchronize];
+        });
+        if (outcomeChanged) {
+            // The breadcrumb also lands in the app's Diagnostics export. It is
+            // written on its own queue (group container lookup, file I/O,
+            // nothing that needs the main thread), so wait behind it, briefly.
+            ISHFileProviderRecordBreadcrumb(@"fileprovider.extension.retiredOnMac", details);
+            dispatch_group_async(recorded, ISHFileProviderBreadcrumbQueue(), ^{});
+        }
+        dispatch_group_wait(recorded, dispatch_time(DISPATCH_TIME_NOW, kISHFileProviderRetireRecordTimeoutMs * (int64_t) NSEC_PER_MSEC));
+    }
+    // _exit, not exit: no atexit handlers or static destructors while XPC and
+    // dispatch threads are still live.
+    _exit(0);
+}
 
 @implementation FileProviderExtension
 

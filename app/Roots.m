@@ -7,6 +7,7 @@
 
 #import <FileProvider/FileProvider.h>
 #import "Diagnostics.h"
+#import "FileProvider/ISHFileProviderDomainCleanup.h"
 #import "Roots.h"
 #import "AppGroup.h"
 #import "AppDelegate.h"
@@ -773,38 +774,37 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 //     API_AVAILABLE(ios(8.0)) API_UNAVAILABLE(macos, macCatalyst)
 //
 // and the extension point is com.apple.fileprovider-nonui, the classic API.
-// macOS hosts only the replicated API (NSFileProviderReplicatedExtension). So
-// on an Apple Silicon Mac running this as a "Designed for iPad" app, the
-// framework loads the extension, finds one it cannot host, and aborts it with
-// __FILEPROVIDER_BAD_EXTENSION__ inside beginRequestWithDomain: -- before a
-// single line of ours runs, which is why the crash reports carry no AOK frame.
+// macOS hosts only the replicated API (NSFileProviderReplicatedExtension) and
+// treats every domain as replicated. So on an Apple Silicon Mac running this as
+// a "Designed for iPad" app, the framework loads the extension, finds one it
+// cannot host, and aborts it with __FILEPROVIDER_BAD_EXTENSION__ inside
+// beginRequestWithDomain: -- which is why the crash reports carry no AOK frame.
 //
-// Nothing inside the extension can prevent that; the only lever is here, in the
-// app: do not register a domain, and the extension is never asked to begin a
-// request. Everything else about AOK works on a Mac -- it is the Files
-// integration specifically that is unavailable.
+// Two levers, because fileproviderd launches the extension without the app.
+// Here, the app never registers a domain and removes any an earlier build left.
+// And the extension, when macOS starts it, exits before it can take a request
+// (ISHFileProviderRetireOnMac in FileProviderExtension.m). First it removes the
+// domains too, unless an earlier launch already did, or this build's removal
+// has failed three or more times and the last failure is less than a day old.
+// Everything else about AOK works on a Mac -- it is the Files integration
+// specifically that is unavailable.
 static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
-    if (@available(iOS 14.0, *)) {
-        NSProcessInfo *info = NSProcessInfo.processInfo;
-        return info.isiOSAppOnMac || info.isMacCatalystApp;
-    }
-    return NO;
+    return ISHFileProviderRunningOnMac();
 }
 
 // Drop a domain a previous run (or an earlier build) left registered, so a Mac
 // -- or a re-signed build that has since lost its app group -- does not keep a
-// stale one that Finder or Files would try to open.
+// stale one that Finder or Files would try to open. This runs at launch and
+// again on every roots change, so only a removal that found something (or
+// failed) is worth a breadcrumb.
 - (void)removeAllFileProviderDomains {
-    [NSFileProviderManager getDomainsWithCompletionHandler:^(NSArray<NSFileProviderDomain *> *domains, NSError *error) {
-        if (error != nil || domains.count == 0)
+    ISHFileProviderRemoveRegisteredDomains(nil, ^(NSDictionary<NSString *, id> *summary) {
+        if ([summary[@"domains"] unsignedIntegerValue] == 0 && summary[@"listError"] == nil)
             return;
-        for (NSFileProviderDomain *domain in domains) {
-            [NSFileProviderManager removeDomain:domain completionHandler:^(NSError *removeError) {
-                if (removeError != nil)
-                    NSLog(@"error removing file provider domain: %@", removeError);
-            }];
-        }
-    }];
+        [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.removedDomains" details:summary];
+        if (summary[@"listError"] != nil || summary[@"errors"] != nil)
+            NSLog(@"removing file provider domains: %@", summary);
+    });
 }
 
 - (void)requestFileProviderDomainSync {
