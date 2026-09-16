@@ -265,13 +265,17 @@ int fakefs_snapshot(const char *src_data, const char *dst_root,
     // The database sits next to the data dir, found by swapping the trailing
     // "data" component -- the same convention fakefs_mount enforces, and the
     // same reason to treat a mismatch as a plain error rather than an assert.
-    char src_db[PATH_MAX];
-    if (snprintf(src_db, sizeof src_db, "%s", src_data) >= (int) sizeof src_db)
-        return _ENAMETOOLONG;
-    char *slash = strrchr(src_db, '/');
+    // Checked against the db path, not the data path: "meta.db" is three bytes
+    // longer than "data", so a src_data that fits could still overrun src_db.
+    const char *slash = strrchr(src_data, '/');
     if (slash == NULL || strcmp(slash + 1, "data") != 0)
         return _EINVAL;
-    strcpy(slash + 1, "meta.db");
+    char src_db[PATH_MAX];
+    size_t dir_len = (size_t) (slash + 1 - src_data);
+    if (dir_len + sizeof("meta.db") > sizeof src_db)
+        return _ENAMETOOLONG;
+    memcpy(src_db, src_data, dir_len);
+    memcpy(src_db + dir_len, "meta.db", sizeof("meta.db"));
 
     char dst_data[PATH_MAX], dst_db[PATH_MAX];
     if (snprintf(dst_data, sizeof dst_data, "%s/data", dst_root) >= (int) sizeof dst_data ||

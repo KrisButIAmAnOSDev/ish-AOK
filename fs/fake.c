@@ -904,10 +904,7 @@ static int fakefs_utime(struct mount *mount, const char *path, struct timespec a
 }
 
 static int fakefs_mount(struct mount *mount) {
-    char db_path[PATH_MAX];
-    strncpy(db_path, mount->source, PATH_MAX - 1);
-    db_path[PATH_MAX - 1] = '\0';
-    char *slash = strrchr(db_path, '/');
+    const char *slash = strrchr(mount->source, '/');
     // The metadata DB lives next to the source dir as "meta.db", found by
     // swapping the final "data" path component -- an internal convention of
     // how this project's own root-installation code names its fakefs source
@@ -920,7 +917,18 @@ static int fakefs_mount(struct mount *mount) {
     // the entire app instead of just failing the mount).
     if (slash == NULL || strcmp(slash + 1, "data") != 0)
         return _EINVAL;
-    strncpy(slash + 1, "meta.db", 8);
+    // "meta.db" is three bytes longer than the "data" it replaces, so a source
+    // that fits PATH_MAX can still make a db path that does not -- and the
+    // guest chooses the source. This used to strncpy the name in unchecked: a
+    // guest `mount -t fake` of a 1023-byte ".../data" wrote past db_path and
+    // aborted the host process. Refuse rather than truncate, because a
+    // truncated path names a different database.
+    char db_path[PATH_MAX];
+    size_t dir_len = (size_t) (slash + 1 - mount->source);
+    if (dir_len + sizeof("meta.db") > sizeof(db_path))
+        return _ENAMETOOLONG;
+    memcpy(db_path, mount->source, dir_len);
+    memcpy(db_path + dir_len, "meta.db", sizeof("meta.db"));
 
     // do this now so rebuilding can use root_fd
     int err = realfs.mount(mount);
