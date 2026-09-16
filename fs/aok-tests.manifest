@@ -220,6 +220,7 @@ inotify_mount_paths.c
 procfd_reopen.c
 scm_rights_pidfd.c
 siocoutq.c
+sock_ifconf_sizing.c
 epoll_nested.c
 tmpfs_exec.c
 kcmp.c

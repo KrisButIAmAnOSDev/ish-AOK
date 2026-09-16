@@ -1754,14 +1754,16 @@ static int sock_ifconf(void *arg) {
     int32_t guest_len = is_64bit ? ifconf64->guest_len : ifconf32->guest_len;
     guest_addr_t guest_buf = is_64bit ? ifconf64->guest_buf : ifconf32->guest_buf;
 
-    if (guest_len < 0)
-        return _EINVAL;
-
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0)
         return _EIO;
 
-    size_t capacity = (size_t) guest_len;
+    // As Linux dev_ifconf(): a NULL ifc_buf is a size query and ifc_len is
+    // ignored, and with a buffer a negative ifc_len just fits nothing. OpenJDK
+    // makes the size query without setting ifc_len, so refusing a negative
+    // one made NetworkInterface.getNetworkInterfaces() throw (Gradle's "Could
+    // not determine a usable wildcard IP", #572).
+    size_t capacity = guest_len > 0 ? (size_t) guest_len : 0;
     size_t used = 0;
     size_t total = 0;
     size_t entry_size = is_64bit ? sizeof(struct guest_ifreq_addr64_) : sizeof(struct guest_ifreq_addr32_);
@@ -1793,7 +1795,7 @@ static int sock_ifconf(void *arg) {
     if (err < 0)
         return err;
 
-    int32_t result_len = (size_t) guest_len >= total ? (int32_t) total : (int32_t) used;
+    int32_t result_len = guest_buf == 0 ? (int32_t) total : (int32_t) used;
     if (is_64bit)
         ifconf64->guest_len = result_len;
     else
