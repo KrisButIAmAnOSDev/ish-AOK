@@ -30,6 +30,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libarchive-dev libsqlite3-dev
           pip3 install meson ninja
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        run: cd deps/dash && ../../tools/configure-dash.sh --quiet
       - name: Build
         run: |
           meson setup build -Dengine=jit
@@ -71,6 +77,12 @@ jobs:
         run: |
           cd deps/libapps/hterm
           python3 bin/mkdist
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        run: cd deps/dash && ../../tools/configure-dash.sh --quiet
       - name: Build app (unsigned)
         run: |
           xcodebuild build \

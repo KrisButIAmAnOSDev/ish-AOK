@@ -1,7 +1,14 @@
 #!/bin/sh
 # Configure dash the way iSH-AOK's native build needs it. Run from deps/dash.
 #
-#     cd deps/dash && ../../tools/configure-dash.sh && make
+#     cd deps/dash && ../../tools/configure-dash.sh
+#
+# Configure ONLY, then build iSH-AOK. The five generated sources are committed
+# in emkey1/dash, and they carry the thread-local conversion; config.h is not,
+# which is all this step produces. Do not follow it with dash's own `make`:
+# from a clean checkout it fails (the committed build products are Mach-O, and
+# the standalone link lacks aok_fork.c), and on the way it can regenerate
+# nodes.c from nodes.c.pat without __thread. CI runs exactly this step.
 #
 # WHY A CONFIGURED TREE AT ALL, rather than compiling the sources straight from
 # a pristine checkout: dash generates five of the objects it links --

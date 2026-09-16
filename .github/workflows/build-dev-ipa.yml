@@ -59,6 +59,12 @@ jobs:
         run: |
           cd deps/libapps/hterm
           python3 bin/mkdist
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        run: cd deps/dash && ../../tools/configure-dash.sh --quiet
 
       - name: Build unsigned .app
         run: |

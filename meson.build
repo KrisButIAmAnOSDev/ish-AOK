@@ -128,7 +128,9 @@ dash_dir = 'deps/dash'
 # dash generates five of the objects it links (builtins, init, nodes, signames,
 # syntax) from its own helpers, and meson does not reimplement that. The marker
 # is a generated file, so a checkout that has never been built fails the test.
-#   cd deps/dash && ../../tools/configure-dash.sh && make
+#   cd deps/dash && ../../tools/configure-dash.sh
+# Configure only: the generated sources are committed, and dash's own `make`
+# fails from a clean checkout (see tools/configure-dash.sh).
 dash_opt = get_option('native_dash')
 dash_prepared = fs_early.exists(dash_dir / 'src/signames.c') and fs_early.exists(dash_dir / 'config.h')
 dash_present = fs_early.exists(dash_dir / 'src/aok_mksignames.c')
@@ -144,9 +146,9 @@ if dash_opt.disabled()
     have_dash = false
 elif dash_opt.enabled() and not dash_prepared
     error('-Dnative_dash=enabled but deps/dash is not a prepared dash tree.\n' +
-          '  dash generates five of its own sources; prepare the tree once:\n' +
+          '  Its generated sources are committed but config.h is not; configure it once:\n' +
           '    git submodule update --init deps/dash\n' +
-          '    cd deps/dash && ../../tools/configure-dash.sh && make\n' +
+          '    cd deps/dash && ../../tools/configure-dash.sh\n' +
           '  Or build without dash: -Dnative_dash=disabled')
 else
     have_dash = dash_prepared

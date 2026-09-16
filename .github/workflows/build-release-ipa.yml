@@ -95,6 +95,17 @@ jobs:
               print("tools/meson.build already has the fix, no patch needed")
           PYEOF
 
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        # A re-spin of a tag from before 555 has no deps/dash.
+        run: |
+          if [ -f deps/dash/src/aok_mksignames.c ]; then
+            cd deps/dash && ../../tools/configure-dash.sh --quiet
+          fi
+
       - name: Build unsigned .app
         run: |
           xcodebuild build \
