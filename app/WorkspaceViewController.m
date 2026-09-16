@@ -20,6 +20,7 @@
 #import "WorkspaceImageViewer.h"
 #import "WorkspaceVideoPlayer.h"
 #import "UIApplication+OpenURL.h"
+#import "UIViewController+Extras.h"
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #include "kernel/task.h"
@@ -4768,10 +4769,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 }
 
 - (void)presentIconManagerFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Windows"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Windows" message:nil];
 
     NSUInteger listed = 0;
     for (ISHWorkspaceContainedWindowView *windowView in self.desktopWindows.copy) {
@@ -4782,27 +4780,20 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         NSString *name = windowView.titleLabel.text.length > 0 ? windowView.titleLabel.text : @"Window";
         __weak typeof(self) weakSelf = self;
         __weak typeof(windowView) weakWindow = windowView;
-        [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:name
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [weakSelf focusDesktopWindow:weakWindow];
-        }]];
+        }];
         listed++;
     }
     if (listed == 0) {
-        UIAlertAction *empty = [UIAlertAction actionWithTitle:@"No open windows" style:UIAlertActionStyleDefault handler:nil];
+        UIAlertAction *empty = [sheet addActionWithTitle:@"No open windows" style:UIAlertActionStyleDefault handler:nil];
         empty.enabled = NO;
-        [sheet addAction:empty];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 // Run a launcher shortcut: a {token} command opens the matching built-in tool or singleton
@@ -4864,67 +4855,59 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // are reachable without leaving the popup.
 - (void)presentLauncherFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect path:(NSArray<NSNumber *> *)path {
     NSArray<NSDictionary<NSString *, id> *> *shortcuts = ISHWorkspaceLauncherArrayAtPath(path);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Launcher"
-                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command in a new terminal." : nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Launcher"
+                                                         message:shortcuts.count == 0 ? @"Add a shortcut to run a command in a new terminal." : nil];
     [shortcuts enumerateObjectsUsingBlock:^(NSDictionary<NSString *, id> *shortcut, NSUInteger idx, __unused BOOL *stop) {
         NSString *command = shortcut[@"command"] ?: @"";
         NSString *shortcutName = shortcut[@"name"];
         NSString *name = shortcutName.length > 0 ? shortcutName
                        : (command.length > 0 ? command : @"Terminal");
         if (ISHWorkspaceShortcutIsGroup(shortcut)) {
-            [sheet addAction:[UIAlertAction actionWithTitle:[name stringByAppendingString:@" ›"]
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(__unused UIAlertAction *action) {
+            [sheet addActionWithTitle:[name stringByAppendingString:@" ›"]
+                                style:UIAlertActionStyleDefault
+                              handler:^(__unused UIAlertAction *action) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self presentLauncherFromView:sourceView sourceRect:sourceRect
                                               path:[path arrayByAddingObject:@(idx)]];
                 });
-            }]];
+            }];
         } else {
-            [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(__unused UIAlertAction *action) {
+            [sheet addActionWithTitle:name
+                                style:UIAlertActionStyleDefault
+                              handler:^(__unused UIAlertAction *action) {
                 [self runLauncherShortcutWithCommand:command title:name];
-            }]];
+            }];
         }
     }];
     if (path.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"‹ Back"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:@"‹ Back"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentLauncherFromView:sourceView sourceRect:sourceRect
                                           path:[path subarrayWithRange:NSMakeRange(0, path.count - 1)]];
             });
-        }]];
+        }];
     }
     if (path.count == 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Show on Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:@"Show on Desktop"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Edit Shortcuts…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Edit Shortcuts…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         // Defer: presenting from a sheet handler races the sheet dismissal and
         // iOS 27 drops it (see presentDesktopRootMenuFromView).
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentLauncherEditorFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 // Lean "+" entry point (used by the Launcher applet's own Add button, alongside its Edit
@@ -4933,40 +4916,31 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // and which also lists items for rename/delete — redundant with the applet's own inline
 // delete/drag chrome, so the applet uses this instead).
 - (void)presentAddLauncherOptionsFromView:(UIView *)sourceView path:(NSArray<NSNumber *> *)path {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Add"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Shortcut…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Add" message:nil];
+    [sheet addActionWithTitle:@"Add Shortcut…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherShortcutAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Built-in…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Add Built-in…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherBuiltinFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Group…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Add Group…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherGroupAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)presentAddLauncherShortcutAtPath:(NSArray<NSNumber *> *)path {
@@ -5033,10 +5007,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 
 - (void)presentLauncherEditorFromView:(UIView *)sourceView path:(NSArray<NSNumber *> *)path {
     NSArray<NSDictionary<NSString *, id> *> *shortcuts = ISHWorkspaceLauncherArrayAtPath(path);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Edit Shortcuts"
-                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command — or just open a terminal." : @"Pick a shortcut to rename, change, move, or delete."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Edit Shortcuts"
+                                                         message:shortcuts.count == 0 ? @"Add a shortcut to run a command — or just open a terminal." : @"Pick a shortcut to rename, change, move, or delete."];
     [shortcuts enumerateObjectsUsingBlock:^(NSDictionary<NSString *, id> *shortcut, NSUInteger idx, __unused BOOL *stop) {
         NSString *command = shortcut[@"command"];
         NSString *shortcutName = shortcut[@"name"];
@@ -5044,44 +5016,38 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                        : (command.length > 0 ? command : @"Terminal");
         if (ISHWorkspaceShortcutIsGroup(shortcut))
             name = [name stringByAppendingString:@" ›"];
-        [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:name
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentEditLauncherShortcutAtPath:path index:idx];
             });
-        }]];
+        }];
     }];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Shortcut…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Add Shortcut…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherShortcutAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Built-in…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Add Built-in…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherBuiltinFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Group…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Add Group…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherGroupAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 // Discoverable companion to the {token} syntax: pick a built-in tool and it's added as a
@@ -5113,28 +5079,20 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (ISHLLMClientEnabled())
         [builtins addObject:@{@"name": @"LLM Chat", @"command": @"{llm}"}];
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Add Built-in"
-                                            message:@"Open a built-in tool straight from the Launcher."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Add Built-in"
+                                                         message:@"Open a built-in tool straight from the Launcher."];
     for (NSDictionary<NSString *, NSString *> *builtin in builtins) {
-        [sheet addAction:[UIAlertAction actionWithTitle:builtin[@"name"]
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:builtin[@"name"]
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceLauncherMutateAtPath(path, ^(NSMutableArray<NSDictionary<NSString *, id> *> *level) {
                 [level addObject:builtin];
             });
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)presentEditLauncherShortcutAtPath:(NSArray<NSNumber *> *)path index:(NSUInteger)index {
@@ -5739,21 +5697,18 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
 }
 
 - (void)presentDesktopRootMenuFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Workspace"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Workspace" message:nil];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"New Terminal"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"New Terminal"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openDesktopTerminalHerePreferringConsole:NO
                                          reuseExisting:NO
                                        trackPrimaryRole:NO];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Terminal…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Terminal…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         // Any item that presents another controller (nested sheet, Launcher,
         // Windows, Utilities, Style chooser) must defer to the next runloop:
         // presenting synchronously from a UIAlertAction handler races this
@@ -5763,77 +5718,71 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentTerminalDockActionsFromView:sourceView];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Launcher"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Launcher"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentLauncherFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Windows"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Windows"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentIconManagerFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"New Desktop"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"New Desktop"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self createNewDesktop];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Utilities…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Utilities…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
     // Suspend to disk, one tap from the root menu. It lives in the Sessions
     // utility as well, but that is five taps deep and nobody found it -- and a
     // feature whose whole job is to be used BEFORE iOS kills the app is not
     // one to go looking for. Always offered, including when the preference is
     // off: that is the only way the menu can say the feature exists.
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Save Session"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self saveSessionFromRootMenu];
         });
-    }]];
+    }];
     BOOL autoShowKeyboard = UserPreferences.shared.autoShowKeyboard;
-    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Auto-Show Keyboard: %@", autoShowKeyboard ? @"On" : @"Off"]
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:[NSString stringWithFormat:@"Auto-Show Keyboard: %@", autoShowKeyboard ? @"On" : @"Off"]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         UserPreferences.shared.autoShowKeyboard = !autoShowKeyboard;
         // Re-present so the toggled state is reflected; see the "Terminal…"
         // handler above for why this must defer to the next runloop.
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentDesktopRootMenuFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Settings"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Settings"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolSettingsIdentifier];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Workspace Style…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Workspace Style…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentWorkspaceStyleChooserFromView:sourceView];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 // Reached by long-pressing the terminal accessory bar's 4-way arrow key in place (see
@@ -5843,44 +5792,35 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
     if (self.desktopCount <= 1)
         return;
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Switch Desktop"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Switch Desktop" message:nil];
 
     if (self.activeDesktopIndex > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Previous Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:@"Previous Desktop"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:self.activeDesktopIndex - 1];
-        }]];
+        }];
     }
     if (self.activeDesktopIndex < self.desktopCount - 1) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Next Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:@"Next Desktop"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:self.activeDesktopIndex + 1];
-        }]];
+        }];
     }
     for (NSInteger index = 0; index < self.desktopCount; index++) {
         if (index == self.activeDesktopIndex)
             continue;
         NSString *title = [NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:index];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 - (ISHWorkspaceContainedWindowView *)desktopWindowHostingTerminalUUID:(NSUUID *)terminalUUID {
@@ -7027,10 +6967,8 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
 - (void)presentUtilityGroup:(NSDictionary<NSString *, id> *)groupDescriptor fromView:(UIView *)sourceView {
     NSString *groupTitle = groupDescriptor[@"title"] ?: @"Utils";
     NSString *groupMessage = groupDescriptor[@"message"];
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:groupTitle
-                                            message:groupMessage
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:groupTitle
+                                                         message:groupMessage];
 
     for (NSDictionary<NSString *, NSString *> *descriptor in groupDescriptor[@"items"]) {
         NSString *toolIdentifier = descriptor[@"identifier"];
@@ -7042,9 +6980,9 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
         NSString *actionTitle = existingWindow != nil
             ? [NSString stringWithFormat:@"Focus %@", title]
             : [NSString stringWithFormat:@"Open %@", title];
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             if (existingWindow != nil) {
                 [self focusDesktopWindow:existingWindow];
             } else if (isDashboardDescriptor) {
@@ -7052,31 +6990,24 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
             } else {
                 [self openWorkspaceToolWithIdentifier:toolIdentifier];
             }
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
-                                              style:UIAlertActionStyleCancel
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Back"
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)presentUtilsDockActionsFromView:(UIView *)sourceView {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Utils"
-                                            message:@"Choose a utility group."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Utils"
+                                                         message:@"Choose a utility group."];
 
     for (NSDictionary<NSString *, id> *groupDescriptor in [self dockUtilityGroupDescriptors]) {
         NSString *title = groupDescriptor[@"title"] ?: @"Group";
@@ -7084,43 +7015,36 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
         NSString *actionTitle = items.count > 0
             ? [NSString stringWithFormat:@"%@ (%lu)", title, (unsigned long) items.count]
             : title;
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentUtilityGroup:groupDescriptor fromView:sourceView];
             });
-        }]];
+        }];
     }
 
     NSString *workspaceStyleTitle = ISHWorkspaceUsesModernStyle() ? @"Modern" : @"Classic";
-    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Workspace Style: %@", workspaceStyleTitle]
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:[NSString stringWithFormat:@"Workspace Style: %@", workspaceStyleTitle]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentWorkspaceStyleChooserFromView:sourceView];
         });
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)presentWorkspaceStyleChooserFromView:(UIView *)sourceView {
     UserPreferences *preferences = UserPreferences.shared;
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Workspace Style"
-                                            message:@"Pick the Classic or Modern workspace experience. Both stay available; this only changes how the desktop and its windows look and behave."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Workspace Style"
+                                                         message:@"Pick the Classic or Modern workspace experience. Both stay available; this only changes how the desktop and its windows look and behave."];
 
     NSArray<NSNumber *> *styles = @[@(WorkspaceStyleClassic), @(WorkspaceStyleModern)];
     NSDictionary<NSNumber *, NSString *> *styleTitles = @{
@@ -7132,31 +7056,26 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
         NSString *actionTitle = selected
             ? [NSString stringWithFormat:@"✓ %@", styleTitles[style]]
             : styleTitles[style];
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             preferences.workspaceStyle = (WorkspaceStyle) style.integerValue;
             // Re-skin every open window immediately. Modern currently mirrors Classic, so
             // this is a no-op visual change until the Modern skin rung lands.
             [self refreshDockButtons];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
-                                              style:UIAlertActionStyleCancel
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Back"
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)handleTerminalDockLongPress:(UILongPressGestureRecognizer *)recognizer {
@@ -7166,58 +7085,51 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
 }
 
 - (void)presentTerminalDockActionsFromView:(UIView *)sourceView {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Terminal"
-                                            message:@"Open or focus shell, console, or another active terminal."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Terminal"
+                                                         message:@"Open or focus shell, console, or another active terminal."];
 
     ISHWorkspaceContainedWindowView *primaryShellWindow = [self desktopWindowForTerminalRole:ISHWorkspaceTerminalRoleSessionShell];
     NSString *primaryActionTitle = primaryShellWindow != nil ? @"Focus Session Shell" : @"Open Session Shell";
-    [sheet addAction:[UIAlertAction actionWithTitle:primaryActionTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:primaryActionTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openTerminalHerePreferringConsole:NO];
-    }]];
+    }];
 
     ISHWorkspaceContainedWindowView *primaryConsoleWindow = [self desktopWindowForTerminalRole:ISHWorkspaceTerminalRoleSystemConsole];
     NSString *consoleActionTitle = primaryConsoleWindow != nil ? @"Focus System Console" : @"Open System Console";
-    [sheet addAction:[UIAlertAction actionWithTitle:consoleActionTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:consoleActionTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openTerminalHerePreferringConsole:YES];
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Open Another Shell Window"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Open Another Shell Window"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openDesktopTerminalHerePreferringConsole:NO
                                          reuseExisting:NO
                                        trackPrimaryRole:NO];
-    }]];
+    }];
 
     NSUUID *primaryTerminalUUID = primaryShellWindow.hostedTerminalViewController.terminal.uuid;
     for (Terminal *terminal in [Terminal activeTerminals]) {
         if (primaryTerminalUUID != nil && [terminal.uuid isEqual:primaryTerminalUUID])
             continue;
         NSString *title = [NSString stringWithFormat:@"Focus %@", ISHWorkspaceTerminalDisplayName(terminal)];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self openExistingTerminalHereWithUUID:terminal.uuid];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockTerminalButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockTerminalButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockTerminalButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)openDesktopTerminalHerePreferringConsole:(BOOL)preferConsole
@@ -12590,13 +12502,12 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 }
 
 - (void)menuTapped {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Music" message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Music…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self addMusicTapped:self->_mButton]; }); }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Playlists…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self playlistsTapped:self->_mButton]; }); }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Music" message:nil];
+    [sheet addActionWithTitle:@"Add Music…" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self addMusicTapped:self->_mButton]; }); }];
+    [sheet addActionWithTitle:@"Playlists…" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self playlistsTapped:self->_mButton]; }); }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:_mButton];
 }
 
@@ -12651,16 +12562,15 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 #pragma mark Add Music / Playlists
 
 - (void)addMusicTapped:(UIButton *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Add Music"
-        message:@"Music lives in /AOK/persist/music by default, or add tracks from any path in the guest."
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Play Music Folder" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:YES]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Music Folder to Queue" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:NO]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add from Path…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self promptAddFromPath]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Add Music"
+        message:@"Music lives in /AOK/persist/music by default, or add tracks from any path in the guest."];
+    [sheet addActionWithTitle:@"Play Music Folder" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:YES]; }];
+    [sheet addActionWithTitle:@"Add Music Folder to Queue" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:NO]; }];
+    [sheet addActionWithTitle:@"Add from Path…" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self promptAddFromPath]; }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
@@ -12697,20 +12607,19 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 }
 
 - (void)playlistsTapped:(UIButton *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Playlists" message:nil
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Save Queue as Playlist…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self promptSavePlaylist]; }]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Playlists" message:nil];
+    [sheet addActionWithTitle:@"Save Queue as Playlist…" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self promptSavePlaylist]; }];
     NSArray<NSString *> *names = [ISHAudioLibrary.sharedLibrary playlistNames];
     for (NSString *name in names) {
-        [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Play “%@”", name]
-            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { [self loadPlaylistNamed:name]; }]];
+        [sheet addActionWithTitle:[NSString stringWithFormat:@"Play “%@”", name]
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { [self loadPlaylistNamed:name]; }];
     }
     if (names.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Delete Playlist…" style:UIAlertActionStyleDestructive
-            handler:^(__unused UIAlertAction *a) { [self promptDeletePlaylistFromView:sender]; }]];
+        [sheet addActionWithTitle:@"Delete Playlist…" style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *a) { [self promptDeletePlaylistFromView:sender]; }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
@@ -12730,13 +12639,12 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 }
 
 - (void)promptDeletePlaylistFromView:(UIView *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Delete Playlist" message:nil
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Delete Playlist" message:nil];
     for (NSString *name in [ISHAudioLibrary.sharedLibrary playlistNames]) {
-        [sheet addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDestructive
-            handler:^(__unused UIAlertAction *a) { [ISHAudioLibrary.sharedLibrary deletePlaylistNamed:name]; }]];
+        [sheet addActionWithTitle:name style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *a) { [ISHAudioLibrary.sharedLibrary deletePlaylistNamed:name]; }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
@@ -12766,14 +12674,9 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)presentSheet:(UIAlertController *)sheet fromView:(UIView *)sourceView {
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView ?: self.toolContentView;
-        popover.sourceRect = sourceView ? sourceView.bounds : self.toolContentView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+- (void)presentSheet:(ISHActionSheet *)sheet fromView:(UIView *)sourceView {
+    UIView *anchor = sourceView ?: self.toolContentView;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 #pragma mark WorkspaceTextScalable
@@ -13322,15 +13225,13 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         subtitle = @"Nothing saved yet this run.";
     }
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Session"
-                                            message:subtitle
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Session"
+                                                         message:subtitle];
 
     if (enabled) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session Now"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Save Session Now"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 int err = ISHSuspendSessionSaveNow();
                 struct checkpoint_status after;
@@ -13351,22 +13252,22 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                         [presenter presentViewController:alert animated:YES completion:nil];
                 });
             });
-        }]];
+        }];
     } else {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Turn On Suspend to Disk\u2026"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Turn On Suspend to Disk\u2026"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             [UIApplication openURL:UIApplicationOpenSettingsURLString];
-        }]];
+        }];
     }
 
     // Only when there is one -- an empty "why it refused" implies something
     // went wrong when nothing did.
     if (ck.last_refusal[0] != '\0') {
         NSString *why = @(ck.last_refusal);
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Why It Was Not Saved"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Why It Was Not Saved"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             UIAlertController *alert =
                 [UIAlertController alertControllerWithTitle:@"Session not saved"
                                                     message:why
@@ -13376,15 +13277,15 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                                     handler:nil]];
             if (presenter.presentedViewController == nil)
                 [presenter presentViewController:alert animated:YES completion:nil];
-        }]];
+        }];
     }
 
     // Confirmed rather than immediate: this one quits the app, and it sits
     // next to one that does not.
     if (enabled) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Suspend and Exit"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             UIAlertController *confirm = [UIAlertController
                 alertControllerWithTitle:@"Suspend and exit?"
                                  message:@"iSH-AOK writes this session to disk and quits. "
@@ -13419,12 +13320,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                                       handler:nil]];
             if (presenter.presentedViewController == nil)
                 [presenter presentViewController:confirm animated:YES completion:nil];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"What Would Be Saved"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
+    [sheet addActionWithTitle:@"What Would Be Saved"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *a) {
         struct checkpoint_status now;
         checkpoint_get_status(&now);
         NSMutableString *body = [NSMutableString string];
@@ -13445,16 +13346,14 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                                 handler:nil]];
         if (presenter.presentedViewController == nil)
             [presenter presentViewController:alert animated:YES completion:nil];
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
     // An action sheet on iPad is a popover and needs somewhere to point.
-    sheet.popoverPresentationController.sourceView = sourceView;
-    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
-    [presenter presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:presenter sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (UIImage *)scenePreviewImageForDescriptor:(NSDictionary<NSString *, id> *)descriptor size:(CGSize)size {
@@ -14561,17 +14460,15 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     NSString *message = bookmarks.count == 0
         ? @"No bookmarks yet. Tap the star to bookmark the current page."
         : (editing ? @"Tap a bookmark to remove it." : nil);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Bookmarks"
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Bookmarks"
+                                                         message:message];
     __weak typeof(self) weakSelf = self;
     for (NSDictionary<NSString *, NSString *> *bookmark in bookmarks) {
         NSString *title = bookmark[@"title"];
         NSString *url = bookmark[@"url"];
-        [sheet addAction:[UIAlertAction actionWithTitle:title.length > 0 ? title : url
-                                                  style:editing ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title.length > 0 ? title : url
+                            style:editing ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             if (editing) {
                 ISHWorkspaceRemoveBrowserBookmarkForURL(url);
                 [weakSelf updateBookmarkButtonState];
@@ -14584,25 +14481,19 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
             } else {
                 [weakSelf loadAddressString:url inWebView:[weakSelf currentBrowserWebView]];
             }
-        }]];
+        }];
     }
     if (bookmarks.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:editing ? @"Done" : @"Edit Bookmarks…"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:editing ? @"Done" : @"Edit Bookmarks…"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf presentBookmarksListFromView:sourceView editing:!editing];
             });
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)handleTabButtonLongPress:(UILongPressGestureRecognizer *)recognizer {

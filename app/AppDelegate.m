@@ -45,6 +45,7 @@
 #include "kernel/checkpoint.h"
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
+#import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
 #include "kernel/init.h"
 #include "kernel/calls.h"
@@ -2786,12 +2787,16 @@ void ISHSessionPresentResumePicker(UIViewController *host,
     [ISHDiagnosticsStore recordBreadcrumb:@"session.resumePicker.presented"
                                   details:@{@"slots": @(slots.count),
                                             @"host": NSStringFromClass(host.class)}];
-    UIAlertController *sheet = [UIAlertController
-        alertControllerWithTitle:@"Resume a session?"
-                         message:slots.count == 1
-                                 ? @"iSH-AOK saved this session. Pick it up, or start fresh."
-                                 : @"iSH-AOK has saved sessions. Pick one up, or start fresh."
-                  preferredStyle:UIAlertControllerStyleAlert];
+    // An ISHActionSheet alert, because this one holds the boot. A Mac draws an
+    // action sheet as one row of buttons, and an alert may be drawn the same
+    // way (not checked on a Mac). Several saved sessions, each titled with a
+    // hostname, a process count and a date, would not fit in that row. So on
+    // a Mac this becomes a list that has to be answered.
+    ISHActionSheet *sheet = [ISHActionSheet
+        alertWithTitle:@"Resume a session?"
+               message:slots.count == 1
+                       ? @"iSH-AOK saved this session. Pick it up, or start fresh."
+                       : @"iSH-AOK has saved sessions. Pick one up, or start fresh."];
 
     NSDateFormatter *when = [[NSDateFormatter alloc] init];
     when.dateStyle = NSDateFormatterShortStyle;
@@ -2812,9 +2817,9 @@ void ISHSessionPresentResumePicker(UIViewController *host,
             title = [NSString stringWithFormat:@"%@ (saved by a different build)",
                      [when stringFromDate:slot[@"date"]]];
         }
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             if (!loadable) {
                 ISHSessionSetResumeChoice(nil);
                 [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
@@ -2826,20 +2831,20 @@ void ISHSessionPresentResumePicker(UIViewController *host,
             dispatch_async(dispatch_get_main_queue(), ^{
                 ISHSessionPresentResumeDisposition(host, slot, completion);
             });
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Start a New Session"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
+    [sheet addActionWithTitle:@"Start a New Session"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *a) {
         // The images are KEPT. "New session" is about this launch, not about
         // throwing away what is on disk -- deleting somebody's saved work
         // because they wanted a fresh prompt is not a thing to do quietly.
         ISHSessionSetResumeChoice(nil);
         completion(nil);
-    }]];
+    }];
 
-    [host presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:host source:nil];
 }
 
 int ISHSuspendSessionSaveNow(void) {

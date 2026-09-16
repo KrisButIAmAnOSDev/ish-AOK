@@ -36,4 +36,65 @@ NS_ASSUME_NONNULL_BEGIN
 
 @end
 
+// ISHActionSheet: a choice sheet that can still be used when AOK runs on a Mac.
+//
+// On iPhone and iPad it IS a UIAlertController. It has the same style, the same
+// actions in the same order, the same popover anchor, and is presented the same
+// way, so nothing changes there.
+//
+// A "Designed for iPad" app on an Apple Silicon Mac draws an action sheet as one
+// horizontal row: title and message on the left, then one button per action.
+// The row does not wrap or scroll. The Launcher's Add Built-in sheet (22
+// actions) ran off the right edge of the screen, and the actions past the edge
+// could not be clicked.
+//
+// So on a Mac, a sheet with more than two non-cancel actions, or with button
+// titles too long to share one row, becomes a list instead: a small table in a
+// navigation controller. It uses the sheet's title and message, and the cancel
+// action becomes a bar button with the same title. An action sheet shows the
+// list in a popover anchored where the sheet would have pointed. An alert shows
+// it as a centred form sheet. Up to two short choices stay a real alert, which
+// is the shape macOS alerts are designed for (at most three buttons, counting
+// Cancel), so short confirmations such as "Close Workspace" are unchanged.
+//
+// Picking a row dismisses the list and THEN runs the handler, passing the same
+// UIAlertAction object. Handlers can present the next controller straight
+// away, and the existing dispatch_async deferrals still work. Clicking outside
+// a popover, or the cancel button, runs the cancel action's handler, as
+// dismissing an iPad action-sheet popover does. The handler runs once at most.
+//
+// Debug override: ISH_FORCE_MAC_SHEETS=1 in the environment takes the Mac path
+// on iPhone and iPad too, so the list can be tested in the simulator:
+//     SIMCTL_CHILD_ISH_FORCE_MAC_SHEETS=1 xcrun simctl launch <device> app.ish.iSH-AOK
+@interface ISHActionSheet : NSObject
+
++ (instancetype)actionSheetWithTitle:(nullable NSString *)title message:(nullable NSString *)message;
+// UIAlertControllerStyleAlert. Only for alerts without text fields: a list has
+// nowhere to put one.
++ (instancetype)alertWithTitle:(nullable NSString *)title message:(nullable NSString *)message;
+
+// Same meaning as +[UIAlertAction actionWithTitle:style:handler:]. Returns the
+// action so a caller can still set `enabled`. The list honours it too.
+- (UIAlertAction *)addActionWithTitle:(NSString *)title
+                                style:(UIAlertActionStyle)style
+                              handler:(void (^_Nullable)(UIAlertAction *action))handler;
+
+// YES when -present... will show the list instead of the UIAlertController.
+@property (nonatomic, readonly) BOOL presentsAsList;
+
+// An action sheet points at sourceRect in sourceView. A nil sourceView points
+// at the centre of the presenter's view. An alert ignores the anchor.
+- (void)presentFromViewController:(UIViewController *)presenter
+                       sourceView:(nullable UIView *)sourceView
+                       sourceRect:(CGRect)sourceRect;
+// `source` is anchored like -anchorPopoverForAlertController:toSource:. It can be
+// a UIBarButtonItem, a UIView (its bounds), or nil (the presenter's centre).
+- (void)presentFromViewController:(UIViewController *)presenter source:(nullable id)source;
+
+@end
+
+// Whether ISHActionSheet takes its Mac path: running as an iOS app on a Mac,
+// Mac Catalyst, or ISH_FORCE_MAC_SHEETS=1.
+BOOL ISHActionSheetUsesMacPresentation(void);
+
 NS_ASSUME_NONNULL_END

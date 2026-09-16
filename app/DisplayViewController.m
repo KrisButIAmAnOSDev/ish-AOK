@@ -7,6 +7,7 @@
 #import "GuestFileBridge.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "UIViewController+Extras.h"
 #import <GameController/GameController.h>
 #include "kernel/init.h"
 #include "kernel/task.h"
@@ -806,30 +807,27 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 // under "Maximize Screen Space" (see -_updateMaximizeScreenSpaceLayout) --
 // carry them here too so they're never the ONLY way to reach those actions.
 - (void)menuPipTapped:(UIButton *)sender {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Wayland Display"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Wayland Display" message:nil];
     __weak typeof(self) weakSelf = self;
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Send Ctrl+Alt+Del"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Send Ctrl+Alt+Del"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [weakSelf sendCtrlAltDel:sender];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Paste"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Paste"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [weakSelf pasteToGuest:sender];
-    }]];
+    }];
     // Same global preference + toggle UX as WorkspaceViewController's
     // "Workspace" root menu (-presentDesktopRootMenuFromView:sourceRect:) --
     // Display mode has no other way to reach it, and without exposing it
     // here a user who turned it off in Workspace has no way back to auto-
     // focus in Wayland mode short of switching back to Workspace to flip it.
     BOOL autoShowKeyboard = UserPreferences.shared.autoShowKeyboard;
-    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Auto-Show Keyboard: %@", autoShowKeyboard ? @"On" : @"Off"]
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:[NSString stringWithFormat:@"Auto-Show Keyboard: %@", autoShowKeyboard ? @"On" : @"Off"]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         UserPreferences.shared.autoShowKeyboard = !autoShowKeyboard;
         [weakSelf _autoShowKeyboardIfAppropriate];
         // Re-present so the toggled state is reflected, matching the same
@@ -837,44 +835,39 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf menuPipTapped:sender];
         });
-    }]];
+    }];
     // GH #529: no way to dismiss the on-screen keyboard in standalone Wayland
     // mode short of leaving the session (Terminal has hideKeyboardButton for
     // exactly this; Display had nothing). resignFirstResponder is a no-op if
     // the keyboard isn't up, so this is safe to always offer rather than
     // tracking first-responder state just to conditionally hide the action.
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Hide Keyboard"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:@"Hide Keyboard"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [weakSelf.displayView resignFirstResponder];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Open Workspace…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Open Workspace…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [weakSelf switchToWorkspace:sender];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Settings"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Settings"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         // Form sheet: dismissable by swipe-down, so Settings can't strand the
         // session (the About screen has no Done button of its own when it
         // isn't hosted in a Workspace window).
         UINavigationController *settings = ISHCreateAboutNavigationController(NO, NO);
         settings.modalPresentationStyle = UIModalPresentationFormSheet;
         [weakSelf presentViewController:settings animated:YES completion:nil];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Reconnect"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:@"Reconnect"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [weakSelf reconnect:sender];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sender;
-        popover.sourceRect = sender.bounds;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    }];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sender sourceRect:sender.bounds];
 }
 
 // Standalone (startup-mode) escape hatch: swap the scene's root over to the

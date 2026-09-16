@@ -3220,11 +3220,10 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
 // URL and model are filled in; an API key, if the provider needs one, is
 // prompted for right here so nothing has to go through Settings.
 - (void)addDestinationFromPreset {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Add Destination"
-                                                                  message:@"Pick a provider preset. Server URL, model and key stay editable in Settings."
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Add Destination"
+                                                         message:@"Pick a provider preset. Server URL, model and key stay editable in Settings."];
     for (NSDictionary<NSString *, NSString *> *preset in ISHLLMProviderPresets()) {
-        [alert addAction:[UIAlertAction actionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             NSDictionary<NSString *, NSString *> *destination = @{
                 kISHLLMDestinationID: NSUUID.UUID.UUIDString,
                 kISHLLMDestinationName: preset[@"name"] ?: @"Destination",
@@ -3239,11 +3238,10 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
             [self switchToDestinationWithID:destination[kISHLLMDestinationID]];
             if (ISHLLMProviderRequiresAPIKey() && ![self isBusy])
                 [self promptForAPIKeyForNewDestination:destination];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:_destinationButton];
-    [[self ish_presentationViewController] presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:[self ish_presentationViewController] source:_destinationButton];
 }
 
 - (void)promptForAPIKeyForNewDestination:(NSDictionary<NSString *, NSString *> *)destination {
@@ -3373,26 +3371,24 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
 - (void)showExtractActions:(id)sender {
     NSArray<NSDictionary<NSString *, NSString *> *> *blocks = [self extractCodeBlocksFromText:self.latestAssistantMessage];
     NSString *savePath = @"/AOK/persist/llm-extracts";
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Save From Chat"
-                                                                   message:blocks.count > 0 ? [@"Save destination: " stringByAppendingString:savePath] : [@"No fenced code blocks found in the last reply. Text in the transcript can be highlighted and copied directly, and each code block has its own Copy button. Save destination: " stringByAppendingString:savePath]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Save From Chat"
+                                                         message:blocks.count > 0 ? [@"Save destination: " stringByAppendingString:savePath] : [@"No fenced code blocks found in the last reply. Text in the transcript can be highlighted and copied directly, and each code block has its own Copy button. Save destination: " stringByAppendingString:savePath]];
     for (NSUInteger i = 0; i < blocks.count; i++) {
         NSDictionary<NSString *, NSString *> *block = blocks[i];
         NSString *language = block[@"language"].length > 0 ? block[@"language"] : @"text";
         NSString *title = [NSString stringWithFormat:@"Save block %lu (%@)", (unsigned long) i + 1, language];
-        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [self saveCodeBlock:block index:i + 1];
-        }]];
+        }];
     }
     if (blocks.count > 1) {
-        [alert addAction:[UIAlertAction actionWithTitle:@"Save All Blocks" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:@"Save All Blocks" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             for (NSUInteger i = 0; i < blocks.count; i++)
                 [self saveCodeBlock:blocks[i] index:i + 1];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)saveCodeBlock:(NSDictionary<NSString *, NSString *> *)block index:(NSUInteger)index {
@@ -3424,53 +3420,51 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
 }
 
 - (void)showPromptActions:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Prompt Actions" message:@"Use terminal context or saved prompt templates." preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Prompt Actions" message:@"Use terminal context or saved prompt templates."];
     NSArray<NSDictionary<NSString *, NSString *> *> *actions = @[
         @{@"title": @"Explain terminal output", @"instruction": @"Explain the important details in this terminal output. If there is an error, identify the likely cause."},
         @{@"title": @"Suggest fix for error", @"instruction": @"Find the most likely error in this terminal output and suggest concrete commands or edits to fix it."},
         @{@"title": @"Draft shell command", @"instruction": @"Based on this terminal context, draft the next safe shell command. Explain briefly before the command."},
     ];
     for (NSDictionary<NSString *, NSString *> *descriptor in actions) {
-        [alert addAction:[UIAlertAction actionWithTitle:descriptor[@"title"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:descriptor[@"title"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [self setPromptFieldText:[self terminalContextPromptWithInstruction:descriptor[@"instruction"]]];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Load Prompt Template" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:@"Load Prompt Template" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self showPromptTemplatePickerFromSender:sender];
-    }]];
+    }];
     // Saving code out of the last reply used to have its own toolbar button;
     // the toolbar now spends two of its four slots on the chat and the
     // destination, so it lives here.
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save From Chat…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:@"Save From Chat…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self showExtractActions:sender];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    }];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)showPromptTemplatePickerFromSender:(id)sender {
     NSURL *templatesURL = [ISHLLMPersistDirectoryURL() URLByAppendingPathComponent:@"llm-prompts" isDirectory:YES];
     [NSFileManager.defaultManager createDirectoryAtURL:templatesURL withIntermediateDirectories:YES attributes:nil error:nil];
     NSArray<NSURL *> *files = [NSFileManager.defaultManager contentsOfDirectoryAtURL:templatesURL includingPropertiesForKeys:nil options:0 error:nil];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Prompt Templates" message:@"Templates are text files in /AOK/persist/llm-prompts." preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Prompt Templates" message:@"Templates are text files in /AOK/persist/llm-prompts."];
     for (NSURL *fileURL in files) {
         if (fileURL.lastPathComponent.length == 0)
             continue;
-        [alert addAction:[UIAlertAction actionWithTitle:fileURL.lastPathComponent style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:fileURL.lastPathComponent style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             NSString *template = [NSString stringWithContentsOfURL:fileURL encoding:NSUTF8StringEncoding error:nil];
             if (template.length > 0)
                 [self setPromptFieldText:template];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Create Examples" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:@"Create Examples" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [@"Review this code for correctness, portability, and security.\n\n```\nPASTE_CODE_HERE\n```\n" writeToURL:[templatesURL URLByAppendingPathComponent:@"code-review.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [@"Turn this into a robust shell script with error handling:\n\n" writeToURL:[templatesURL URLByAppendingPathComponent:@"make-script.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [self appendRole:@"assistant" content:@"Created example prompt templates in /AOK/persist/llm-prompts."];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    }];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)appendRole:(NSString *)role content:(NSString *)content {
@@ -5343,62 +5337,53 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
 // Preset pickers for the shell-tool limits. Action sheets need a popover anchor
 // on iPad, so both take the tapped cell as the source view.
 - (void)pickToolTimeoutFromView:(UIView *)sourceView {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Command Timeout"
-        message:@"A command that runs longer than this is killed and its partial output is returned to the model."
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Command Timeout"
+        message:@"A command that runs longer than this is killed and its partial output is returned to the model."];
     NSInteger current = ISHLLMToolTimeoutSeconds();
     for (NSNumber *choice in @[@15, @30, @60, @120, @300, @600, @900]) {
         NSInteger seconds = choice.integerValue;
         NSString *title = ISHLLMToolTimeoutTitle(seconds);
         if (seconds == current)
             title = [title stringByAppendingString:@" ✓"];
-        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             UserPreferences.shared.llmToolTimeoutSeconds = seconds;
             [self.tableView reloadData];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = sourceView;
-    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)pickToolOutputLimitFromView:(UIView *)sourceView {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Output Limit"
-        message:@"Command output beyond this is truncated before being returned to the model. Larger limits use more of the model's context window."
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Output Limit"
+        message:@"Command output beyond this is truncated before being returned to the model. Larger limits use more of the model's context window."];
     NSInteger current = ISHLLMToolOutputLimitKB();
     for (NSNumber *choice in @[@16, @64, @128, @256]) {
         NSInteger kb = choice.integerValue;
         NSString *title = [NSString stringWithFormat:@"%ld KB%@", (long) kb, kb == current ? @" ✓" : @""];
-        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             UserPreferences.shared.llmToolOutputLimitKB = kb;
             [self.tableView reloadData];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = sourceView;
-    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)pickToolMaxRoundsFromView:(UIView *)sourceView {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Tool Call Rounds"
-        message:@"A model reply that keeps calling tools without giving a final answer is stopped after this many rounds in a row, so a stuck model can't loop forever. Each round is one request to the model, so higher values let longer multi-step tasks (installing something, then using it) finish without you having to nudge it to continue."
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Tool Call Rounds"
+        message:@"A model reply that keeps calling tools without giving a final answer is stopped after this many rounds in a row, so a stuck model can't loop forever. Each round is one request to the model, so higher values let longer multi-step tasks (installing something, then using it) finish without you having to nudge it to continue."];
     NSInteger current = ISHLLMToolMaxRounds();
     for (NSNumber *choice in @[@6, @10, @15, @20, @30, @50]) {
         NSInteger rounds = choice.integerValue;
         NSString *title = [NSString stringWithFormat:@"%ld%@", (long) rounds, rounds == current ? @" ✓" : @""];
-        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             UserPreferences.shared.llmToolMaxRounds = rounds;
             [self.tableView reloadData];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = sourceView;
-    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (NSArray<NSString *> *)modelIdentifiersFromResponseData:(NSData *)data {
@@ -5415,27 +5400,25 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
         [self showConnectionResult:message title:@"Model Query Failed"];
         return;
     }
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Choose Model"
-                                                                   message:[NSString stringWithFormat:@"%lu models returned by %@", (unsigned long) models.count, ISHLLMModelsEndpoint()]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Choose Model"
+                                                         message:[NSString stringWithFormat:@"%lu models returned by %@", (unsigned long) models.count, ISHLLMModelsEndpoint()]];
     NSUInteger limit = MIN(models.count, 80);
     for (NSUInteger i = 0; i < limit; i++) {
         NSString *model = models[i];
         NSString *title = [model isEqualToString:UserPreferences.shared.llmModel] ? [model stringByAppendingString:@"  Current"] : model;
-        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             UserPreferences.shared.llmModel = model;
             ISHLLMSyncActiveDestinationFromPreferences();
             [self.tableView reloadData];
-        }]];
+        }];
     }
     if (models.count > limit) {
-        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Showing first %lu of %lu", (unsigned long) limit, (unsigned long) models.count]
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
+        [alert addActionWithTitle:[NSString stringWithFormat:@"Showing first %lu of %lu", (unsigned long) limit, (unsigned long) models.count]
+                            style:UIAlertActionStyleDefault
+                          handler:nil];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sourceView];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sourceView];
 }
 
 - (void)queryAvailableModelsFromView:(UIView *)sourceView {
@@ -5908,9 +5891,9 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 }
 
 - (void)pickPresetFromView:(UIView *)sourceView {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Provider" message:@"Fills in the server URL and a default model." preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Provider" message:@"Fills in the server URL and a default model."];
     for (NSDictionary<NSString *, NSString *> *preset in ISHLLMProviderPresets()) {
-        [alert addAction:[UIAlertAction actionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             NSMutableDictionary<NSString *, NSString *> *updated = [self.destination mutableCopy];
             NSString *previousProvider = ISHLLMStringValue(updated, kISHLLMDestinationProvider);
             updated[kISHLLMDestinationProvider] = preset[@"name"] ?: @"Custom";
@@ -5923,11 +5906,10 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
             if (name.length == 0 || [name isEqualToString:previousProvider])
                 updated[kISHLLMDestinationName] = updated[kISHLLMDestinationProvider];
             [self commitDestination:updated];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sourceView];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sourceView];
 }
 
 - (void)commitDestination:(NSDictionary<NSString *, NSString *> *)destination {
@@ -5985,9 +5967,9 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 }
 
 - (void)addDestination:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Add Destination" message:@"Start from a provider preset." preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Add Destination" message:@"Start from a provider preset."];
     for (NSDictionary<NSString *, NSString *> *preset in ISHLLMProviderPresets()) {
-        [alert addAction:[UIAlertAction actionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:preset[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             NSDictionary<NSString *, NSString *> *destination = @{
                 kISHLLMDestinationID: NSUUID.UUID.UUIDString,
                 kISHLLMDestinationName: preset[@"name"] ?: @"Destination",
@@ -6000,11 +5982,10 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
             [self reload];
             [self notifyChanged];
             [self editDestination:destination]; // straight into the editor for the key
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self anchorPopoverForAlertController:alert toSource:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)editDestination:(NSDictionary<NSString *, NSString *> *)destination {
@@ -6419,10 +6400,8 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 }
 
 - (void)_showInitialWindowPickerFromCell:(UITableViewCell *)cell {
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Startup Mode"
-                                            message:@"Choose whether new app launches open the Workspace, the Wayland Display, show a filesystem chooser, or open a terminal."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Startup Mode"
+                                                         message:@"Choose whether new app launches open the Workspace, the Wayland Display, show a filesystem chooser, or open a terminal."];
 
     NSString *currentValue = [self _initialWindowPreferenceValue];
     NSString *workspaceTitle = [currentValue isEqualToString:ISHInitialWindowWorkspaceValue]
@@ -6441,41 +6420,36 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
         ? @"Session Shell (pts/1)  Current"
         : @"Session Shell (pts/1)";
 
-    [alert addAction:[UIAlertAction actionWithTitle:workspaceTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:workspaceTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self _setInitialWindowPreferenceValue:ISHInitialWindowWorkspaceValue];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:waylandTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [alert addActionWithTitle:waylandTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self _setInitialWindowPreferenceValue:ISHInitialWindowWaylandValue];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:chooseFilesystemTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [alert addActionWithTitle:chooseFilesystemTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self _setInitialWindowPreferenceValue:ISHInitialWindowChooseFilesystemValue];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:terminalTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [alert addActionWithTitle:terminalTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self _setInitialWindowPreferenceValue:@"terminal"];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:sessionTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [alert addActionWithTitle:sessionTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self _setInitialWindowPreferenceValue:@"session-shell"];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    }];
+    [alert addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    UIPopoverPresentationController *popover = alert.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = cell;
-        popover.sourceRect = cell.bounds;
-    }
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert presentFromViewController:self sourceView:cell sourceRect:cell.bounds];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {

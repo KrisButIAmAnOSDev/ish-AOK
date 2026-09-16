@@ -1110,32 +1110,29 @@ static const CGFloat kFindBarHeight = 44;
         subtitle = @"Nothing saved yet this run.";
     }
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Session"
-                                            message:subtitle
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Session" message:subtitle];
 
     if (enabled) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Save Session Now"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Save Session Now"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             [self saveSessionFromBar:nil];
-        }]];
+        }];
     } else {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Turn On Suspend to Disk…"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Turn On Suspend to Disk…"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             [UIApplication openURL:UIApplicationOpenSettingsURLString];
-        }]];
+        }];
     }
 
     // Only when there is one. An empty "why it refused" is worse than no entry,
     // because it implies something went wrong when nothing did.
     if (ck.last_refusal[0] != '\0') {
         NSString *why = [NSString stringWithUTF8String:ck.last_refusal];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Why It Was Not Saved"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Why It Was Not Saved"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             UIAlertController *alert =
                 [UIAlertController alertControllerWithTitle:@"Session not saved"
                                                     message:why
@@ -1145,16 +1142,16 @@ static const CGFloat kFindBarHeight = 44;
                                                     handler:nil]];
             if (self.presentedViewController == nil)
                 [self presentViewController:alert animated:YES completion:nil];
-        }]];
+        }];
     }
 
     // Separate from "Save Session Now" because the outcome is different in the
     // way that matters: the app goes away. Confirmed rather than immediate --
     // the two entries sit next to each other and one of them quits.
     if (enabled) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Suspend and Exit"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *a) {
+        [sheet addActionWithTitle:@"Suspend and Exit"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
             UIAlertController *confirm = [UIAlertController
                 alertControllerWithTitle:@"Suspend and exit?"
                                  message:@"iSH-AOK writes this session to disk and quits. "
@@ -1188,12 +1185,12 @@ static const CGFloat kFindBarHeight = 44;
                                                       handler:nil]];
             if (self.presentedViewController == nil)
                 [self presentViewController:confirm animated:YES completion:nil];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"What Would Be Saved"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
+    [sheet addActionWithTitle:@"What Would Be Saved"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *a) {
         struct checkpoint_status now;
         checkpoint_get_status(&now);
         NSMutableString *body = [NSMutableString string];
@@ -1215,17 +1212,15 @@ static const CGFloat kFindBarHeight = 44;
                                                 handler:nil]];
         if (self.presentedViewController == nil)
             [self presentViewController:alert animated:YES completion:nil];
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
     // An action sheet on iPad is a popover and needs somewhere to point.
-    sheet.popoverPresentationController.sourceView = sourceView;
-    sheet.popoverPresentationController.sourceRect = sourceView.bounds;
     if (self.presentedViewController == nil)
-        [self presentViewController:sheet animated:YES completion:nil];
+        [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 // Command-S, arriving up the responder chain from TerminalView. Same save as
@@ -2413,21 +2408,19 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     if (sourceView == nil)
         sourceView = self.infoButton;
 
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Switch Terminal"
-                                            message:@"Boot via init creates both a session shell and system consoles."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Switch Terminal"
+                                                         message:@"Boot via init creates both a session shell and system consoles."];
 
     Terminal *sessionTerminal = self.sessionTerminal;
     if (sessionTerminal != nil) {
         NSString *title = (self.terminal == sessionTerminal)
             ? [[self terminalDisplayName:sessionTerminal] stringByAppendingString:@" (Current)"]
             : [self terminalDisplayName:sessionTerminal];
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             self.terminal = sessionTerminal;
-        }]];
+        }];
     }
 
     Terminal *consoleTerminal = [self currentConsoleTerminal];
@@ -2435,11 +2428,11 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
         NSString *title = [self.terminal.uuid isEqual:consoleTerminal.uuid]
             ? [[self terminalDisplayName:consoleTerminal] stringByAppendingString:@" (Current)"]
             : [self terminalDisplayName:consoleTerminal];
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             self.terminal = consoleTerminal;
-        }]];
+        }];
     }
 
     for (int i = 1; i <= 7; i++) {
@@ -2447,52 +2440,47 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
         NSString *title = [self.terminal.uuid isEqual:console.uuid]
             ? [[self terminalDisplayName:console] stringByAppendingString:@" (Current)"]
             : [self terminalDisplayName:console];
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             self.terminal = console;
-        }]];
+        }];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Find in Scrollback…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:@"Find in Scrollback…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self showFindBar:nil];
-    }]];
+    }];
 
     if (ISHLLMClientEnabled()) {
-        [alert addAction:[UIAlertAction actionWithTitle:@"LLM Chat"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:@"LLM Chat"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewController()];
             [self presentViewController:navigationController animated:YES completion:nil];
-        }]];
+        }];
         NSString *terminalContext = Terminal_debugReadRows(self.terminal.type, self.terminal.number, 80) ?: @"";
-        [alert addAction:[UIAlertAction actionWithTitle:@"LLM: Explain Current Terminal"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:@"LLM: Explain Current Terminal"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             NSString *prompt = [NSString stringWithFormat:@"Explain the important details in this terminal output. If there is an error, identify the likely cause.\n\nTerminal output:\n```text\n%@\n```", terminalContext];
             UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewControllerWithInitialPrompt(prompt)];
             [self presentViewController:navigationController animated:YES completion:nil];
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"LLM: Suggest Fix"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        }];
+        [alert addActionWithTitle:@"LLM: Suggest Fix"
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             NSString *prompt = [NSString stringWithFormat:@"Find the most likely error in this terminal output and suggest concrete commands or edits to fix it.\n\nTerminal output:\n```text\n%@\n```", terminalContext];
             UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewControllerWithInitialPrompt(prompt)];
             [self presentViewController:navigationController animated:YES completion:nil];
-        }]];
+        }];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    UIPopoverPresentationController *popover = alert.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-    }
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
+    [alert presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)resizeBar {

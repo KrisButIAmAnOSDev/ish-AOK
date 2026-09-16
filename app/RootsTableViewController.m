@@ -251,21 +251,6 @@
     });
 }
 
-- (void)_configurePopoverForAlert:(UIAlertController *)alert sender:(id)sender {
-    UIPopoverPresentationController *popover = alert.popoverPresentationController;
-    if (popover != nil) {
-        if ([sender isKindOfClass:UIBarButtonItem.class]) {
-            popover.barButtonItem = sender;
-        } else if ([sender isKindOfClass:UIView.class]) {
-            popover.sourceView = sender;
-            popover.sourceRect = ((UIView *) sender).bounds;
-        } else {
-            popover.sourceView = self.view;
-            popover.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
-        }
-    }
-}
-
 // One-line label for an architecture variant when offering it as a sub-choice
 // under a distro-family row -- distinct from _bundledChoiceSubtitle, which is
 // a full sentence used under a single-variant family's own row.
@@ -301,29 +286,24 @@
         return;
     }
 
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:group[@"displayName"]
-                                             message:@"Choose an architecture."
-                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:group[@"displayName"]
+                                                         message:@"Choose an architecture."];
     for (NSDictionary<NSString *, NSString *> *choice in variants) {
-        [alert addAction:[UIAlertAction actionWithTitle:[self _archChoiceActionTitle:choice]
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:[self _archChoiceActionTitle:choice]
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self _confirmBundledImportChoiceIfNeeded:choice];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    [self _configurePopoverForAlert:alert sender:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)presentImportOptionsFromSender:(id)sender {
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Import Filesystem"
-                                            message:@"Choose a distribution or import a root archive from Files."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:@"Import Filesystem"
+                                                         message:@"Choose a distribution or import a root archive from Files."];
 
     NSArray<NSDictionary<NSString *, id> *> *groups =
         [self.officialFamilyGroups arrayByAddingObjectsFromArray:self.communityFamilyGroups];
@@ -332,16 +312,16 @@
         NSString *title = [group[@"tier"] isEqualToString:@"community"]
             ? [NSString stringWithFormat:@"%@ (Community)", displayName]
             : displayName;
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self _chooseArchitectureForGroup:group sender:sender];
-        }]];
+        }];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Browse Files…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:@"Browse Files…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
                                                   initWithDocumentTypes:@[@"public.tar-archive", @"org.gnu.gnu-zip-archive", @"public.bzip2-archive"]
                                                   inMode:UIDocumentPickerModeImport];
@@ -350,14 +330,13 @@
             picker.shouldShowFileExtensions = YES;
         }
         picker.delegate = self;
-    }]];
+    }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [alert addActionWithTitle:@"Cancel"
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    [self _configurePopoverForAlert:alert sender:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)updateEmptyState {
