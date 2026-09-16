@@ -845,6 +845,22 @@ static void deliver_signal_to_group_locked(struct sighand *sighand, int sig, str
     for (size_t i = 0; i < count; i++) {
         struct task *task = members[i];
         signalfd_wakeup_task(task, sig);
+        // Only a member that can TAKE the signal may be woken. The wake marks
+        // the member's wait interrupted -- wake_waiting_task stores through
+        // waiting_interrupt_flag, signal_note_interrupted sets wait_interrupted
+        // -- and futex(FUTEX_WAIT*) and rt_sigtimedwait turn that mark straight
+        // into a guest-visible EINTR without asking whether anything is
+        // deliverable to that thread. Linux never picks a thread that blocks
+        // the signal (complete_signal/wants_signal), so such a thread must
+        // never see EINTR for it: foot's render workers block every signal and
+        // park in an unchecked sem_wait(), and one child's SIGCHLD EINTR'd all
+        // of them into popping an empty work queue (SIGSEGV at 0x8). Skipping
+        // them loses nothing: the signal stays in sighand->pending and is taken
+        // when some thread unblocks it, and a sigwaitinfo waiter is kept by
+        // ~waiting. Same test as deliver_signal_unlocked_locked's.
+        if (sigset_has(task_wake_blocked(task) & ~task->waiting, sig) &&
+                signal_is_blockable(sig) && !signal_is_synchronous_trap(sig))
+            continue;
         bool interrupted_wait = signal_wake_task(task, sighand, sig);
         signal_note_interrupted(task, sighand, sig, interrupted_wait);
     }
