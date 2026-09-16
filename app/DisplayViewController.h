@@ -27,4 +27,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @end
 
+// The desktop size the applet asks the compositor for, given the size of the
+// surface that shows it, in points (#483). One desktop pixel per point,
+// scaled up uniformly so the short side is at least 480 and down so the long
+// side is at most 2560 (the ceiling wins when both apply), then rounded to
+// even dimensions. CGSizeZero for a surface under 1pt on either side.
+CGSize DisplayDesktopSizeForViewSize(CGSize viewSize);
+
 NS_ASSUME_NONNULL_END

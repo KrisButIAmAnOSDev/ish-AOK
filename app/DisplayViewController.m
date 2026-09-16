@@ -48,6 +48,33 @@ static NSArray<NSString *> *DisplayGuestSessionCommand(void) {
 }
 static const NSTimeInterval DisplayReadyTimeout = 45.0;
 
+// Desktop size policy, see DisplayDesktopSizeForViewSize in the header.
+static const CGFloat DisplayDesktopMinimumShortSide = 480.0;
+static const CGFloat DisplayDesktopMaximumLongSide = 2560.0;
+static const NSTimeInterval DisplayDesktopResizeSettleDelay = 0.4;
+
+CGSize DisplayDesktopSizeForViewSize(CGSize viewSize) {
+    CGFloat width = viewSize.width;
+    CGFloat height = viewSize.height;
+    if (!(width >= 1.0) || !(height >= 1.0)) // also turns away NaN
+        return CGSizeZero;
+    CGFloat shortSide = MIN(width, height);
+    CGFloat longSide = MAX(width, height);
+    // One desktop pixel per point: labwc's text and window chrome come out the
+    // size of the app's own. The same scale on both axes keeps the shape.
+    CGFloat scale = 1.0;
+    if (shortSide * scale < DisplayDesktopMinimumShortSide)
+        scale = DisplayDesktopMinimumShortSide / shortSide;
+    // The ceiling wins over the floor: an extreme strip of a window gets a
+    // short side under the floor rather than a long side past the ceiling.
+    if (longSide * scale > DisplayDesktopMaximumLongSide)
+        scale = DisplayDesktopMaximumLongSide / longSide;
+    // Even dimensions, which video modes and encoders commonly expect.
+    CGFloat desktopWidth = MAX(2.0, 2.0 * round(width * scale / 2.0));
+    CGFloat desktopHeight = MAX(2.0, 2.0 * round(height * scale / 2.0));
+    return CGSizeMake(desktopWidth, desktopHeight);
+}
+
 typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     DisplayConnectionStateIdle,
     DisplayConnectionStateStartingGuestSession,
@@ -112,6 +139,13 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     BOOL _reconnectPendingAfterTeardown;
 
     DisplayRFBClient *_Nullable _rfbClient;
+    // YES once _rfbClient has reported connecting. _state goes Connected
+    // optimistically before that, and a SetDesktopSize sent earlier is dropped.
+    BOOL _rfbClientConnected;
+    // The desktop size last asked of the current connection (zero: none yet),
+    // and the display surface size -viewDidLayoutSubviews last saw.
+    CGSize _requestedDesktopSize;
+    CGSize _lastDisplaySize;
     DisplayConnectionState _state;
     NSDate *_Nullable _readyPollDeadline;
     BOOL _startedOnce;
@@ -170,6 +204,17 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     ]];
     [constraints addObject:
         [_statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_pasteButton.leadingAnchor constant:-6.0]];
+    // ...but only as tall as that. "At least 22" on its own left the pill's
+    // height ambiguous against the display below it, which is pinned between
+    // the pill and the bottom edge and has no height of its own. Auto Layout was
+    // free to split the space either way, and in the standalone Wayland Display
+    // mode it gave the pill everything: a full-window pill with the status
+    // centred in it and a display 0pt tall (measured in the simulator, both
+    // views reporting hasAmbiguousLayout). A zero-height display also leaves
+    // nothing to size the desktop from.
+    NSLayoutConstraint *compactToolbar = [_toolbarCard.heightAnchor constraintEqualToConstant:22.0];
+    compactToolbar.priority = UILayoutPriorityDefaultLow;
+    [constraints addObject:compactToolbar];
     [NSLayoutConstraint activateConstraints:constraints];
 
     // Standalone (startup-mode) only: the same lower-right "Workspace menu"
@@ -446,27 +491,49 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     [coordinator animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
         if (self->_displayView.isFirstResponder)
             [self->_displayView reloadInputViews];
-        [self _requestDesktopSizeForViewSize:size];
+        [self _scheduleDesktopSizeRequest];
     }];
 }
 
-// Per-orientation compositor resolution (docs/wayland_rotation_resize_plan.md):
-// instead of stretching the landscape-shaped canvas into a portrait viewport,
-// ask the server to resize its actual output to match the orientation --
-// wayvnc forwards SetDesktopSize to labwc via wlr-output-management on
-// headless outputs, and the maximized windows reflow (all verified live
-// on-device before this was built). Fixed 1280x720 <-> 720x1280 pair rather
-// than deriving from the exact view aspect: it matches the wlroots headless
-// default area, and a stable, predictable pair beats a slightly-truer aspect
-// that changes with every device model. Standalone mode only: the windowed
-// Workspace applet's canvas follows a user-resizable window, where a fixed
-// per-orientation size makes no sense. Harmless when unsupported
-// server-side: no confirmation rect ever arrives and everything stays as-is.
-- (void)_requestDesktopSizeForViewSize:(CGSize)size {
-    if (!self.standaloneMode || _rfbClient == nil)
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // A Workspace window being resized, the toolbar collapsing for Maximize
+    // Screen Space, a rotation: anything that changes the display surface's
+    // size. Only an actual change schedules anything.
+    if (_displayView != nil && !CGSizeEqualToSize(_displayView.bounds.size, _lastDisplaySize)) {
+        _lastDisplaySize = _displayView.bounds.size;
+        [self _scheduleDesktopSizeRequest];
+    }
+}
+
+// Waits for the size to settle before asking: dragging a Workspace window's
+// resize handle lays this out on every frame, and each request makes labwc
+// reconfigure its output and redraw at the new size.
+- (void)_scheduleDesktopSizeRequest {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_requestDesktopSizeForDisplay) object:nil];
+    [self performSelector:@selector(_requestDesktopSizeForDisplay) withObject:nil afterDelay:DisplayDesktopResizeSettleDelay];
+}
+
+// The desktop is as big as the surface showing it (#483). It used to be a
+// fixed 1280x720 or 720x1280 chosen by orientation, and only in standalone
+// mode; DisplayRFBView stretches the framebuffer over the whole view, so any
+// other shape was drawn distorted -- a portrait phone window squeezed a
+// landscape desktop into it (#482) -- and resizing the window changed nothing.
+//
+// wayvnc forwards SetDesktopSize to labwc's headless output
+// (docs/wayland_rotation_resize_plan.md, verified on-device for the fixed
+// pair). The request is advisory: a server that refuses or ignores it sends
+// no new size and the client keeps drawing the old one, stretched, exactly as
+// before. Each size is asked for once per connection, so a refusal is not
+// retried on every layout pass.
+- (void)_requestDesktopSizeForDisplay {
+    if (_rfbClient == nil || !_rfbClientConnected || _displayView == nil)
         return;
-    BOOL landscape = size.width >= size.height;
-    [_rfbClient requestDesktopSizeWidth:(landscape ? 1280 : 720) height:(landscape ? 720 : 1280)];
+    CGSize desktopSize = DisplayDesktopSizeForViewSize(_displayView.bounds.size);
+    if (CGSizeEqualToSize(desktopSize, CGSizeZero) || CGSizeEqualToSize(desktopSize, _requestedDesktopSize))
+        return;
+    _requestedDesktopSize = desktopSize;
+    [_rfbClient requestDesktopSizeWidth:(uint16_t) desktopSize.width height:(uint16_t) desktopSize.height];
 }
 
 - (void)dealloc {
@@ -659,6 +726,8 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 - (void)connectRFBToGuestPort:(uint16_t)guestPort {
     _state = DisplayConnectionStateConnected; // optimistic; refined by DisplayRFBClientDelegate callbacks
     _statusLabel.text = @"Connecting to compositor…";
+    _rfbClientConnected = NO;
+    _requestedDesktopSize = CGSizeZero;
     _rfbClient = [DisplayRFBClient new];
     _rfbClient.delegate = self;
     [_rfbClient connectToGuestPort:guestPort];
@@ -667,6 +736,7 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 - (void)teardownSession {
     [_rfbClient disconnect];
     _rfbClient = nil;
+    _rfbClientConnected = NO;
     _displayView.rfbClient = nil;
     Terminal *terminal = _sessionTerminal;
     _sessionTerminal = nil;
@@ -699,6 +769,7 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     _sessionTerminal = nil; // the kernel already tore this down; don't double-destroy it
     [_rfbClient disconnect];
     _rfbClient = nil;
+    _rfbClientConnected = NO;
     _displayView.rfbClient = nil;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -957,11 +1028,15 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     _statusLabel.text = @"Connected";
     _statusLabel.numberOfLines = 1;
     _reconnectButton.hidden = YES;
-    // The session always starts at the compositor's landscape default; if
-    // the app launched (or reconnected) while the device is in portrait,
-    // bring the output in line with the current orientation right away
-    // rather than waiting for the next physical rotation.
-    [self _requestDesktopSizeForViewSize:self.view.bounds.size];
+    // The session always starts at the compositor's 1280x720 headless
+    // default; bring it to the size of the surface showing it right away
+    // rather than waiting for the next resize. -displayView may have only just
+    // been created above, so lay it out first.
+    _rfbClientConnected = YES;
+    _requestedDesktopSize = CGSizeZero;
+    [self.view layoutIfNeeded];
+    _lastDisplaySize = _displayView.bounds.size;
+    [self _requestDesktopSizeForDisplay];
     [self _autoShowKeyboardIfAppropriate];
 }
 
