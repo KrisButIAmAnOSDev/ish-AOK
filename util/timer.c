@@ -25,13 +25,19 @@ void timer_set_clock_source(struct timer *timer, timer_clock_fn fn, void *data) 
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data) {
 //    assert(clockid == CLOCK_MONOTONIC || clockid == CLOCK_REALTIME);
-    struct timer *timer = malloc(sizeof(struct timer));
+    // calloc, not malloc: every field this function does not name must start
+    // zeroed. clock_now was added without an init here, and on iOS 15, whose
+    // allocator hands back dirty memory, the first alarm() called through a
+    // garbage pointer (#595).
+    struct timer *timer = calloc(1, sizeof(struct timer));
     timer->clockid = clockid;
     timer->start = (struct timespec) {};
     timer->end = (struct timespec) {};
     timer->interval = (struct timespec) {};
     timer->callback = callback;
     timer->data = data;
+    timer->clock_now = NULL;
+    timer->clock_data = NULL;
     timer->active = false;
     timer->thread_running = false;
     timer->generation = 0;
