@@ -776,17 +776,37 @@ int realfs_readdir(struct fd *fd, struct dir_entry *entry) {
     int err = realfs_opendir(fd);
     if (err < 0)
         return err;
-    errno = 0;
-    struct dirent *dirent = readdir(fd->dir);
-    if (dirent == NULL) {
-        if (errno != 0)
-            return errno_map();
-        else
-            return 0;
-    }
+    // A host name can be longer than the guest's NAME_MAX: APFS counts its
+    // 255 in UTF-16 units, so a non-ASCII name runs to 765 bytes. It is
+    // passed through whole, as Linux does for any name shorter than PATH_MAX,
+    // and entry->name has room for every name a Darwin readdir returns (see
+    // struct dir_entry). This used to be a strcpy into 256 bytes, which
+    // smashed the getdents stack frame and aborted the whole emulator.
+    //
+    // The copy is still bounded, and a name that does not fit is skipped.
+    // That is a last resort for a Linux host, whose readdir can return a name
+    // of up to PATH_MAX; it never happens on Darwin. Cutting the name short
+    // would name a different file (255 bytes of a 765-byte name can be
+    // another file's whole name), and an error would hide the rest of the
+    // directory. The bound is a memchr rather than a strnlen because GCC
+    // warns about a strnlen bound longer than the 256 bytes a Linux libc
+    // declares for d_name, although its readdir returns the whole name.
+    struct dirent *dirent;
+    const char *name_end;
+    do {
+        errno = 0;
+        dirent = readdir(fd->dir);
+        if (dirent == NULL) {
+            if (errno != 0)
+                return errno_map();
+            else
+                return 0;
+        }
+        name_end = memchr(dirent->d_name, '\0', sizeof(entry->name));
+    } while (name_end == NULL);
     entry->inode = dirent->d_ino;
     entry->type = dirent->d_type;
-    strcpy(entry->name, dirent->d_name);
+    memcpy(entry->name, dirent->d_name, (size_t) (name_end - dirent->d_name) + 1);
     return 1;
 }
 

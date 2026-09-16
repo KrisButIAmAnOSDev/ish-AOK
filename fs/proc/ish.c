@@ -1585,7 +1585,17 @@ static void get_child_names(struct proc_entry *entry, unsigned long index) {
 
 static bool proc_ish_underlying_defaults_readdir(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry) {
     get_child_names(entry, *index);
-    if (entry->child_names == NULL || entry->child_names[*index] == NULL)
+    if (entry->child_names == NULL)
+        return false;
+    // Every key in the defaults database is listed, not just AOK's own, and
+    // proc_ish_defaults_getname strcpy's the key into buffers of MAX_NAME
+    // bytes (proc_lookup's, proc_getpath's, proc_entry_inode's). A key longer
+    // than NAME_MAX would overrun them, so it is left out of the listing; it
+    // is not a file, and a lookup of it fails with ENAMETOOLONG anyway.
+    while (entry->child_names[*index] != NULL &&
+            strlen(entry->child_names[*index]) > NAME_MAX)
+        (*index)++;
+    if (entry->child_names[*index] == NULL)
         return false;
     next_entry->meta = &proc_ish_underlying_defaults_fd;
     next_entry->name = strdup(entry->child_names[*index]);

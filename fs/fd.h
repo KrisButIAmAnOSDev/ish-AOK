@@ -366,10 +366,17 @@ int fd_getflags(struct fd *fd);
 int fd_setflags(struct fd *fd, int flags);
 
 #define NAME_MAX 255
+// name is sized for what a host directory can hold, not for the guest's
+// NAME_MAX. APFS limits a name to 255 UTF-16 units, so a non-ASCII name runs
+// to 765 bytes of UTF-8, and exFAT volumes are the same. Linux lists names
+// like that: fs/readdir.c refuses only a name of PATH_MAX bytes or more, and
+// FUSE allows 1024. 1024 is the size of Darwin's d_name, so realfs_readdir
+// can pass every Darwin host name through whole.
+#define DIR_ENTRY_NAME_SIZE 1024
 struct dir_entry {
     qword_t inode;
     byte_t type;
-    char name[NAME_MAX + 1];
+    char name[DIR_ENTRY_NAME_SIZE];
 };
 
 static inline byte_t dir_entry_type_for_mode(mode_t_ mode) {
