@@ -114,10 +114,61 @@ term.scrollPort_.screen_.addEventListener('blur', (e) => {
         e.stopImmediatePropagation();
     }
 }, {capture: true});
+// A tap or click on the terminal gives it keyboard focus back: native.focus() is what makes the
+// TerminalView first responder again, and on a click nothing else does.
+//
+// The exception is a press ON a selection. That belongs to the selection view -- it is how a
+// selection is adjusted and how its menu comes up -- and taking first responder away from the
+// web view would dismiss both.
+//
+// Ask the document the rows are actually in. hterm draws them inside an <iframe>, so the
+// terminal's selection is that document's. This used to ask the top-level document, which
+// never holds terminal text but can hold a caret: a trackpad click can leave one there. From
+// then on its rangeCount was never 0 again, every click and tap returned early, and no click
+// could give the terminal keyboard focus back (#579). A collapsed range is only a caret, so it
+// does not count as a selection either.
+const screenDocument = term.scrollPort_.getDocument();
+function liveSelection() {
+    const selection = screenDocument.getSelection();
+    if (selection == null || selection.rangeCount == 0 || selection.isCollapsed)
+        return null;
+    return selection;
+}
+function selectionContainsPoint(selection, x, y) {
+    for (let i = 0; i < selection.rangeCount; i++) {
+        for (const rect of selection.getRangeAt(i).getClientRects()) {
+            if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+                return true;
+        }
+    }
+    return false;
+}
+let pressOnSelection = false;
 term.scrollPort_.screen_.addEventListener('mousedown', (e) => {
-    // Taps while there is a selection should be left to the selection view
-    if (document.getSelection().rangeCount != 0) return;
+    const selection = liveSelection();
+    pressOnSelection = selection != null && selectionContainsPoint(selection, e.clientX, e.clientY);
+    if (pressOnSelection)
+        return;
+    // A plain click away from a selection ends it. Left in place it would no longer be shown
+    // once the terminal has focus, yet Copy would still copy it. Shift-click extends a selection
+    // instead, so that one is left alone.
+    if (selection != null && !e.shiftKey)
+        selection.removeAllRanges();
     native.focus();
+});
+// Focus again once the click is over, unless it left a selection behind (a drag or a double
+// click that selected text, which is about to be copied). The press is delivered before the
+// click has finished, so anything that hands first responder to the web view during the rest of
+// it would otherwise have the last word. When the terminal already has focus this is a no-op.
+term.scrollPort_.screen_.addEventListener('mouseup', (e) => {
+    if (pressOnSelection) {
+        pressOnSelection = false;
+        return;
+    }
+    setTimeout(() => {
+        if (liveSelection() == null)
+            native.focus();
+    }, 0);
 });
 exports.setFocused = (focus) => {
     if (focus)
