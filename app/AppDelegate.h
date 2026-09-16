@@ -80,6 +80,10 @@ NSString *ISHSuspendSessionImagePath(void);
 NSString *_Nullable ISHSessionRestoredImagePath(void);
 int ISHSuspendSessionSaveNow(void);
 
+// True once the guest's init has exited (reboot, poweroff, halt, or init dying)
+// for the rest of this launch. Nothing restarts it in place.
+bool ISHGuestHalted(void);
+
 // Save the session and terminate the app, so the next launch resumes it. Does
 // not return on success. A SAVE is a copy and the guest carries on; this is the
 // departure.

@@ -14,7 +14,12 @@
 #include "fs/devices.h"
 #include "fs/tty.h"
 
-static void halt_system_locked(void);
+struct halt_target {
+    struct task *task;
+    struct sighand *sighand;
+};
+static struct halt_target *halt_system_collect_locked(size_t *count);
+static void halt_system_kill(struct halt_target *targets, size_t count);
 
 static bool trace_session_exit_task(struct task *UNUSED(task)) {
     return false;
@@ -111,9 +116,11 @@ static bool exit_tgroup(struct task *task) {
 // A function pointer that can be assigned to a cleanup function to be called upon task exit.
 void (*exit_hook)(struct task *task, int code) = NULL;
 
-// Optional hook invoked when init (pid 1) exits, before halt_system_locked(). The
-// standalone CLI sets this to terminate the host process with init's exit status;
-// it does not return. NULL for the iOS app (keeps the existing teardown behavior).
+// Optional hook invoked when init (pid 1) exits, before the other tasks are
+// killed (halt_system_collect_locked). Called with pids_lock and init's
+// general_lock held, so it must not take either. The standalone CLI sets this to
+// terminate the host process with init's exit status; it does not return. The
+// app's records that the guest has halted and returns.
 void (*halt_hook)(int status) = NULL;
 
 static inline bool exit_wait_needed(struct task *task) {
@@ -509,6 +516,8 @@ noreturn void do_exit(struct task *task, int status) {
     // here and sent after pids_lock is dropped, like every other signal in
     // this function.
     struct task *reparent_signal_parent = NULL;
+    struct halt_target *halt_targets = NULL;
+    size_t halt_target_count = 0;
     struct siginfo_ reparent_signal_info = {};
     int reparented_zombies = 0;
 
@@ -631,11 +640,10 @@ noreturn void do_exit(struct task *task, int status) {
             // init died. The CLI's halt_hook exits the host process with init's
             // status (and does not return), so the host exit code mirrors the guest
             // — including for multi-threaded init (e.g. the Go runtime), whose
-            // lingering sibling pthreads would otherwise be host-SIGKILLed by
-            // halt_system_locked(), killing the whole process with signal 9 (137).
+            // lingering sibling threads would otherwise still be running.
             if (halt_hook != NULL)
                 halt_hook(status);
-            halt_system_locked();
+            halt_targets = halt_system_collect_locked(&halt_target_count);
         } else {
             task_ref_cnt_mod(parent, 1);
             signal_parent = parent;
@@ -733,6 +741,9 @@ noreturn void do_exit(struct task *task, int status) {
             send_signal_to_group(signal_parent->group, signal_no, signal_info);
         task_ref_cnt_mod(signal_parent, -1);
     }
+
+    if (halt_targets != NULL)
+        halt_system_kill(halt_targets, halt_target_count);
 
     // Published BEFORE the destroy below, not after: task_destroy_unlinked
     // can free(task) outright, and a store into the struct after that is a
@@ -848,23 +859,56 @@ noreturn void do_exit_group(int status) {
     pthread_exit(NULL);
 }
 
-// always called from init process. Intended to be called when the init process exits.
-static void halt_system_locked(void) {
-    // brutally murder everything
-    // which will leave everything in an inconsistent state. I will solve this problem later.
+// Init has exited and the halt_hook, if any, returned. Only the app gets here:
+// the CLI's hook exits the process. What is left is to stop every other task.
+//
+// This used to pthread_kill(task->thread, SIGKILL) each one. A host SIGKILL is
+// not aimed at a thread -- it ends the whole process -- so in the app, running
+// `reboot` killed iSH-AOK outright whenever any task outlived init, and one
+// always did: busybox init's kill(-1, SIGKILL) takes the terminal's shell, the
+// terminal starts a new one, and init exits two seconds later (#587). It also
+// sent that signal to the saved pthread_t of leaders whose threads were gone.
+//
+// A guest SIGKILL does what was meant. Collected here under pids_lock, with a
+// reference and the sighand held, and delivered by do_exit after it has let go
+// of its locks, the way do_exit_group delivers its own. Every task, not just
+// leaders: a process whose leader already exited lives on in its other threads.
+//
+// Filesystems stay mounted. Tearing them down here freed mounts that the tasks
+// just told to die were still unwinding through; the host process outlives the
+// guest and releases them when it exits.
+static struct halt_target *halt_system_collect_locked(size_t *count) {
+    size_t cap = 0;
     for (int i = 2; i < MAX_PID; i++) {
         struct task *task = pid_get_task(i);
-        if (task != NULL)
-            pthread_kill(task->thread, SIGKILL);
+        if (task != NULL && !task->zombie && task->sighand != NULL)
+            cap++;
     }
+    *count = 0;
+    if (cap == 0)
+        return NULL;
+    struct halt_target *targets = malloc(sizeof(*targets) * cap);
+    if (targets == NULL)
+        return NULL;
+    for (int i = 2; i < MAX_PID && *count < cap; i++) {
+        struct task *task = pid_get_task(i);
+        if (task == NULL || task->zombie || task->sighand == NULL)
+            continue;
+        task_ref_cnt_mod(task, 1);
+        sighand_retain(task->sighand);
+        targets[*count] = (struct halt_target) {.task = task, .sighand = task->sighand};
+        (*count)++;
+    }
+    return targets;
+}
 
-    // unmount all filesystems
-    lock(&mounts_lock, 0);
-    struct mount *mount, *tmp;
-    list_for_each_entry_safe(&mounts, mount, tmp, mounts) {
-        mount_remove(mount);
+static void halt_system_kill(struct halt_target *targets, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        deliver_signal_with_sighand(targets[i].task, targets[i].sighand, SIGKILL_, SIGINFO_NIL);
+        sighand_release(targets[i].sighand);
+        task_ref_cnt_mod(targets[i].task, -1);
     }
-    unlock(&mounts_lock);
+    free(targets);
 }
 
 dword_t sys_exit(dword_t status) {

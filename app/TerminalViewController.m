@@ -1972,7 +1972,7 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.processExited"
                                   details:@{@"pid": @(pid),
                                             @"sceneSession": self.sceneSession.persistentIdentifier ?: @"",
-                                            @"restarting": @(didEndHandler == nil && !crashLooping),
+                                            @"restarting": @(didEndHandler == nil && !crashLooping && !ISHGuestHalted()),
                                             @"elapsed": @(elapsed),
                                             @"consecutiveQuickExits": @(self.consecutiveQuickSessionExits)}];
     self.sessionTerminal = nil;
@@ -1985,6 +1985,14 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
         // it from its parent can release the last reference), so don't run it while we're still
         // executing one of its instance methods.
         dispatch_async(dispatch_get_main_queue(), didEndHandler);
+        return;
+    }
+    if (ISHGuestHalted()) {
+        // reboot/poweroff/halt: init has exited, so a new shell has nowhere to
+        // run (become_new_init_child refuses). Say so instead of retrying.
+        self.consecutiveQuickSessionExits = 0;
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.notRestarted.guestHalted"];
+        [self _showTerminalStartupFailureOverlayWithText:@"System halted. Quit and reopen iSH-AOK to boot it again."];
         return;
     }
     if (crashLooping) {

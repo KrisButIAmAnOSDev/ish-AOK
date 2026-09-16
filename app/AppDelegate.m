@@ -490,6 +490,76 @@ static void ios_handle_exit(struct task *task, int code) {
     });
 }
 
+// ---- guest halt ------------------------------------------------------------
+//
+// `reboot`, `poweroff` and `halt` end in init exiting: AOK's reboot(2) refuses,
+// so busybox init (like any init whose reboot call returns) just exits. AOK
+// cannot boot a second machine inside the same process, so for the rest of this
+// launch the guest is gone, and a new launch is the reboot.
+//
+// Before this hook existed the kernel host-SIGKILLed whatever task outlived
+// init, which took the whole app with it, and a terminal opened afterwards
+// crashed on the dead init (#587). The kernel now stops those tasks with a guest
+// SIGKILL and refuses new ones; what is left for the app is to not keep trying,
+// and to say what happened instead of looking broken.
+static atomic_bool ishGuestHalted;
+
+bool ISHGuestHalted(void) {
+    return atomic_load(&ishGuestHalted);
+}
+
+static NSString *ISHGuestHaltDescription(int status) {
+    if ((status & 0x7f) == 0) {
+        int code = (status >> 8) & 0xff;
+        return code == 0 ? @"init exited" : [NSString stringWithFormat:@"init exited with status %d", code];
+    }
+    return [NSString stringWithFormat:@"init was killed by signal %d", status & 0x7f];
+}
+
+static void ISHPresentGuestHaltedAlert(int status, int attempt) {
+    UIViewController *host = ISHActivePresentationViewController();
+    if (host == nil || host.presentedViewController != nil) {
+        // No scene yet, or something is already up (a resume picker, another
+        // alert). Try again shortly rather than stack on top of it.
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHPresentGuestHaltedAlert(status, attempt + 1);
+            });
+        }
+        return;
+    }
+    NSString *message = [NSString stringWithFormat:
+        @"The Linux system has shut down (%@). That is what reboot, poweroff and halt do.\n\n"
+        @"iSH-AOK can't start it again while the app is running. Quit, then open iSH-AOK again to boot it.",
+        ISHGuestHaltDescription(status)];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"System Halted"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Not Now" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit iSH-AOK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"guest.halted.quit"];
+        exit(0);
+    }]];
+    [host presentViewController:alert animated:YES completion:nil];
+}
+
+// halt_hook. Runs on init's thread with pids_lock and init's general_lock held
+// (kernel/exit.c), so it takes no locks and waits for nothing: set the flag and
+// hand the rest to the main queue. The kernel's checkpoint suspend also calls
+// it, immediately before exit(0), where this is harmless.
+static void ios_handle_halt(int status) {
+    atomic_store(&ishGuestHalted, true);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [ISHDiagnosticsStore recordBreadcrumb:@"guest.halted"
+                                      details:@{@"status": @(status),
+                                                @"description": ISHGuestHaltDescription(status)}];
+        ISHPresentGuestHaltedAlert(status, 0);
+    });
+}
+
 const char* getRenameRunDirString(void) {
     NSDate *currentDate = [NSDate date];
     NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
@@ -948,6 +1018,8 @@ static void *FallbackConsoleInitThread(void *context) {
 
     while (true) {
         intptr_t err = become_new_init_child();
+        if (err < 0 && ISHGuestHalted())
+            return NULL;
         if (err < 0) {
             printk("ERROR: fallback init could not create console shell child: %ld\n", (long) err);
             sleep(1);
@@ -2771,6 +2843,9 @@ void ISHSessionPresentResumePicker(UIViewController *host,
 }
 
 int ISHSuspendSessionSaveNow(void) {
+    // Nothing to save once init has exited: no machine is left to freeze.
+    if (ISHGuestHalted())
+        return _ESRCH;
     NSString *image = ISHSuspendSessionImagePath();
     if (image == nil)
         return _ENOENT;
@@ -2789,14 +2864,16 @@ int ISHSuspendSessionSaveNow(void) {
 // suspend is a departure -- the point is to put the machine down and have the
 // next launch be the one that continues it. Without this the only way to do
 // that was /AOK/tools/suspend.sh from inside the guest, which already ends in
-// the same exit(0) (kernel/checkpoint.c's halt path, where the app installs no
-// halt_hook).
+// the same exit(0) (kernel/checkpoint.c's halt path; the app's halt_hook only
+// records a flag there).
 //
 // Exiting immediately rather than after a beat, and that is deliberate: the
 // image describes the guest as it was when the freeze stopped it, while the
 // filesystem keeps changing for as long as the app is alive. Every millisecond
 // between the two is a millisecond the root can drift from the image.
 int ISHSuspendSessionSuspendAndExit(void) {
+    if (ISHGuestHalted())
+        return _ESRCH;
     NSString *image = ISHSuspendSessionImagePath();
     if (image == nil)
         return _ENOENT;
@@ -3360,6 +3437,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [self scheduleDnsRefresh:@"boot"];
     
     exit_hook = ios_handle_exit;
+    halt_hook = ios_handle_halt;
     die_handler = ios_handle_die;
 #if !TARGET_OS_SIMULATOR
     NSString *sockTmp = [NSTemporaryDirectory() stringByAppendingString:@"ishsock"];
@@ -4374,7 +4452,7 @@ void ISHSuspendGuardEnterBackground(void) {
     // guest is unharmed either way -- a checkpoint is a copy -- and if it
     // refuses (a native program that cannot describe itself, a descriptor with
     // no restore rule) it says so and the next launch simply boots.
-    if (UserPreferences.shared.shouldSuspendToDisk) {
+    if (UserPreferences.shared.shouldSuspendToDisk && !ISHGuestHalted()) {
         NSString *image = ISHSuspendSessionImagePath();
         if (image != nil) {
             // OFF this thread, under an assertion of its own.

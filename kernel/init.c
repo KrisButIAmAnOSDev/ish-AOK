@@ -332,6 +332,15 @@ intptr_t become_new_init_child(void) {
     struct task *init = pid_get_task_ref(1);
     if (init == NULL)
         return _ESRCH;
+    // An exited init stays in the pid table -- it has no parent, so it is never
+    // made a zombie or unlinked -- but its fs, files and namespaces are gone.
+    // Building a child from it dereferenced its NULL uts_ns, so opening a
+    // terminal after `reboot` crashed the app (#587). There is no machine left
+    // to join.
+    if (init->exiting) {
+        task_ref_cnt_mod(init, -1);
+        return _ESRCH;
+    }
 
     struct task *task = construct_task(init);
     task_ref_cnt_mod(init, -1);
