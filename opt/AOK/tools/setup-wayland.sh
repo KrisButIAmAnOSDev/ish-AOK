@@ -28,16 +28,15 @@
 #       sudo sh /AOK/tools/setup-wayland.sh
 #   or  doas sh /AOK/tools/setup-wayland.sh
 #
-# Devuan (apt) is supported now; Arch (pacman) installs the same stack (all
-# ten packages carry identical names in the Arch repos); Alpine (apk) is a
-# documented follow-up (the packages exist in edge/community but haven't
-# been bring-up-tested the way the Devuan path has -- see
-# wayland_workspace_plan.md phase 0).
+# Devuan (apt) and Alpine (apk) both run the desktop: Devuan 6 on amd64 and
+# arm64, in the CLI harness and on-device, and Alpine 3.23 arm64 (labwc 0.9.2)
+# start to finish in the harness, menu and X11 programs included. Arch (pacman)
+# installs the same stack under the same names and its packages resolve, but
+# nobody has run a session on it.
 #
-# Only amd64/x86_64 has been bring-up-tested (cage/labwc + wlroots' headless
-# backend + wayvnc, verified both in the CLI harness and on-device). Other
-# guest arches may work -- the packages exist for them in Devuan -- but
-# haven't been verified, so this script warns rather than refuses.
+# amd64/x86_64 and arm64/aarch64 are the tested guest arches. The others may
+# work -- the packages exist for them in Devuan -- but haven't been run, so
+# this script warns rather than refuses.
 # ---------------------------------------------------------------------------
 set -u
 
@@ -49,7 +48,7 @@ die()  { printf 'setup-wayland.sh: %s\n' "$*" >&2; exit 1; }
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64|amd64) : ;;
+    x86_64|amd64|aarch64|arm64) : ;;
     *) note "warning: guest arch '$ARCH' is untested for the Wayland stack;"
        note "proceeding anyway -- report back what breaks." ;;
 esac
@@ -89,7 +88,7 @@ elif command -v pacman >/dev/null 2>&1; then
 
 elif command -v apk >/dev/null 2>&1; then
     log "Alpine (apk) detected"
-    note "warning: the Alpine path is untested -- please report back what breaks."
+    note "Alpine was last run on 3.23 arm64 -- please report back what breaks."
     # font-dejavu: on Devuan and Arch the stack pulls in a text font, and on
     # Alpine nothing does. With only the icon font waybar brings below, every
     # window title, menu and foot terminal was drawn in Font Awesome.

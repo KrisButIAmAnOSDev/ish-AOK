@@ -138,9 +138,9 @@ one, which takes a few seconds. SDL games are told to use Wayland, and
 
 Two caveats worth knowing before you start. It has been run on **amd64** and
 **arm64** guests — the packages exist for the other architectures in Devuan and
-may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)
-install the same stack under the same package names, while Alpine (apk) is a
-documented follow-up rather than a supported path.
+may well work, but nobody has run them. And it has been run on **Devuan** (apt)
+and **Alpine** (apk); **Arch** (pacman) installs the same stack under the same
+names, and its packages resolve, but no one has run a session on it.
 
 You may also come across `wayland_workspace_plan.md` in the project's design
 docs. That is the forward design document this applet came out of; where it and
