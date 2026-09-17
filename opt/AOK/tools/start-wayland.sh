@@ -331,6 +331,23 @@ if ! ( : > "$shm_probe" ) 2>/dev/null; then
 fi
 rm -f "$shm_probe"
 
+# The same kind of trap for X: wlroots binds the Xwayland display's socket in
+# /tmp/.X11-unix, which Linux boot scripts create world-writable and sticky
+# (Devuan's x11-common does). Where nothing has, wlroots creates it with the
+# session's umask, so a root session left it 0755, and a later session as the
+# default user could bind no display at all: wlroots gave up after X0-X32,
+# labwc exited with "cannot create xwayland server", and the desktop never
+# started. A root session makes the directory 1777 before the compositor
+# starts. Another user cannot change a directory root owns, so that session
+# stops here with the fix rather than with labwc's exit.
+X11_SOCKET_DIR=/tmp/.X11-unix
+if [ "$CURRENT_UID" = 0 ]; then
+    mkdir -p "$X11_SOCKET_DIR" 2>/dev/null
+    chmod 1777 "$X11_SOCKET_DIR" 2>/dev/null
+elif [ -d "$X11_SOCKET_DIR" ] && ! [ -w "$X11_SOCKET_DIR" ]; then
+    die "$X11_SOCKET_DIR is not writable by uid $CURRENT_UID, so $COMPOSITOR_CMD cannot start Xwayland and would exit -- a root session created it; run: sudo chmod 1777 $X11_SOCKET_DIR"
+fi
+
 # Seed a minimal sway config + a wofi-driven app launcher, for anyone who
 # sets WAYLAND_COMPOSITOR_CMD=sway instead of the labwc default below. sway
 # has no menu system at all; everything is a keybinding, dispatched straight
@@ -927,6 +944,10 @@ spawn_logged() {
     SPAWN_PID=$!
 }
 
+# Marks when the compositor started, for telling its X display lock from locks
+# earlier sessions left behind (see the DISPLAY lookup below).
+COMPOSITOR_START_MARK="$XDG_RUNTIME_DIR/compositor-started"
+: > "$COMPOSITOR_START_MARK"
 log "starting $COMPOSITOR_CMD (headless)"
 spawn_logged compositor $COMPOSITOR_CMD
 COMPOSITOR_PID=$SPAWN_PID
@@ -1055,10 +1076,15 @@ done
 # claims the display while the compositor starts up, which wayvnc connecting has
 # shown is over: it binds the X sockets and writes the compositor's pid into
 # /tmp/.X<n>-lock, which is how that display is told apart from another
-# session's. Xwayland itself starts on the first X client. No lock names the
-# compositor when it has no Xwayland, and DISPLAY stays unset.
+# session's. Guest pids start again at 1 with every boot, though, and a lock an
+# earlier session left behind can name the same pid: a default-user session
+# took :0 from a stale root lock while its own display was :2. So only a lock
+# written since the compositor started counts. Xwayland itself starts on the
+# first X client. No lock names the compositor when it has no Xwayland, and
+# DISPLAY stays unset.
 for x_lock in /tmp/.X*-lock; do
     [ -f "$x_lock" ] || continue
+    [ "$COMPOSITOR_START_MARK" -nt "$x_lock" ] && continue
     x_lock_pid=""
     # The pid is right-aligned in ten columns with no newline: read strips the
     # padding and returns nonzero at the missing newline, having set the value.
