@@ -57,6 +57,7 @@ epoll_data_layout.c
 epoll_eloop.c
 epoll_exclusive.c
 ptrace_exit_kill.c
+ptrace_tracee_exit.c
 fcntl_lock.c
 fcntl_ofd.c
 fcntl_setown.c

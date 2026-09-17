@@ -2198,10 +2198,15 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
             unlock(&sighand->lock); // do_exit must be called without this lock
             // execve asked for THIS thread to go, not the whole group -- see
             // exit_requested in kernel/task.h. do_exit takes a non-leader
-            // thread off the group list and destroys it without touching the
-            // other threads or notifying the parent.
+            // thread off the group list without touching the other threads.
+            //
+            // With status 0, as Linux's do_group_exit gives a thread that
+            // de_thread zaps. Nothing saw the status while such a thread was
+            // simply destroyed, but a traced one is a zombie its tracer reaps,
+            // and strace -f reported "+++ killed by SIGKILL +++" for a sibling
+            // Linux reports as "+++ exited with 0 +++".
             if (__atomic_load_n(&current->exit_requested, __ATOMIC_ACQUIRE))
-                do_exit(current, sig);
+                do_exit(current, 0);
             do_exit_group(sig);
     }
 

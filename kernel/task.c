@@ -1110,7 +1110,15 @@ static void task_free_final(struct task *task) {
     native_env_discard(task);
     native_cmdline_discard(task);
     native_sigtable_discard(task);
-    if (task != NULL && task_is_leader(task) && task->group != NULL) {
+    // The group goes with its leader. Whether this IS the leader is asked
+    // without reading a thread's group pointer first: a thread's struct can
+    // outlive its process's group -- one left on the deferred queue below
+    // while its process is reaped, or the last thread of a process whose exit
+    // freed the leader before this thread had finished freeing itself -- and
+    // task_is_leader would read the freed group. A leader's pid is its tgid;
+    // a thread's never is, nor that of a leader execve retired (pid 0).
+    if (task != NULL && task->group != NULL && task->pid == task->tgid &&
+            task->group->leader == task) {
         // Before the group struct goes: an AIO context is keyed by a guest
         // address, and this address space is on its way out.
         aio_discard_tgroup(task->group);
@@ -1137,7 +1145,15 @@ void task_destroy_unlinked(struct task *task, int caller) {
         count++;
     }
 
-    if (task_ref_cnt_get(task, 1)) { // Check to see if another thread is accessing this process.  If yes, note that and defer freeing it
+    // A zombie can be reaped the moment do_exit marks it, while its own thread
+    // is still finishing do_exit on the struct -- freeing the queued signals,
+    // sending its parent's SIGCHLD, publishing exit_finished. A reap used to
+    // free it regardless. Now that a tracer reaps zombie threads and a
+    // process's exit can release a leader from another thread, that window is
+    // wider, so such a zombie waits on the deferred queue for exit_finished.
+    bool still_exiting = task->zombie &&
+        !atomic_load_explicit(&task->exit_finished, memory_order_acquire);
+    if (task_ref_cnt_get(task, 1) || still_exiting) { // Check to see if another thread is accessing this process.  If yes, note that and defer freeing it
         struct task_pending_deletion *pd = malloc(sizeof(struct task_pending_deletion));
         if (pd) {
             task->reference.ready_to_be_freed = true;
@@ -1169,7 +1185,9 @@ void cleanup_pending_deletions(void) {
     struct task_pending_deletion *pd, *tmp;
     list_for_each_entry_safe(&tasks_pending_deletion_queue, pd, tmp, list) {
         if (difftime(time(NULL), pd->added_time) >= GRACE_PERIOD &&
-                atomic_load_explicit(&pd->task->reference.count, memory_order_acquire) == 0) { // Delete reaped tasks old and no longer referenced
+                atomic_load_explicit(&pd->task->reference.count, memory_order_acquire) == 0 &&
+                (!pd->task->zombie ||
+                 atomic_load_explicit(&pd->task->exit_finished, memory_order_acquire))) { // Delete reaped tasks old and no longer referenced
             task_free_final(pd->task);
             list_remove(&pd->list);
             free(pd);

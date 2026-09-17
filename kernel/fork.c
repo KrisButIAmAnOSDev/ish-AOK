@@ -85,6 +85,11 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     // running timer thread. Clear the array so the child inherits no timers.
     memset(group->posix_timers, 0, sizeof(group->posix_timers));
     group->doing_group_exit = false;
+    // The parent's unreaped traced threads are the parent's. Inherited, a
+    // child forked while one was outstanding could never be reaped: its exit
+    // would wait for a thread zombie that is not its own to be released.
+    group->traced_zombies = 0;
+    group->exit_notify_deferred = false;
     group->continued = false;
     group->children_rusage = (struct rusage_) {};
     // Everything below is per-PROCESS state that Linux does not hand to a
@@ -606,10 +611,8 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         else
             ptrace_event = PTRACE_EVENT_FORK_;
 
-        if (current->ptrace.options & trace_option) {
-            ptrace_attach_fork_child(task, current);
-            trace_child = true;
-        }
+        if (current->ptrace.options & trace_option)
+            trace_child = ptrace_attach_fork_child(task, current);
     }
 
     // CLONE_CLEAR_SIGHAND: the child's dispositions start at SIG_DFL rather

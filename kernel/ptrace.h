@@ -205,6 +205,9 @@ void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventm
 // if it owes one. Call where the task looks for signals, before taking any, with
 // no lock held.
 void ptrace_trap_stop_if_pending(void);
-void ptrace_attach_fork_child(struct task *child, struct task *tracee);
+// Attach a new child to the tracer of `tracee`, its creator. Returns false,
+// having done nothing, when `tracee` is no longer traced by the time pids_lock
+// is held.
+bool ptrace_attach_fork_child(struct task *child, struct task *tracee);
 
 #endif /* KERNEL_PTRACE_H */

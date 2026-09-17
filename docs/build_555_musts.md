@@ -159,10 +159,12 @@ emulator underneath it differs.
   `PTRACE_EVENT_STOP` rather than a SIGSTOP, which `strace -f` had been
   printing and injecting into every child. Covered by
   `tests/manual/ptrace_seize_trap_stop.c`.
-- **`PTRACE_DETACH` still does not unlink `ptrace_siblings`.** Found while
-  chasing this and left alone deliberately: it is not what killed anything, and
-  changing list membership under the detach path deserved its own change rather
-  than riding along with a fix that was already three files wide.
+- ~~**`PTRACE_DETACH` still does not unlink `ptrace_siblings`.**~~ **Fixed
+  2026-09-17**, with the change that made a tracee's exit reach its tracer
+  (`tests/manual/ptrace_tracee_exit.c`). By then it mattered: the tracer's wait
+  counts its tracee list to decide between blocking and ECHILD, so a detached
+  task left on it kept a tracer from ever hearing "no children", and a second
+  attach by anyone else linked the same node into two lists.
 - ~~`gdb -p` end to end has not been re-run.~~ **Done, and it works.** `gdb -q
   -p <non-leader tid> -batch -ex bt -ex 'info threads' -ex detach` on a live
   guest process prints a full symbolic backtrace -- through musl's

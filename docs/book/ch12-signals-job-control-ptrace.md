@@ -427,6 +427,46 @@ resumes the task, as it does in Linux, instead of returning `EINTR`.
 `tests/manual/ptrace_seize_trap_stop.c` holds each of these to what Linux 6.12
 measured.
 
+**An exit belongs to the tracer first.** Linux's rule is "a zombie ptracee is
+only visible to its ptracer". When a traced task exits, its tracer hears first,
+whoever the task's parent is:
+
+- A traced thread becomes a zombie that only its tracer can reap, and it is
+  released when the tracer does. Until then its process can be neither reaped
+  nor announced, even to a tracer that is also the parent. The process's tgroup
+  counts these threads in `traced_zombies`, and the count also keeps the tgroup
+  alive for the thread structs that still point at it.
+- A traced process whose parent is somewhere else is reaped by the tracer first.
+  In the meantime the parent's `wait` says "not yet": `WNOHANG` returns 0, a
+  blocking wait blocks, and no SIGCHLD arrives. The tracer's reap untraces the
+  process and announces it to the parent, which reaps it and is the only one
+  charged its CPU time. A tracer that exits while holding such a zombie passes
+  it on the same way.
+
+One routine, `exit_notify_process_locked`, makes every announcement, whether it
+comes from `do_exit`, from the tracer's reap, from a tracer's exit, or from the
+release of a last thread zombie. It sends to the tracer or to the parent, and
+handles autoreap for a parent that ignores SIGCHLD.
+
+> **The bug that taught us this**
+>
+> Every `strace -f` of a program that made a thread or forked ended with
+> `strace: wait4(__WALL): No child processes` and exit status 1, and printed
+> `+++ exited` for the top process only. The program itself ran correctly. AOK
+> destroyed a thread the moment it exited and announced a process to its parent
+> alone, so the tracer's tracees vanished without a report. The one path that did
+> reach an exit was worse: a tracer waiting on a traced process by pid got into
+> the parent's reap and destroyed the process, so the real parent's own
+> `waitpid` failed.
+>
+> Fixing the report surfaced two bugs that had been hiding behind it. A signal a
+> tracer passes on at a signal-delivery-stop reached the tracee with no siginfo,
+> so a traced shell's SIGCHLD handler read `si_pid` 0. It now carries the stop's
+> siginfo, as Linux's `ptrace_signal` does. And Guard Malloc caught `PTRACE_CONT`
+> reading a thread that had already exited and been freed, which the old binary
+> did when strace was killed mid-run. `tests/manual/ptrace_tracee_exit.c` holds
+> the rules to Linux 6.12.
+
 ## 12.9 What this costs the rest of Part III
 
 Everything that blocks has to satisfy three obligations that come from this
@@ -449,12 +489,13 @@ right to be. Those three obligations are why.
 
 *Anchors:* [kernel/signal.c](../../kernel/signal.c),
 [kernel/signal.h](../../kernel/signal.h), [kernel/ptrace.c](../../kernel/ptrace.c),
+[kernel/exit.c](../../kernel/exit.c) (`exit_notify_process_locked`, `do_wait`),
 [kernel/calls.c](../../kernel/calls.c) (`handle_interrupt`'s group-stop path),
 [kernel/native.c](../../kernel/native.c) (`native_checkpoint`),
 [fs/tty.c](../../fs/tty.c), [fs/tty.h](../../fs/tty.h),
 [util/sync.c](../../util/sync.c) (`signal_thread_unwedge_wake_sigs`),
 `tests/manual/ptrace_group_stop.c`, `tests/manual/native_ptrace_group_stop.c`,
-`tests/manual/ptrace_seize_trap_stop.c`,
+`tests/manual/ptrace_seize_trap_stop.c`, `tests/manual/ptrace_tracee_exit.c`,
 `tests/manual/tty_hangup_reopen.c`, [docs/TODO.md](../../docs/TODO.md).
 
 *Story:* `PTRACE_SEIZE` of an already-stopped tracee hanging forever — a race

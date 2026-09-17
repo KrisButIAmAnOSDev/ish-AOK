@@ -56,7 +56,17 @@ static int pidfd_close(struct fd *fd) {
 static int pidfd_poll(struct fd *fd) {
     struct pidfd_data *data = fd->data;
     complex_lockt(&pids_lock, 0);
-    int types = data->task->zombie ? POLL_READ : 0;
+    struct task *task = data->task;
+    int types = 0;
+    if (task->zombie) {
+        // Readable once the process is done: Linux's pidfd_poll wants its
+        // thread group empty, and a thread zombie its tracer has not reaped
+        // yet still counts. Its group is safe to read while the task is
+        // still in the pid table -- a released task is done by definition.
+        bool released = pid_get_task_zombie(task->pid) != task;
+        if (released || task->group->traced_zombies == 0)
+            types = POLL_READ;
+    }
     unlock(&pids_lock);
     return types;
 }

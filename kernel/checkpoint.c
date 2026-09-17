@@ -2677,6 +2677,10 @@ int checkpoint_restore(const char *host_path) {
             memcpy(task->comm, rec.comm, sizeof(task->comm));
             task->exit_code = rec.exit_code;
             task->zombie = true;
+            // No thread will ever run do_exit for it, so nothing else says it
+            // is finished -- and a zombie that is not is never freed once
+            // reaped (task_destroy_unlinked).
+            atomic_store_explicit(&task->exit_finished, true, memory_order_release);
             atomic_store_explicit(&task->ckpt_freeze_wanted, false,
                                   memory_order_release);
             continue;   // no register file, no maps, no descriptors follow

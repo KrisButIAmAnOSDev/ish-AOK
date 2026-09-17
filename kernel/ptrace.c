@@ -28,6 +28,34 @@ static int ptrace_resume_signal(guest_addr_t data) {
 
 static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         bool single_step, bool stop_at_syscall, bool detach) {
+    // What the injected signal carries. From a signal-delivery-stop, Linux's
+    // ptrace_signal delivers the very signal the tracee was taking, siginfo
+    // and all, and a different one as SI_USER from the tracer. This was queued
+    // with no siginfo whatever the stop, so a traced program's handler saw
+    // SI_KERNEL and si_pid 0 -- including the SIGCHLD a traced shell gets for
+    // a child: strace -f takes that one at its delivery-stop and passes it on.
+    // Measured on Linux 6.12 by tests/manual/ptrace_tracee_exit.c. From any
+    // other stop Linux's send_sig says SI_KERNEL, which SIGINFO_NIL is.
+    struct siginfo_ resume_info = SIGINFO_NIL;
+    if (resume_sig != 0 && child->ptrace_delivery_stop) {
+        if (resume_sig == child->ptrace.info.sig) {
+            resume_info = child->ptrace.info;
+        } else {
+            struct task *tracer = ptrace_tracer(child);
+            resume_info.code = SI_USER_;
+            resume_info.kill.pid = tracer != NULL ? tracer->pid : current->pid;
+            resume_info.kill.uid = tracer != NULL ? tracer->uid : current->uid;
+        }
+    }
+    child->ptrace_delivery_stop = false;
+    // Pinned until the end. Everything past the unlock below runs with the
+    // tracee free to run, and a tracee that is let go can exit and be freed
+    // before this reaches its group or its signal queue. Guard Malloc caught
+    // exactly that under strace -f killed mid-run: PTRACE_CONT faulting on
+    // child->group, the child a thread that had exited and been freed. A
+    // traced task's exit now waits for its tracer, but a detached one's does
+    // not.
+    task_ref_cnt_mod(child, 1);
     child->cpu.tf = single_step;
     child->ptrace.stop_at_syscall = stop_at_syscall;
     if (!stop_at_syscall)
@@ -71,7 +99,8 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         unlock(&child->group->lock);
     }
     if (resume_sig != 0)
-        send_signal(child, resume_sig, SIGINFO_NIL);
+        send_signal(child, resume_sig, resume_info);
+    task_ref_cnt_mod(child, -1);
 }
 
 // A failed lookup here means one of: the pid does not exist, it is not a
@@ -106,12 +135,18 @@ static struct task *find_child(pid_t_ pid) {
     return find_tracee(pid, true);
 }
 
-void ptrace_attach_fork_child(struct task *child, struct task *tracee) {
-    struct task *tracer = ptrace_tracer(tracee);
-    if (tracer == NULL)
-        return;
-
+bool ptrace_attach_fork_child(struct task *child, struct task *tracee) {
+    // The tracer is read under pids_lock, which is what its exit holds while
+    // it lets go of its tracees. Read before, as it was, a fork racing the
+    // tracer's exit attached the child to a tracer that had already detached
+    // everything and was about to be freed -- and a traced child's exit now
+    // waits for that tracer to collect it.
     complex_lockt(&pids_lock, 0);
+    struct task *tracer = tracee->ptrace.traced ? ptrace_tracer(tracee) : NULL;
+    if (tracer == NULL) {
+        unlock(&pids_lock);
+        return false;
+    }
     child->ptrace.traced = true;
     child->ptrace.seized = tracee->ptrace.seized;
     child->ptrace.sysgood = tracee->ptrace.sysgood;
@@ -119,6 +154,7 @@ void ptrace_attach_fork_child(struct task *child, struct task *tracee) {
     child->ptrace.tracer = tracer;
     list_add(&tracer->ptracees, &child->ptrace_siblings);
     unlock(&pids_lock);
+    return true;
 }
 
 static void sync_i386_shadows_from_amd64_ptrace(struct cpu_state *cpu) {
@@ -624,8 +660,10 @@ static bool ptrace_sigkill_pending(void) {
 //
 // `trap_stop` marks the stop that answers ptrace.trap_stop itself
 // (ptrace_trap_stop_if_pending), which is owed only while the flag is still set.
+// `delivery` marks a signal-delivery-stop (ptrace_signal_stop), the one stop a
+// resume with a signal re-delivers with the stop's own siginfo.
 static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscall_stop,
-        int event, qword_t eventmsg, bool trap_stop) {
+        bool delivery, int event, qword_t eventmsg, bool trap_stop) {
     struct task *tracer = NULL;
     int signal_no = 0;
 
@@ -663,6 +701,7 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
     current->ptrace.trap_event = event;
     current->ptrace.eventmsg = eventmsg;
     current->ptrace.info = *info;
+    current->ptrace_delivery_stop = delivery;
     // Any stop answers a pending PTRACE_INTERRUPT, as Linux's ptrace_stop
     // clears JOBCTL_TRAP_STOP for every stop: a tracee interrupted on its way
     // into some other stop reports that stop and nothing more. An interrupt
@@ -710,15 +749,16 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
     unlock(&current->ptrace.lock);
 }
 
+// A signal-delivery-stop: `info` describes a signal the task was taking.
 void ptrace_signal_stop(int sig, struct siginfo_ *info) {
-    ptrace_stop_common(sig, info, false, 0, 0, false);
+    ptrace_stop_common(sig, info, false, true, 0, 0, false);
 }
 
 void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventmsg) {
     struct siginfo_ event_info = *info;
     event_info.sig = SIGTRAP_;
     event_info.code = (event << 8) | SIGTRAP_;
-    ptrace_stop_common(sig, &event_info, false, event, eventmsg, false);
+    ptrace_stop_common(sig, &event_info, false, false, event, eventmsg, false);
 }
 
 // Take the PTRACE_EVENT_STOP this task owes its tracer, if it owes one: the
@@ -743,7 +783,7 @@ void ptrace_trap_stop_if_pending(void) {
         .kill.pid = current->pid,
         .kill.uid = current->uid,
     };
-    ptrace_stop_common(SIGTRAP_, &info, false, PTRACE_EVENT_STOP_, 0, true);
+    ptrace_stop_common(SIGTRAP_, &info, false, false, PTRACE_EVENT_STOP_, 0, true);
 }
 
 void ptrace_syscall_stop(struct cpu_state *cpu) {
@@ -764,7 +804,7 @@ void ptrace_syscall_stop(struct cpu_state *cpu) {
     current->ptrace.syscall_stopped = entry;
     unlock(&current->ptrace.lock);
 
-    ptrace_stop_common(SIGTRAP_, &info, true, 0,
+    ptrace_stop_common(SIGTRAP_, &info, true, false, 0,
             entry ? PTRACE_EVENTMSG_SYSCALL_ENTRY_ : PTRACE_EVENTMSG_SYSCALL_EXIT_, false);
 }
 
@@ -804,10 +844,12 @@ void ptrace_group_stop(void) {
     };
     // No message, as in Linux's do_jobctl_trap. This passed the stop signal,
     // which no tracer could see while wait4 cleared every message.
+    // A group-stop, not a signal-delivery-stop, even when it is reported as
+    // one: nothing is being delivered.
     if (current->ptrace.seized)
         ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_STOP_, 0);
     else
-        ptrace_signal_stop(stop_sig, &info);
+        ptrace_stop_common(stop_sig, &info, false, false, 0, 0, false);
 }
 
 dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, dword_t data) {
@@ -844,7 +886,15 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
                 unlock(&pids_lock);
                 return _ESRCH;
             }
-            if (child == current) {
+            // Not a thread of our own process, and not a task that has already
+            // exited -- Linux's same_thread_group and exit_state refusals, both
+            // EPERM, measured on 6.12. Attaching a zombie used to succeed, and
+            // now that a traced zombie belongs to its tracer that would have
+            // taken it away from the parent about to reap it. A leader that
+            // left while its threads run on counts as exited, as it does on
+            // Linux, where it is a zombie.
+            if (child->group == current->group || child->zombie ||
+                    atomic_load_explicit(&child->exit_finished, memory_order_acquire)) {
                 unlock(&pids_lock);
                 return _EPERM;
             }
@@ -865,7 +915,14 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             child->ptrace.syscall_stopped = false;
             child->ptrace.trap_event = 0;
             child->ptrace.eventmsg = 0;
-            if (child->parent == NULL || child->parent->group != current->group)
+            // A process we are the parent of is found through our children;
+            // everything else we trace, threads included, only through this
+            // list. A thread's parent here is whichever task created it (or
+            // inherited it), so "its parent is ours" says nothing about a
+            // thread, and testing that alone could leave a traced thread on no
+            // list at all.
+            if (!(task_is_leader(child) && child->parent != NULL &&
+                    child->parent->group == current->group))
                 list_add(&current->ptracees, &child->ptrace_siblings);
             unlock(&child->ptrace.lock);
             // A tracee that was ALREADY group-stopped when we seized it is
@@ -1250,13 +1307,34 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
         case PTRACE_DETACH_: {
             STRACE("ptrace(PTRACE_DETACH, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
-            struct task *child = find_child(pid);
-            if (!child) return _ESRCH;
+            // find_child's lookup, but keeping pids_lock long enough to take
+            // the tracee off our list. The detach never used to: the tracee
+            // stayed linked into the tracer's ptracees after it was let go, so
+            // a later attach by anyone else linked the same node into a second
+            // list, and the old tracer's wait counted a task it no longer
+            // traced as a reason not to answer ECHILD.
+            complex_lockt(&pids_lock, 0);
+            struct task *child = pid_get_task_zombie(pid);
+            if (child == NULL) {
+                unlock(&pids_lock);
+                return _ESRCH;
+            }
+            lock(&child->ptrace.lock, 0);
+            if (!ptrace_traced_by(current, child) || !child->ptrace.stopped) {
+                unlock(&child->ptrace.lock);
+                unlock(&pids_lock);
+                return _ESRCH;
+            }
             int resume_sig = ptrace_resume_signal(data);
             if (resume_sig < 0) {
                 unlock(&child->ptrace.lock);
+                unlock(&pids_lock);
                 return resume_sig;
             }
+            list_remove_safe(&child->ptrace_siblings);
+            // Still holding ptrace.lock, as find_child's callers do: a stopped
+            // tracee cannot get on with exiting until it is released.
+            unlock(&pids_lock);
 
             ptrace_resume_child_locked(child, resume_sig, false, false, true);
             return 0;

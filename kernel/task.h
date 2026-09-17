@@ -505,6 +505,13 @@ struct task {
     // the dispatcher at rewind time, consumed by receive_signal, and cleared as
     // the next syscall starts. At the end for the reason given just above.
     bool restart_sys_pending;
+
+    // The ptrace-stop this task is in is a signal-delivery-stop: ptrace.info is
+    // the siginfo of a signal it was about to take, which is what a tracer
+    // that resumes it with that signal must see delivered (Linux's
+    // ptrace_signal). Locked by ptrace.lock. At the end for the reason given
+    // above native_standin_child.
+    bool ptrace_delivery_stop;
 };
 
 // current will always give the process that is currently executing
@@ -678,6 +685,22 @@ struct tgroup {
     // for everything in this struct not locked by something else.
     // Lock ordering: pids_lock -> group->lock -> tty->lock.
     lock_t lock;
+
+    // Threads of this process that have exited but are still zombies, because
+    // a tracer has not reaped them yet (kernel/exit.c). A traced task's exit is
+    // its tracer's to collect, so such a thread stays in the pid table after
+    // it has left `threads`. Until the count is back to zero the process
+    // cannot be reaped and its exit is not announced -- Linux's
+    // delay_group_leader -- which is also what keeps this struct alive for
+    // them: it is freed with the leader. Locked by pids_lock.
+    //
+    // At the end of the struct for the same reason native_standin_child is at
+    // the end of struct task.
+    int traced_zombies;
+    // The last thread has gone while traced_zombies was not zero, so telling
+    // the parent (or tracer) is owed to whoever releases the last of them.
+    // Locked by pids_lock.
+    bool exit_notify_deferred;
 };
 
 // Is this thread group the leader of its session? Linux keeps this as a
