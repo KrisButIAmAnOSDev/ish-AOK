@@ -216,18 +216,37 @@ static size_t do_syslog(int type, guest_addr_t buf_addr, int_t len, struct syslo
             return syslog_take(len, 0, out);
         }
         case SYSLOG_ACTION_READ_ALL_:
-            if (len < 0)
-                return _EINVAL;
-            return syslog_take(len, FIFO_LAST | FIFO_PEEK, out);
-
         case SYSLOG_ACTION_READ_CLEAR_:
-            if (len < 0)
+            // Both arguments are checked before anything is read, and a null
+            // buffer is EINVAL even with a zero length -- Linux tests
+            // `!buf || len < 0` first and `!len` second (printk.c, do_syslog;
+            // measured on 6.12). A zero length therefore answers 0 without
+            // ever reaching syslog_print_all, so it does not clear either.
+            if (buf_addr == 0 || len < 0)
                 return _EINVAL;
+            if (len == 0)
+                return 0;
             res = (int)syslog_take(len, FIFO_LAST | FIFO_PEEK, out);
             if (res < 0)
                 return res;
-            FALLTHROUGH;
+            // The clear is unconditional once the read has been attempted --
+            // even at zero bytes returned, and even if the copy to the guest
+            // faults afterwards. Linux advances clear_seq after the copy loop
+            // whether or not that loop broke on -EFAULT.
+            if (type == SYSLOG_ACTION_READ_CLEAR_)
+                log_max_since_clear = 0;
+            // And the count is the answer. This used to fall into the CLEAR_
+            // case below and return its 0, which is not a harmless
+            // discrepancy: both busybox's and util-linux's dmesg print only
+            // as many bytes as the call reported, so `dmesg -c` printed
+            // NOTHING in a guest while the bytes sat correctly in its buffer.
+            // Measured on 6.12: READ_CLEAR returns exactly what the READ_ALL
+            // before it returned.
+            return (size_t) res;
+
         case SYSLOG_ACTION_CLEAR_:
+            // Type 5 takes no buffer and validates nothing -- measured on
+            // 6.12, a negative length and a garbage pointer both return 0.
             log_max_since_clear = 0;
             return 0;
 
