@@ -230,6 +230,7 @@ socket_kill.c
 inaddr_any_iface.c
 epoll_dup_add.c
 inotify_mount_paths.c
+inotify_fionread.c
 procfd_reopen.c
 scm_rights_pidfd.c
 siocoutq.c

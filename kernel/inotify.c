@@ -581,6 +581,44 @@ static int inotify_poll(struct fd *fd) {
     return types;
 }
 
+static ssize_t inotify_ioctl_size(int cmd) {
+    if (cmd == FIONREAD_)
+        return sizeof(int_t);
+    return -1;
+}
+
+// FIONREAD: the bytes a read with a big enough buffer would return right now,
+// i.e. every queued record plus its padded name -- the IN_Q_OVERFLOW marker
+// included, since it is a record too. Linux's inotify_ioctl() walks its queue
+// the same way.
+//
+// There was no ioctl at all, so this was ENOTTY, and GLib treats that as fatal.
+// Its inotify backend reads into a 4096-byte buffer and asks FIONREAD whenever
+// a read comes back nearly full; the failure is a g_error(), which killed the
+// monitoring program or left its "gmain" thread spinning at 100% CPU (Thunar,
+// about 8 s after every launch). Any GLib program watching a directory reached
+// it on the first burst of changes big enough to fill that buffer.
+static int inotify_ioctl(struct fd *fd, int cmd, void *arg) {
+    if (cmd != FIONREAD_)
+        return _ENOTTY;
+    lock(&fd->lock, 0);
+    struct inotify_state *state = inotify_state_get(fd);
+    if (state == NULL) {
+        unlock(&fd->lock);
+        return _EBADF;
+    }
+    // Bounded: the queue holds at most INOTIFY_MAX_QUEUED_EVENTS + 1 records
+    // of at most 16 + 256 bytes each, a few MB, so an int cannot overflow.
+    size_t bytes = 0;
+    struct inotify_event_node *event;
+    list_for_each_entry(&state->events, event, list) {
+        bytes += sizeof(event->event) + event->event.len;
+    }
+    unlock(&fd->lock);
+    *(int_t *) arg = (int_t) bytes;
+    return 0;
+}
+
 static int inotify_close(struct fd *fd) {
     lock(&fd->lock, 0);
     struct inotify_state *state = inotify_state_get(fd);
@@ -622,6 +660,8 @@ static struct fd_ops inotify_fdops = {
     .anon_inode_class = "inotify",
     .read = inotify_read,
     .poll = inotify_poll,
+    .ioctl_size = inotify_ioctl_size,
+    .ioctl = inotify_ioctl,
     .close = inotify_close,
 };
 
