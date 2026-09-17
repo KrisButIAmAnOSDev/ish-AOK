@@ -24,6 +24,13 @@ ssize_t ish_log_read_bytes(size_t offset, void *buf, size_t len);
 uint64_t ish_log_total_written(void);
 ssize_t ish_log_read_at(uint64_t *pos, void *buf, size_t len);
 int ish_log_wait_past(uint64_t pos);
+// The same log as LINES, which is what /dev/kmsg serves: one whole message
+// per read, with a sequence number. See kernel/log.c.
+uint64_t ish_log_oldest(void);
+uint64_t ish_log_clear_pos(void);
+uint64_t ish_log_line_seek(uint64_t *pos);
+ssize_t ish_log_peek_line(uint64_t pos, void *buf, size_t bufsize,
+                          uint64_t *next, size_t *needed);
 void ish_vprintk(const char *msg, va_list args);
 void ish_printk(const char *msg, ...);
 __attribute__((__noreturn__)) void die(const char *msg, ...);

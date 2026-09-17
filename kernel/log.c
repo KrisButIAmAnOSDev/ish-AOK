@@ -24,6 +24,11 @@ static lock_t log_lock = LOCK_INITIALIZER;
 // once. Stream readers position themselves against this instead, which keeps
 // counting, and the window still in the buffer is [total - fifo_size, total).
 static uint64_t log_total_written = 0;
+// Total lines ever appended. Every stored line is one output_line() call and
+// ends in a newline, so this is also the number of newlines ever written --
+// which is what makes a line's index recoverable from a byte position, and is
+// what /dev/kmsg reports as a record's sequence number.
+static uint64_t log_total_lines = 0;
 // Signalled whenever a line lands, so a blocking reader wakes instead of
 // spinning on a zero-length read.
 static cond_t log_cond = COND_INITIALIZER;
@@ -173,6 +178,161 @@ ssize_t ish_log_read_at(uint64_t *pos, void *buf, size_t len) {
     *pos += len;
     unlock(&log_lock);
     return (ssize_t) len;
+}
+
+// ---- the log as LINES, for /dev/kmsg ----------------------------------
+//
+// Everything above treats the log as bytes, which is what syslog(2) and
+// /proc/kmsg want. /dev/kmsg wants records: one whole message per read, each
+// carrying a sequence number and a timestamp (fs/mem.c has the wire format).
+// Rather than store records -- which would put a second meaning on every
+// absolute position the byte readers already use -- the line structure is
+// recovered from the bytes. Every stored line is one output_line() call ending
+// in exactly one newline, so newlines and lines are the same thing, and a
+// line's sequence number is just how many lines precede it.
+
+// Absolute position of the first '\n' in [from, to), or `to` if there is none.
+// Caller holds log_lock; [from, to) must lie inside the buffered window.
+static uint64_t log_find_newline(uint64_t from, uint64_t to) {
+    if (from >= to)
+        return to;
+    size_t off = (size_t) (from - log_oldest_locked());
+    size_t len = (size_t) (to - from);
+    size_t start = (log_buf.start + off) % log_buf.capacity;
+    size_t first = log_buf.capacity - start;
+    if (first > len)
+        first = len;
+    const char *hit = memchr(&log_buf.buf[start], '\n', first);
+    if (hit != NULL)
+        return from + (uint64_t) (hit - &log_buf.buf[start]);
+    if (len > first) {
+        hit = memchr(&log_buf.buf[0], '\n', len - first);
+        if (hit != NULL)
+            return from + first + (uint64_t) (hit - &log_buf.buf[0]);
+    }
+    return to;
+}
+
+// Lines wholly inside [from, to). Each memchr resumes where the last one
+// stopped, so this scans the span once however many lines are in it.
+// Caller holds log_lock.
+static uint64_t log_count_lines(uint64_t from, uint64_t to) {
+    uint64_t lines = 0;
+    while (from < to) {
+        uint64_t at = log_find_newline(from, to);
+        if (at == to)
+            break;
+        lines++;
+        from = at + 1;
+    }
+    return lines;
+}
+
+// Caller holds log_lock; [from, from+len) must lie inside the buffered window.
+static void log_copy_out(uint64_t from, void *buf, size_t len) {
+    size_t start = (log_buf.start + (size_t) (from - log_oldest_locked())) % log_buf.capacity;
+    size_t first = log_buf.capacity - start;
+    if (first > len)
+        first = len;
+    memcpy(buf, &log_buf.buf[start], first);
+    memcpy((char *) buf + first, &log_buf.buf[0], len - first);
+}
+
+uint64_t ish_log_oldest(void) {
+    lock(&log_lock, 0);
+    uint64_t oldest = log_oldest_locked();
+    unlock(&log_lock);
+    return oldest;
+}
+
+// Where the log stood at the last syslog(2) clear -- what /dev/kmsg's
+// SEEK_DATA names, and what `dmesg` seeks to before its first read. The
+// cap log_buf_append puts on log_max_since_clear can only pull this back
+// to the start of the buffer, which ish_log_line_seek clamps.
+uint64_t ish_log_clear_pos(void) {
+    lock(&log_lock, 0);
+    uint64_t pos = log_total_written - log_max_since_clear;
+    unlock(&log_lock);
+    return pos;
+}
+
+// Move *pos to the start of the first whole line at or after it, and return
+// that line's sequence number.
+//
+// A position older than the buffer is not simply clamped to the oldest byte:
+// unless nothing has ever been evicted, those first bytes are the tail of a
+// line whose beginning went with them, and handing that tail back as a record
+// would give the reader half a message with a whole message's sequence number.
+// Skipping to the next newline costs at most one line, and only after a wrap,
+// which is exactly when Linux reports the overrun as lost records anyway.
+uint64_t ish_log_line_seek(uint64_t *pos) {
+    lock(&log_lock, 0);
+    uint64_t oldest = log_oldest_locked();
+    uint64_t at = *pos;
+    // <= and not <: landing exactly ON the oldest byte is the same problem,
+    // and SEEK_DATA can land there when a clear has fallen out of the buffer.
+    if (at <= oldest) {
+        at = oldest;
+        // oldest == 0 means the buffer has never overwritten anything, so its
+        // first byte really is the start of the first line ever logged.
+        if (oldest != 0) {
+            uint64_t nl = log_find_newline(at, log_total_written);
+            at = (nl == log_total_written) ? log_total_written : nl + 1;
+        }
+    }
+    if (at > log_total_written)
+        at = log_total_written;
+    uint64_t seq = log_total_lines - log_count_lines(at, log_total_written);
+    *pos = at;
+    unlock(&log_lock);
+    return seq;
+}
+
+// Copy the whole line that starts at `pos`, its newline excluded, and report
+// in *next where the line after it starts. Nothing here owns a position: the
+// caller keeps it and moves it on, which is what lets it decide when a line
+// counts as delivered.
+//
+//   > 0       the line's length; *next set
+//   0         no whole line at `pos` yet -- the reader is caught up
+//   _EPIPE    `pos` has fallen off the back of the buffer
+//   _E2BIG    `bufsize` is too small; *needed is the length required
+//
+// *next is written only on success, so a caller that seeds it with `pos` can
+// tell "a line was there" from "nothing yet" even for an empty line.
+ssize_t ish_log_peek_line(uint64_t pos, void *buf, size_t bufsize,
+                          uint64_t *next, size_t *needed) {
+    lock(&log_lock, 0);
+    ssize_t res;
+    if (pos < log_oldest_locked()) {
+        res = _EPIPE;
+        goto out;
+    }
+    if (pos >= log_total_written) {
+        res = 0;
+        goto out;
+    }
+    uint64_t nl = log_find_newline(pos, log_total_written);
+    if (nl == log_total_written) {
+        // A line always reaches the buffer with its newline (output_line
+        // appends both under this lock), so this is unreachable in practice --
+        // and "wait" is the safe answer if it ever is not.
+        res = 0;
+        goto out;
+    }
+    size_t len = (size_t) (nl - pos);
+    if (needed != NULL)
+        *needed = len;
+    if (len > bufsize) {
+        res = _E2BIG;
+        goto out;
+    }
+    log_copy_out(pos, buf, len);
+    *next = nl + 1;
+    res = (ssize_t) len;
+out:
+    unlock(&log_lock);
+    return res;
 }
 
 // Block until something lands past pos. Returns 0, or _EINTR if a guest
@@ -325,6 +485,10 @@ static void output_line(const char *line) {
         // add it to the circular buffer
         log_buf_append(tmpbuff);
         log_buf_append("\n");
+        // Both appends happen under the one log_lock hold ish_vprintk takes,
+        // so a reader can never see the text without its newline, nor the
+        // count without the bytes.
+        log_total_lines++;
     }
 }
 

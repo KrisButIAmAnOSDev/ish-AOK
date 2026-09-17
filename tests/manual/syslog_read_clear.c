@@ -286,13 +286,11 @@ int main(int argc, char **argv) {
     // It must be a dmesg that actually ISSUES SYSLOG_ACTION_READ_CLEAR.
     // busybox's only method is klogctl, so plain `dmesg -c` is right there.
     // util-linux's default method is /dev/kmsg, and `dmesg -c` then never
-    // calls syslog(2) at all -- so on a Devuan guest this check passed or
-    // failed on something else entirely. Measured on util-linux 2.41 under
-    // AOK: plain `dmesg` prints BLANK LINES, because /dev/kmsg here emits
-    // "[ctime] text" rather than Linux's "<prio>,<seq>,<usec>,<flag>;text"
-    // record format and util-linux parses every line as an empty record.
-    // (That is a real and separate gap in the /dev/kmsg node, not something
-    // this file can assert on; `dmesg --syslog` is unaffected by it.)
+    // calls syslog(2) at all -- so on a Devuan guest this check passes or
+    // fails on something else entirely. (/dev/kmsg used to emit "[ctime] text"
+    // rather than Linux's "prio,seq,usec,flag;text" record format, so plain
+    // `dmesg` printed nothing but blank lines; that was a separate gap in the
+    // node, fixed since, and kmsg_records.c is what asserts on it.)
     //
     // So: prefer `--syslog`, which forces the klogctl method, and fall back
     // to plain `-c` for a dmesg that does not know the option -- which is

@@ -314,6 +314,11 @@ struct fd {
             // `dmesg --follow` and systemd-journald both epoll this rather
             // than sitting in a blocking read.
             struct list link;
+            // The sequence number of the record at fd->offset. Every record
+            // /dev/kmsg emits carries one, and the reader just counts up: it
+            // is recovered from the byte position only at open and lseek,
+            // where the position can jump (kernel/log.c, ish_log_line_seek).
+            uint64_t seq;
         } kmsg;
         struct {
             int num;

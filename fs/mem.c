@@ -1,5 +1,8 @@
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "kernel/errno.h"
 #include "kernel/log.h"
 #include "kernel/random.h"
@@ -167,10 +170,15 @@ static struct list kmsg_fds = LIST_INITIALIZER(kmsg_fds);
 static lock_t kmsg_fds_lock = LOCK_INITIALIZER;
 
 static int kmsg_open(int UNUSED(major), int UNUSED(minor), struct fd *fd) {
-    // Start at the oldest line still buffered rather than at 0: a fresh open
-    // of /dev/kmsg reads the buffer from its start on Linux too, and
-    // ish_log_read_at clamps a position that has fallen off the back anyway.
-    fd->offset = 0;
+    // Start at the oldest line still buffered rather than at "now": a fresh
+    // open of /dev/kmsg reads the buffer from its start on Linux too
+    // (devkmsg_open seeks to the first valid record, the same place SEEK_SET
+    // names), so a daemon started after boot still gets the boot messages.
+    // ish_log_line_seek clamps 0 forward to the oldest whole line and hands
+    // back its sequence number.
+    uint64_t at = 0;
+    fd->kmsg.seq = ish_log_line_seek(&at);
+    fd->offset = (unsigned long) at;
     lock(&kmsg_fds_lock, 0);
     list_add(&kmsg_fds, &fd->kmsg.link);
     unlock(&kmsg_fds_lock);
@@ -201,8 +209,9 @@ void kmsg_notify_readers(void) {
     notifying = false;
 }
 
-// A stream of the kernel log, shared with /proc/kmsg (fs/proc/root.c).
-// Positions are absolute -- see ish_log_read_at.
+// The kernel log as a byte stream, which is what /proc/kmsg serves
+// (fs/proc/root.c). /dev/kmsg no longer comes through here -- it serves
+// records, see kmsg_read below. Positions are absolute -- see ish_log_read_at.
 ssize_t kmsg_stream_read(unsigned long *pos, void *buf, size_t bufsize, bool nonblock) {
     // A zero-length read returns 0 at once. POSIX says so, every Linux driver
     // implements it, and here it is load-bearing rather than pedantic: the
@@ -225,12 +234,11 @@ ssize_t kmsg_stream_read(unsigned long *pos, void *buf, size_t bufsize, bool non
         ssize_t res = ish_log_read_at(&at, buf, bufsize);
         if (res != 0) {
             if (res > 0) {
-                // Linux hands back exactly one record per read from
-                // /dev/kmsg. This is a byte stream, so a reader whose buffer
-                // did not land on a record boundary got a partial line and
-                // printed it as one -- busybox's klogd logged the tail of a
-                // timestamp as its own syslog entry. Stop at the first
-                // newline so a record is never split across two reads.
+                // Stop at the first newline so a line is never split across
+                // two reads. A reader whose buffer did not land on a line
+                // boundary got a partial line and logged it as a whole one --
+                // busybox's klogd logged the tail of a timestamp as its own
+                // syslog entry.
                 const char *nl = memchr(buf, '\n', (size_t) res);
                 if (nl != NULL) {
                     size_t upto = (size_t) (nl - (const char *) buf) + 1;
@@ -258,17 +266,271 @@ int kmsg_stream_poll(unsigned long pos) {
     return ish_log_total_written() > pos ? POLL_READ : 0;
 }
 
-static ssize_t kmsg_read(struct fd *fd, void *buf, size_t bufsize) {
-    // /dev/kmsg hands back one whole RECORD per read, so a buffer too small to
-    // hold one is a bad argument rather than an empty answer -- Linux answers
-    // EINVAL, and a zero-length buffer can never hold a record. Measured on
-    // Devuan, where the same read of /proc/kmsg returns 0 instead: /proc/kmsg
-    // is a byte stream and has nothing to complain about. The two share an
-    // implementation here, so the distinction lives at this end of it.
-    if (bufsize == 0)
+// ---- /dev/kmsg's record format ----------------------------------------
+//
+// Linux hands the guest one whole RECORD per read, not a slice of a byte
+// stream:
+//
+//     prio,seq,timestamp_usec,flag;text\n
+//
+// util-linux's dmesg parses that field by field -- facility/level, then the
+// sequence number, then the microsecond timestamp, then an optional flag --
+// and takes everything after the ';' as the message. Handed AOK's bare
+// "[Thu Sep 17 21:01:27 2026] text" it found no ';' at all and read every line
+// as an empty message: `/bin/dmesg` in a Devuan guest printed nothing but
+// blank lines, while `dmesg --syslog`, which goes to syslog(2) instead, was
+// fine. Measured against util-linux 2.41, and against Linux 6.12 for
+// everything below.
+//
+// The cost is that `cat /dev/kmsg` is now a machine format rather than the
+// log as a human reads it -- exactly as it is on Linux, and for the same
+// unavoidable reason: the header is what makes the line parseable, and it has
+// to come before the text. Nothing is lost by it. /proc/kmsg and
+// `dmesg --syslog` still serve the same bytes AOK has always printed, so the
+// human view is one command away, and `dmesg` renders these records the way
+// it renders a real kernel's.
+
+// facility 0 (kern), level 6 (info). AOK's printk carries no level -- there is
+// nowhere in a byte-stream log to keep one, and kmsg_write has always dropped
+// the "<N>" a guest writes -- so every record gets the one that describes
+// them: informational kernel messages. `dmesg --decode` reads it as kern.info,
+// and a level filter behaves, which it would not if everything claimed to be a
+// warning.
+#define KMSG_PRIORITY 6
+
+// output_line() stamps every stored line with ctime(3)'s fixed 24-character
+// form in brackets: "[Www Mmm dd hh:mm:ss yyyy] ", 27 characters in all.
+#define KMSG_CTIME_LEN 27
+
+// Most log lines are well under this; the rest take a malloc.
+#define KMSG_LINE_FAST 1024
+
+static int kmsg_month(const char *s) {
+    static const char names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    for (int i = 0; i < 12; i++)
+        if (memcmp(s, &names[i * 3], 3) == 0)
+            return i;
+    return -1;
+}
+
+// ctime space-pads the day of the month, so " 7" is a number here.
+static bool kmsg_two_digits(const char *s, int *out) {
+    if (s[0] == ' ')
+        return s[1] >= '0' && s[1] <= '9' ? (*out = s[1] - '0', true) : false;
+    if (s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9')
+        return false;
+    *out = (s[0] - '0') * 10 + (s[1] - '0');
+    return true;
+}
+
+// Recover a record's timestamp from the stamp output_line() already wrote, and
+// report where the message text begins after it.
+//
+// That stamp is the only per-line time the log keeps, so it is the only honest
+// source for this field, and once it has been read out of the line it is
+// dropped from the record text -- otherwise dmesg would print its own rendering
+// of the timestamp and then the same time again in words, from the same clock.
+// Nothing is lost by that: /proc/kmsg still carries the line verbatim.
+//
+// The resolution is whole seconds, because ctime's is. The origin is boot_time,
+// which is where kernel/task.c puts the guest's uptime zero, so these agree
+// with /proc/uptime and with /proc/stat's btime.
+//
+// They do NOT currently agree with what `dmesg -T` prints, and that is a
+// separate gap: util-linux derives the boot instant as "now minus
+// CLOCK_BOOTTIME", and AOK's CLOCK_BOOTTIME and CLOCK_MONOTONIC report the
+// HOST's uptime rather than the guest's (measured: /proc/uptime 0.77 against
+// CLOCK_BOOTTIME 1264336). The relative times `dmesg` prints are right either
+// way; only the absolute ones dmesg reconstructs are off, by however long the
+// host had been up when the guest booted.
+static uint64_t kmsg_line_time(const char *line, size_t len, size_t *text_off) {
+    extern time_t boot_time;
+    *text_off = 0;
+    if (len < KMSG_CTIME_LEN)
+        return 0;
+    if (line[0] != '[' || line[4] != ' ' || line[8] != ' ' || line[11] != ' ' ||
+        line[14] != ':' || line[17] != ':' || line[20] != ' ' ||
+        line[25] != ']' || line[26] != ' ')
+        return 0;
+    int mon = kmsg_month(&line[5]);
+    int day, hour, min, sec;
+    if (mon < 0 || !kmsg_two_digits(&line[9], &day) ||
+        !kmsg_two_digits(&line[12], &hour) || !kmsg_two_digits(&line[15], &min) ||
+        !kmsg_two_digits(&line[18], &sec))
+        return 0;
+    int year = 0;
+    for (int i = 21; i < 25; i++) {
+        if (line[i] < '0' || line[i] > '9')
+            return 0;
+        year = year * 10 + (line[i] - '0');
+    }
+
+    struct tm tm = {
+        .tm_year = year - 1900, .tm_mon = mon, .tm_mday = day,
+        .tm_hour = hour, .tm_min = min, .tm_sec = sec,
+        // ctime() rendered local time, so mktime() is its exact inverse. -1
+        // lets it work out DST; the one ambiguous hour a year can land on
+        // either side of the change, which costs an hour on those records and
+        // nothing on any other.
+        .tm_isdst = -1,
+    };
+    time_t when = mktime(&tm);
+    if (when == (time_t) -1)
+        return 0;
+    // Only now is the stamp known to be one of ours, so only now is it right
+    // to take it off the text.
+    *text_off = KMSG_CTIME_LEN;
+    if (when <= boot_time)
+        return 0;
+    return (uint64_t) (when - boot_time) * 1000000;
+}
+
+// Write the record for one line into the guest's buffer. Returns its length,
+// or _EINVAL if the buffer cannot hold the whole thing -- which is what Linux
+// answers a reader whose buffer is too small for a record.
+static ssize_t kmsg_format_record(char *out, size_t outsize, uint64_t seq,
+                                  const char *line, size_t len) {
+    size_t text_off = 0;
+    uint64_t usec = kmsg_line_time(line, len, &text_off);
+
+    int header = snprintf(out, outsize, "%u,%llu,%llu,-;", KMSG_PRIORITY,
+                          (unsigned long long) seq, (unsigned long long) usec);
+    if (header < 0 || (size_t) header >= outsize)
         return _EINVAL;
-    return kmsg_stream_read(&fd->offset, buf, bufsize,
-                            (fd->flags & O_NONBLOCK_) != 0);
+    size_t at = (size_t) header;
+
+    for (size_t i = text_off; i < len; i++) {
+        unsigned char c = (unsigned char) line[i];
+        // Exactly what Linux escapes (msg_print_ext_body): control bytes, the
+        // high half, and the backslash itself. It is not decoration -- an
+        // unescaped byte in the text could be read as the '\n' that ends the
+        // record or as the space that starts a continuation line, and a guest
+        // can put any byte here with a write to /dev/kmsg.
+        if (c < ' ' || c >= 0x7f || c == '\\') {
+            static const char hex[] = "0123456789abcdef";
+            if (at + 4 > outsize)
+                return _EINVAL;
+            out[at++] = '\\';
+            out[at++] = 'x';
+            out[at++] = hex[c >> 4];
+            out[at++] = hex[c & 0xf];
+        } else {
+            if (at + 1 > outsize)
+                return _EINVAL;
+            out[at++] = (char) c;
+        }
+    }
+    if (at + 1 > outsize)
+        return _EINVAL;
+    out[at++] = '\n';
+    return (ssize_t) at;
+}
+
+// /dev/kmsg hands back one whole record per read, so a buffer too small to
+// hold one is a bad argument rather than an empty answer or a partial record:
+// there would be no way for the reader to tell a truncated record from a whole
+// one. Linux answers EINVAL, and a zero-length buffer can never hold a record,
+// so that is EINVAL too -- measured on 6.12 at 8, 1 and 0 bytes. Measured on
+// Devuan, where the same read of /proc/kmsg returns 0 instead: /proc/kmsg is a
+// byte stream and has nothing to object to. The two used to share an
+// implementation, so the distinction lived at this end of it; they no longer
+// do, and it lives in the formatting.
+//
+// The record is CONSUMED either way. That is Linux's behaviour and not an
+// obvious one -- devkmsg_read advances the reader past the record before it
+// checks the size, so the message the caller could not receive is gone.
+// Measured, because it looked like a wart worth not copying: with two lines
+// waiting, a four-byte read returns EINVAL and the next full read gives the
+// SECOND line. Keeping the record instead would be friendlier right up until a
+// reader retried, which would then hand it the same EINVAL forever.
+static ssize_t kmsg_read(struct fd *fd, void *buf, size_t bufsize) {
+    char fast[KMSG_LINE_FAST];
+    char *line = fast;
+    size_t line_cap = sizeof fast;
+    ssize_t res;
+
+    for (;;) {
+        uint64_t pos = fd->offset;
+        uint64_t next = pos;
+        size_t needed = 0;
+        ssize_t len = ish_log_peek_line(pos, line, line_cap, &next, &needed);
+
+        if (len == _E2BIG) {
+            // A line longer than the fast path's buffer. printk lines are tens
+            // of bytes, so pay for this only when it actually happens -- and
+            // go round again rather than trusting `needed`, since the log can
+            // move on between the two calls.
+            if (line != fast)
+                free(line);
+            line = malloc(needed);
+            if (line == NULL) {
+                line = fast;
+                line_cap = sizeof fast;
+                res = _ENOMEM;
+                break;
+            }
+            line_cap = needed;
+            continue;
+        }
+
+        if (len == _EPIPE) {
+            // The reader's position has fallen off the back of the buffer.
+            // Linux says so exactly once, resets the reader to the oldest
+            // record still there, and answers the next read normally --
+            // util-linux's dmesg retries on EPIPE and on nothing else.
+            uint64_t at = pos;
+            fd->kmsg.seq = ish_log_line_seek(&at);
+            fd->offset = (unsigned long) at;
+            res = _EPIPE;
+            break;
+        }
+
+        if (len < 0) {
+            res = len;
+            break;
+        }
+
+        // A line was found -- `next` moved -- even if it was empty. Testing
+        // the length alone would read an empty line as "caught up" and wait
+        // for something that had already arrived.
+        if (len > 0 || next != pos) {
+            res = kmsg_format_record(buf, bufsize, fd->kmsg.seq, line, (size_t) len);
+            // Before the result is looked at, so a record the guest's buffer
+            // could not hold is consumed rather than handed back forever.
+            fd->offset = (unsigned long) next;
+            fd->kmsg.seq++;
+            break;
+        }
+
+        // Caught up. Linux blocks here, and a log daemon's entire main loop is
+        // this read: answering 0 would turn that loop into a spin.
+        if (fd->flags & O_NONBLOCK_) {
+            res = _EAGAIN;
+            break;
+        }
+        int err = ish_log_wait_past(fd->offset);
+        if (err < 0) {
+            res = err;
+            break;
+        }
+    }
+
+    if (line != fast)
+        free(line);
+    return res;
+}
+
+// Linux ignores the offset on a pread of /dev/kmsg outright -- devkmsg_read
+// never looks at ppos -- so pread reads the NEXT record and advances the reader
+// exactly as a plain read does. Measured on 6.12: a read, a pread at 0, a pread
+// at 12345 and a read returned four consecutive sequence numbers.
+//
+// Not optional. Without it the generic fallback emulates pread with a pair of
+// lseeks, and this driver's lseek does not take byte offsets: it would answer
+// EINVAL to the LSEEK_CUR that saves the position, move the reader to the
+// oldest record, and then trip the assert that the restoring seek cannot fail.
+static ssize_t kmsg_pread(struct fd *fd, void *buf, size_t bufsize, off_t UNUSED(off)) {
+    return kmsg_read(fd, buf, bufsize);
 }
 
 static int kmsg_poll(struct fd *fd) {
@@ -284,12 +546,19 @@ static int kmsg_poll(struct fd *fd) {
 // the stored text. There is nowhere to route the level here, so honour the
 // syntax -- a line beginning "<6>" must not appear with the marker still on
 // it -- and drop the value.
-#define KMSG_WRITE_MAX 4096
+#define KMSG_WRITE_MAX 1024
 static ssize_t kmsg_write(struct fd *UNUSED(fd), const void *buf, size_t bufsize) {
     if (bufsize == 0)
         return 0;
+    // One write is one record, and Linux caps a record at PRINTKRB_RECORD_MAX
+    // -- 1024 bytes. Anything longer is rejected outright rather than stored
+    // truncated (measured on 6.12: 1024 is accepted and returns 1024, 1025 is
+    // EINVAL). This used to truncate silently and report the whole write
+    // consumed, which loses the tail of a message without telling anyone.
+    if (bufsize > KMSG_WRITE_MAX)
+        return _EINVAL;
     const char *msg = buf;
-    size_t len = bufsize > KMSG_WRITE_MAX ? KMSG_WRITE_MAX : bufsize;
+    size_t len = bufsize;
     size_t skip = 0;
     if (len > 2 && msg[0] == '<') {
         size_t i = 1;
@@ -306,41 +575,47 @@ static ssize_t kmsg_write(struct fd *UNUSED(fd), const void *buf, size_t bufsize
     if (n > 0)
         // Never as the format string itself: the text is the guest's.
         ish_printk("%.*s\n", (int) n, msg + skip);
-    // Linux reports the whole write consumed even where it truncated.
     return (ssize_t) bufsize;
 }
 
 static off_t_ kmsg_lseek(struct fd *fd, off_t_ off, int whence) {
-    // Offsets the guest names are relative to the oldest line still buffered,
-    // which is what Linux's SEEK_SET on /dev/kmsg means; the position we keep
-    // is absolute so a wrap cannot strand it.
-    uint64_t total = ish_log_total_written();
-    size_t size = ish_log_size();
-    uint64_t oldest = total - size;
-    off_t_ target;
+    // /dev/kmsg seeks by RECORD, not by byte. The only offset Linux accepts is
+    // zero, each whence names a fixed point in the log, and a successful seek
+    // returns 0 rather than a position (measured on 6.12: a non-zero offset is
+    // ESPIPE for every whence, including SEEK_CUR and SEEK_DATA, and SEEK_CUR
+    // is EINVAL even at zero).
+    //
+    // This is not pedantry about a rarely used call: util-linux's dmesg opens
+    // /dev/kmsg and immediately seeks SEEK_DATA, so that is the seek every
+    // plain `dmesg` in a guest performs before its first read.
+    if (off != 0)
+        return _ESPIPE;
+    uint64_t at;
     switch (whence) {
         case LSEEK_SET:
-            target = off;
+            // The first record still buffered. 0 is clamped forward to it.
+            at = 0;
             break;
-        case LSEEK_CUR:
-            target = (off_t_) ((uint64_t) fd->offset > oldest
-                               ? (uint64_t) fd->offset - oldest : 0) + off;
+        case LSEEK_DATA:
+            // The first record logged after the last syslog(2) clear, which is
+            // what `dmesg` after a `dmesg -c` is asking for.
+            at = ish_log_clear_pos();
             break;
         case LSEEK_END:
-            target = (off_t_) size + off;
+            at = ish_log_total_written();
             break;
         default:
             return _EINVAL;
     }
-    if (target < 0)
-        return _EINVAL;
-    fd->offset = (unsigned long) (oldest + (uint64_t) target);
-    return target;
+    fd->kmsg.seq = ish_log_line_seek(&at);
+    fd->offset = (unsigned long) at;
+    return 0;
 }
 
 struct dev_ops kmsg_dev = {
     .open = kmsg_open,
     .fd.read = kmsg_read,
+    .fd.pread = kmsg_pread,
     .fd.write = kmsg_write,
     .fd.lseek = kmsg_lseek,
     .fd.poll = kmsg_poll,
