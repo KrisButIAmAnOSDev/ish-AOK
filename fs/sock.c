@@ -145,6 +145,8 @@ struct audit_features_ {
 #define IFLA_MTU_ 4
 #define IFLA_TXQLEN_ 13
 #define IFLA_OPERSTATE_ 16
+#define IFLA_CARRIER_ 33
+#define IFLA_ALT_IFNAME_ 53
 
 #define IFA_ADDRESS_ 1
 #define IFA_LOCAL_ 2
@@ -157,6 +159,7 @@ struct audit_features_ {
 #define RTA_OIF_ 4
 #define RTA_GATEWAY_ 5
 #define RTA_PREFSRC_ 7
+#define RTA_TABLE_ 15
 
 #define RT_SCOPE_UNIVERSE_ 0
 #define RT_SCOPE_LINK_ 253
@@ -332,6 +335,8 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
 static int netlink_append_error(struct fd *sock, uint32_t seq,
         const struct nlmsghdr_ *req, int err_code);
 static int netlink_append_done(struct fd *sock, uint32_t seq);
+static const struct nlattr_ *netlink_attr_find(const void *attrs, size_t len, uint16_t type);
+static bool netlink_attr_streq(const struct nlattr_ *attr, const char *str);
 static void netlink_notify_register(struct fd *sock);
 static void netlink_notify_unregister(struct fd *sock);
 
@@ -497,6 +502,7 @@ struct netlink_link_info {
     uint32_t mtu;
     uint32_t txqlen;
     uint8_t operstate;
+    uint8_t carrier;
     uint8_t address[16];
     uint8_t broadcast[16];
     size_t address_len;
@@ -508,6 +514,9 @@ static void netlink_fill_link_info(const struct ifaddrs *addrs, const struct ifa
     info->mtu = 1500;
     info->txqlen = 1000;
     info->operstate = (cursor->ifa_flags & IFF_RUNNING) ? IF_OPER_UP_ : IF_OPER_UNKNOWN_;
+    // Carrier is what IFF_LOWER_UP reports for a link that is up, and Darwin's
+    // IFF_RUNNING is where both come from (netlink_linux_if_flags).
+    info->carrier = (cursor->ifa_flags & IFF_RUNNING) ? 1 : 0;
 #if defined(__APPLE__)
     if (cursor->ifa_data != NULL) {
         const struct if_data *stats = (const struct if_data *) cursor->ifa_data;
@@ -705,6 +714,14 @@ static int netlink_build_link_payload(char *payload, size_t cap, size_t *payload
             IFLA_OPERSTATE_, &info->operstate, sizeof(info->operstate));
     if (err < 0)
         return err;
+    // Linux puts IFLA_CARRIER in every link message (rtnl_fill_ifinfo), so a
+    // reader may take its absence as no carrier. waybar's network module does:
+    // it starts a link at carrier=false and only this attribute raises it, so
+    // without it a working interface showed "Disconnected".
+    err = netlink_append_attr_raw(payload, cap, &payload_len,
+            IFLA_CARRIER_, &info->carrier, sizeof(info->carrier));
+    if (err < 0)
+        return err;
     *payload_len_out = payload_len;
     return 0;
 }
@@ -766,6 +783,65 @@ static int netlink_append_route_links(struct fd *sock, const struct nlmsghdr_ *r
     freeifaddrs(addrs);
     if (err >= 0)
         err = netlink_append_done(sock, req_hdr->nlmsg_seq);
+    return err;
+}
+
+// RTM_GETLINK without NLM_F_DUMP asks for one link: by ifi_index, or when that
+// is not positive, by IFLA_IFNAME or IFLA_ALT_IFNAME (rtnl_getlink). Linux
+// answers with that link alone -- no NLM_F_MULTI, no NLMSG_DONE -- and then the
+// ACK if the request asked for one; ENODEV when nothing matches, EINVAL when
+// the request names no link. waybar's network module asks this way for the
+// link its default route leaves by, and `ip link show dev X` does too. This
+// used to answer with the whole link dump, so iproute2 printed the first link,
+// lo0, for any name, including one that does not exist.
+static int netlink_append_route_link_get(struct fd *sock, const struct nlmsghdr_ *req_hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifinfomsg_))
+        return netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _EINVAL);
+    const struct ifinfomsg_ *req = (const struct ifinfomsg_ *) payload;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req))
+        ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    const struct nlattr_ *name = NULL;
+    if (req->ifi_index <= 0) {
+        name = netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_);
+        if (name == NULL)
+            name = netlink_attr_find(attrs, attrs_len, IFLA_ALT_IFNAME_);
+        if (name == NULL)
+            return netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _EINVAL);
+    }
+
+    struct ifaddrs *addrs = NULL;
+    if (getifaddrs(&addrs) != 0)
+        return _EIO;
+    // The first entry for a name, as the dump uses.
+    const struct ifaddrs *match = NULL;
+    for (const struct ifaddrs *cursor = addrs; cursor != NULL; cursor = cursor->ifa_next) {
+        if (cursor->ifa_name == NULL)
+            continue;
+        if (name != NULL ? netlink_attr_streq(name, cursor->ifa_name)
+                : (int32_t) if_nametoindex(cursor->ifa_name) == req->ifi_index) {
+            match = cursor;
+            break;
+        }
+    }
+
+    int err;
+    if (match == NULL) {
+        err = netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _ENODEV);
+    } else {
+        struct netlink_link_info info = {};
+        netlink_fill_link_info(addrs, match, &info);
+        char reply[256];
+        size_t reply_len;
+        err = netlink_build_link_payload(reply, sizeof(reply), &reply_len,
+                match->ifa_name, match->ifa_flags, &info);
+        if (err >= 0)
+            err = netlink_append_nlmsg(sock, RTM_NEWLINK_, 0, req_hdr->nlmsg_seq, reply, reply_len);
+        if (err >= 0 && (req_hdr->nlmsg_flags & NLM_F_ACK_))
+            err = netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, 0);
+    }
+    freeifaddrs(addrs);
     return err;
 }
 
@@ -1247,20 +1323,18 @@ static int netlink_append_route_route(struct fd *sock, const struct nlmsghdr_ *r
     msg->rtm_type = RTN_UNICAST_;
     msg->rtm_flags = 0;
 
-    int err = 0;
+    // Attributes in fib_dump_info's order. RTA_TABLE is in every route Linux
+    // reports (rtm_table alone cannot name a table above 255), and a route
+    // through a router carries RTA_GATEWAY: waybar's network module takes the
+    // default route to be the one with a gateway.
+    uint32_t table = RT_TABLE_MAIN_;
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+            RTA_TABLE_, &table, sizeof(table));
+    if (err < 0)
+        return err;
     if (route->prefix_len != 0) {
         err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
                 RTA_DST_, &route->destination_be, sizeof(route->destination_be));
-        if (err < 0)
-            return err;
-    }
-    err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
-            RTA_OIF_, &route->ifindex, sizeof(route->ifindex));
-    if (err < 0)
-        return err;
-    if (route->gateway_be != 0) {
-        err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
-                RTA_GATEWAY_, &route->gateway_be, sizeof(route->gateway_be));
         if (err < 0)
             return err;
     }
@@ -1270,6 +1344,16 @@ static int netlink_append_route_route(struct fd *sock, const struct nlmsghdr_ *r
         if (err < 0)
             return err;
     }
+    if (route->gateway_be != 0) {
+        err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+                RTA_GATEWAY_, &route->gateway_be, sizeof(route->gateway_be));
+        if (err < 0)
+            return err;
+    }
+    err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+            RTA_OIF_, &route->ifindex, sizeof(route->ifindex));
+    if (err < 0)
+        return err;
 
     return netlink_append_nlmsg(sock, RTM_NEWROUTE_, NLM_F_MULTI_,
             req_hdr->nlmsg_seq, payload, payload_len);
@@ -1301,7 +1385,11 @@ static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ 
         const void *payload, size_t payload_len) {
     switch (hdr->nlmsg_type) {
         case RTM_GETLINK_:
-            return netlink_append_route_links(sock, hdr, payload, payload_len);
+            // Either bit of NLM_F_DUMP makes it a dump, as rtnetlink_rcv_msg
+            // tests it.
+            if (hdr->nlmsg_flags & NLM_F_DUMP_)
+                return netlink_append_route_links(sock, hdr, payload, payload_len);
+            return netlink_append_route_link_get(sock, hdr, payload, payload_len);
         case RTM_GETADDR_:
             return netlink_append_route_addrs(sock, hdr, payload, payload_len);
         case RTM_GETROUTE_:

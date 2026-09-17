@@ -30,11 +30,27 @@
  *     6to4 tunnel stf0 is "flags=0<>" on macOS and iOS, and forwarding that
  *     zero SIGABRTs systemd-networkd -- see the comment at the check)
  *
+ * What waybar's network module reads to find the interface it shows (each of
+ * the first two, missing, left it at "Disconnected" on a working network):
+ *   - the default route carries the router as RTA_GATEWAY. waybar takes the
+ *     default route to be the one with a gateway; AOK reported "default dev en0
+ *     scope link" with none, while /proc/net/route flagged the same route G
+ *     beside a zero gateway, which Linux never does
+ *   - every link carries IFLA_CARRIER. waybar starts the link it found at
+ *     carrier=false and only that attribute raises it
+ *   - RTM_GETLINK without NLM_F_DUMP answers with the one link it names (no
+ *     NLM_F_MULTI, no NLMSG_DONE), then the ACK; ENODEV for no such link and
+ *     EINVAL for a request naming none. AOK answered with the whole dump, so
+ *     `ip link show dev en0` printed lo0, and so did a name that did not exist
+ *   - every route carries RTA_TABLE
+ * Checked against Linux 6.12 (Devuan 6, x86_64): all of these hold there.
+ *
  * Exits 0 and prints "netlink_route: PASS" on success.
  */
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -46,6 +62,11 @@
 #include <netinet/in.h>
 
 #include "test_common.h"
+
+/* From <net/if.h>, which cannot be included here: both glibc and musl define
+ * ifr_name there as a macro, and struct nl_ifreq below has a field by that
+ * name. */
+extern unsigned int if_nametoindex(const char *ifname);
 
 /* Self-contained netlink/rtnetlink ABI (avoids a linux-headers dependency so
  * this builds under musl-only Alpine too). Values are kernel-ABI stable. */
@@ -96,9 +117,34 @@ struct nl_sockaddr {
 #define RTM_GETLINK_ 18
 #define RTM_NEWADDR_ 20
 #define RTM_GETADDR_ 22
+#define RTM_NEWROUTE_ 24
+#define RTM_GETROUTE_ 26
+#define NLM_F_ACK_ 0x004
 #define IFA_FLAGS_ 8
+#define IFLA_IFNAME_ 3
+#define IFLA_CARRIER_ 33
+#define RTA_OIF_ 4
+#define RTA_GATEWAY_ 5
+#define RTA_MULTIPATH_ 9
+#define RTA_TABLE_ 15
+#define RT_TABLE_MAIN_ 254
+#define RT_SCOPE_LINK_ 253
+#define RTF_GATEWAY_ 0x2
+#define IFF_UP_       0x1
 #define IFF_RUNNING_  0x40
 #define IFF_LOWER_UP_ 0x10000
+
+struct nl_rtmsg {
+    unsigned char rtm_family;
+    unsigned char rtm_dst_len;
+    unsigned char rtm_src_len;
+    unsigned char rtm_tos;
+    unsigned char rtm_table;
+    unsigned char rtm_protocol;
+    unsigned char rtm_scope;
+    unsigned char rtm_type;
+    uint32_t rtm_flags;
+};
 
 struct nl_ifinfomsg {
     unsigned char ifi_family;
@@ -440,6 +486,376 @@ static void test_link_dump_family_filter(void) {
     check("famaddr.inet_subset_of_all", addr_v4 <= addr_all, 1);
 }
 
+/* Attribute `type` of a message whose fixed header is `fixed` bytes, or NULL. */
+static struct nl_rtattr *msg_attr(struct nl_hdr *nlh, size_t fixed, uint16_t type) {
+    int len = (int) nlh->nlmsg_len - NL_HDRLEN - (int) NL_ALIGN(fixed);
+    struct nl_rtattr *rta = (struct nl_rtattr *) ((char *) NL_DATA(nlh) + NL_ALIGN(fixed));
+    while (len >= (int) sizeof(*rta) && rta->rta_len >= sizeof(*rta) &&
+            (int) rta->rta_len <= len) {
+        if ((rta->rta_type & 0x3fff) == type)
+            return rta;
+        len -= NL_ALIGN(rta->rta_len);
+        rta = (struct nl_rtattr *) ((char *) rta + NL_ALIGN(rta->rta_len));
+    }
+    return NULL;
+}
+#define ATTR_DATA(rta) ((void *) ((char *) (rta) + NL_ALIGN(sizeof(struct nl_rtattr))))
+#define ATTR_LEN(rta)  ((int) (rta)->rta_len - (int) sizeof(struct nl_rtattr))
+
+static uint32_t attr_u32(struct nl_rtattr *rta) {
+    uint32_t v = 0;
+    if (ATTR_LEN(rta) >= (int) sizeof v)
+        memcpy(&v, ATTR_DATA(rta), sizeof v);
+    return v;
+}
+
+struct link_rec {
+    int index;
+    char name[16];
+    uint32_t flags;
+    int carrier; /* -1: no IFLA_CARRIER */
+};
+
+#define MAX_LINKS 128
+
+/* Every link one RTM_GETLINK dump reports. */
+static int collect_links(struct link_rec *links, int cap) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0)
+        return -1;
+    if (send_dump_family(fd, IO_SEND, RTM_GETLINK_, 0x6000, 0) <= 0) {
+        close(fd);
+        return -1;
+    }
+    char buf[64 * 1024];
+    int count = 0, done = 0;
+    arm_alarm(10);
+    while (!done && !alarm_fired) {
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0)
+            break;
+        struct nl_hdr *nlh = (struct nl_hdr *) buf;
+        int len = (int) n;
+        for (; NL_OK(nlh, len); nlh = NL_NEXT(nlh, len)) {
+            if (nlh->nlmsg_type == NLMSG_DONE_ || nlh->nlmsg_type == NLMSG_ERROR_) {
+                done = 1;
+                break;
+            }
+            if (nlh->nlmsg_type != RTM_NEWLINK_ || count >= cap)
+                continue;
+            struct nl_ifinfomsg *ifi = NL_DATA(nlh);
+            struct link_rec *l = &links[count++];
+            memset(l, 0, sizeof *l);
+            l->index = ifi->ifi_index;
+            l->flags = ifi->ifi_flags;
+            struct nl_rtattr *name = msg_attr(nlh, sizeof *ifi, IFLA_IFNAME_);
+            if (name != NULL)
+                snprintf(l->name, sizeof l->name, "%.*s", ATTR_LEN(name), (char *) ATTR_DATA(name));
+            struct nl_rtattr *carrier = msg_attr(nlh, sizeof *ifi, IFLA_CARRIER_);
+            l->carrier = carrier != NULL && ATTR_LEN(carrier) >= 1
+                ? *(unsigned char *) ATTR_DATA(carrier) : -1;
+        }
+    }
+    alarm(0);
+    close(fd);
+    return count;
+}
+
+/* Linux puts IFLA_CARRIER in every link message, and for a link that is up it
+ * agrees with IFF_LOWER_UP: dev_get_flags() sets LOWER_UP from the carrier
+ * while the device runs. A link that is down may report either. waybar's
+ * network module starts the link it found at carrier=false, and only this
+ * attribute raises it, so without it a working interface was "Disconnected". */
+static void test_link_carrier(void) {
+    struct link_rec links[MAX_LINKS];
+    int n = collect_links(links, MAX_LINKS);
+    check("carrier.have_links", n >= 1, 1);
+    int missing = 0, disagree = 0;
+    for (int i = 0; i < n; i++) {
+        if (links[i].carrier < 0) {
+            test_log_if(1, "  carrier: link %d (%s) has no IFLA_CARRIER\n",
+                        links[i].index, links[i].name);
+            missing++;
+        } else if ((links[i].flags & IFF_UP_) &&
+                links[i].carrier != !!(links[i].flags & IFF_LOWER_UP_)) {
+            test_log_if(1, "  carrier: link %d (%s) is up, carrier=%d, flags=%#x\n",
+                        links[i].index, links[i].name, links[i].carrier, links[i].flags);
+            disagree++;
+        }
+    }
+    check("carrier.every_link_has_it", missing, 0);
+    check("carrier.agrees_with_lower_up", disagree, 0);
+}
+
+struct getlink_reply {
+    int newlinks;  /* RTM_NEWLINK messages */
+    int multi;     /* ...of them carrying NLM_F_MULTI */
+    int index;     /* ifi_index of the last */
+    char name[16]; /* IFLA_IFNAME of the last */
+    int acks;      /* NLMSG_ERROR with error 0 */
+    int error;     /* the last nonzero NLMSG_ERROR */
+    int dones;     /* NLMSG_DONE */
+    int other;     /* anything else */
+    int wrong_seq; /* replies not carrying the request's nlmsg_seq */
+};
+
+/* One RTM_GETLINK request without NLM_F_DUMP, naming its link by index or, when
+ * `name` is not NULL, by IFLA_IFNAME, and everything that comes back. The
+ * kernel queues the whole answer before sendmsg returns, so once the first
+ * reply is readable the rest is drained without waiting. Returns 1 if anything
+ * came back, 0 if nothing did, -1 if the request could not be sent. */
+static int getlink_one(int fd, uint32_t seq, int index, const char *name, int ack,
+                       struct getlink_reply *r) {
+    char req[128];
+    memset(req, 0, sizeof req);
+    memset(r, 0, sizeof *r);
+    struct nl_hdr *nlh = (struct nl_hdr *) req;
+    size_t len = NL_HDRLEN + NL_ALIGN(sizeof(struct nl_ifinfomsg));
+    ((struct nl_ifinfomsg *) NL_DATA(nlh))->ifi_index = index;
+    if (name != NULL) {
+        struct nl_rtattr *rta = (struct nl_rtattr *) (req + len);
+        size_t name_len = strlen(name) + 1;
+        rta->rta_type = IFLA_IFNAME_;
+        rta->rta_len = (uint16_t) (sizeof *rta + name_len);
+        memcpy(rta + 1, name, name_len);
+        len += NL_ALIGN(rta->rta_len);
+    }
+    nlh->nlmsg_len = (uint32_t) len;
+    nlh->nlmsg_type = RTM_GETLINK_;
+    nlh->nlmsg_flags = NLM_F_REQUEST_ | (ack ? NLM_F_ACK_ : 0);
+    nlh->nlmsg_seq = seq;
+    struct nl_sockaddr dst = { .nl_family = AF_NETLINK };
+    if (sendto(fd, req, len, 0, (struct sockaddr *) &dst, sizeof dst) != (ssize_t) len)
+        return -1;
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (poll(&pfd, 1, 2000) != 1)
+        return 0;
+    char buf[16 * 1024];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0)
+            break;
+        struct nl_hdr *h = (struct nl_hdr *) buf;
+        int left = (int) n;
+        for (; NL_OK(h, left); h = NL_NEXT(h, left)) {
+            if (h->nlmsg_seq != seq)
+                r->wrong_seq++;
+            if (h->nlmsg_type == RTM_NEWLINK_) {
+                struct nl_ifinfomsg *ifi = NL_DATA(h);
+                r->newlinks++;
+                if (h->nlmsg_flags & NLM_F_MULTI_)
+                    r->multi++;
+                r->index = ifi->ifi_index;
+                struct nl_rtattr *nm = msg_attr(h, sizeof *ifi, IFLA_IFNAME_);
+                if (nm != NULL)
+                    snprintf(r->name, sizeof r->name, "%.*s", ATTR_LEN(nm), (char *) ATTR_DATA(nm));
+            } else if (h->nlmsg_type == NLMSG_ERROR_) {
+                struct nl_err *e = NL_DATA(h);
+                if (e->error == 0)
+                    r->acks++;
+                else
+                    r->error = e->error;
+            } else if (h->nlmsg_type == NLMSG_DONE_) {
+                r->dones++;
+            } else {
+                r->other++;
+            }
+        }
+    }
+    return 1;
+}
+
+static void log_getlink(const char *what, const struct getlink_reply *r) {
+    test_log_if(1, "  getlink %s: newlinks=%d multi=%d index=%d name=%s acks=%d error=%d "
+                "dones=%d other=%d wrong_seq=%d\n", what, r->newlinks, r->multi, r->index,
+                r->name, r->acks, r->error, r->dones, r->other, r->wrong_seq);
+}
+
+/* RTM_GETLINK without NLM_F_DUMP (rtnl_getlink): the one link the request names,
+ * without NLM_F_MULTI or NLMSG_DONE, then the ACK when one was asked for. No such
+ * link is ENODEV; naming none is EINVAL. waybar asks this way for the link its
+ * default route leaves by, and `ip link show dev X` does too. AOK answered with
+ * the whole dump, and iproute2 printed its first link, lo0, for any name. */
+static void test_link_get(void) {
+    struct link_rec links[MAX_LINKS];
+    int n = collect_links(links, MAX_LINKS);
+    check("getlink.have_links", n >= 1, 1);
+    if (n < 1)
+        return;
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("getlink.socket", fd >= 0, 1);
+    if (fd < 0)
+        return;
+
+    struct getlink_reply r;
+    int wrong = 0;
+    for (int i = 0; i < n; i++) {
+        int got = getlink_one(fd, 0x7000 + (uint32_t) i, links[i].index, NULL, 1, &r);
+        if (got != 1 || r.newlinks != 1 || r.multi != 0 || r.index != links[i].index ||
+                strcmp(r.name, links[i].name) != 0 || r.acks != 1 || r.error != 0 ||
+                r.dones != 0 || r.other != 0 || r.wrong_seq != 0) {
+            char what[48];
+            snprintf(what, sizeof what, "index %d (%s) got=%d", links[i].index, links[i].name, got);
+            log_getlink(what, &r);
+            wrong++;
+        }
+    }
+    check("getlink.by_index_that_link_then_ack", wrong, 0);
+
+    int got = getlink_one(fd, 0x7100, 0, links[0].name, 1, &r);
+    int ok = got == 1 && r.newlinks == 1 && r.multi == 0 && r.index == links[0].index &&
+        r.acks == 1 && r.error == 0 && r.dones == 0 && r.other == 0;
+    if (!ok)
+        log_getlink("by name", &r);
+    check("getlink.by_name_that_link_then_ack", ok, 1);
+
+    got = getlink_one(fd, 0x7101, links[0].index, NULL, 0, &r);
+    ok = got == 1 && r.newlinks == 1 && r.multi == 0 && r.acks == 0 && r.error == 0 &&
+        r.dones == 0 && r.other == 0;
+    if (!ok)
+        log_getlink("without NLM_F_ACK", &r);
+    check("getlink.no_ack_link_alone", ok, 1);
+
+    got = getlink_one(fd, 0x7102, 2000000000, NULL, 1, &r);
+    if (r.error != -ENODEV || r.newlinks != 0)
+        log_getlink("missing index", &r);
+    check("getlink.missing_index_enodev", r.error, -ENODEV);
+    check("getlink.missing_index_no_link", r.newlinks, 0);
+
+    got = getlink_one(fd, 0x7103, 0, "nosuchlink9", 1, &r);
+    if (r.error != -ENODEV || r.newlinks != 0)
+        log_getlink("missing name", &r);
+    check("getlink.missing_name_enodev", r.error, -ENODEV);
+
+    got = getlink_one(fd, 0x7104, 0, NULL, 1, &r);
+    if (r.error != -EINVAL || r.newlinks != 0)
+        log_getlink("no index or name", &r);
+    check("getlink.nothing_named_einval", r.error, -EINVAL);
+    close(fd);
+}
+
+/* /proc/net/route and the rtnetlink route dump describe the same table. On
+ * Linux a route flagged G (RTF_GATEWAY) names a nonzero gateway; a default
+ * route through a router is in the main table's dump with the router as
+ * RTA_GATEWAY and its interface as RTA_OIF; a route through a router is never
+ * link scope (fib_check_nh refuses one); and every route carries RTA_TABLE,
+ * agreeing with rtm_table when the id fits in it.
+ *
+ * AOK flagged its default route G beside a zero gateway and reported it over
+ * rtnetlink as "default dev en0 scope link", with no RTA_GATEWAY and no
+ * RTA_TABLE. waybar's network module takes the default route to be the one
+ * with a gateway, found none, and showed "Disconnected" on a working network. */
+static void test_route_gateway(void) {
+    FILE *f = fopen("/proc/net/route", "r");
+    check("route.proc_open", f != NULL, 1);
+    if (f == NULL)
+        return;
+    struct { char ifname[16]; uint32_t gateway; } proc_defaults[16];
+    int n_proc = 0, flagged_without_gateway = 0;
+    char line[256];
+    while (fgets(line, sizeof line, f) != NULL) {
+        char ifname[16];
+        unsigned dest, gateway, flags, mask;
+        int refcnt, use, metric;
+        if (sscanf(line, "%15s %x %x %x %d %d %d %x", ifname, &dest, &gateway, &flags,
+                   &refcnt, &use, &metric, &mask) != 8)
+            continue;
+        if ((flags & RTF_GATEWAY_) && gateway == 0) {
+            test_log_if(1, "  route: /proc/net/route %s %08X is flagged G with gateway 0\n",
+                        ifname, dest);
+            flagged_without_gateway++;
+        }
+        if (dest == 0 && mask == 0 && (flags & RTF_GATEWAY_) && gateway != 0 && n_proc < 16) {
+            snprintf(proc_defaults[n_proc].ifname, sizeof proc_defaults[n_proc].ifname, "%s", ifname);
+            proc_defaults[n_proc].gateway = gateway;
+            n_proc++;
+        }
+    }
+    fclose(f);
+    check("route.proc_g_flag_has_gateway", flagged_without_gateway, 0);
+
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("route.socket", fd >= 0, 1);
+    if (fd < 0)
+        return;
+    check("route.dump_sent", send_dump_family(fd, IO_SEND, RTM_GETROUTE_, 0x7200, AF_INET) > 0, 1);
+    struct { uint32_t gateway; uint32_t oif; } nl_defaults[32];
+    int n_nl = 0, routes = 0, no_table = 0, table_mismatch = 0, gateway_link_scope = 0;
+    int multipath_default = 0, done = 0;
+    char buf[64 * 1024];
+    arm_alarm(10);
+    while (!done && !alarm_fired) {
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0)
+            break;
+        struct nl_hdr *h = (struct nl_hdr *) buf;
+        int left = (int) n;
+        for (; NL_OK(h, left); h = NL_NEXT(h, left)) {
+            if (h->nlmsg_type == NLMSG_DONE_ || h->nlmsg_type == NLMSG_ERROR_) {
+                done = 1;
+                break;
+            }
+            if (h->nlmsg_type != RTM_NEWROUTE_)
+                continue;
+            routes++;
+            struct nl_rtmsg *rtm = NL_DATA(h);
+            unsigned table_id = rtm->rtm_table;
+            struct nl_rtattr *table = msg_attr(h, sizeof *rtm, RTA_TABLE_);
+            if (table == NULL) {
+                test_log_if(no_table == 0, "  route: a route (dst_len %u, table %u) has no RTA_TABLE\n",
+                            rtm->rtm_dst_len, rtm->rtm_table);
+                no_table++;
+            } else {
+                table_id = attr_u32(table);
+                if (table_id < 256 && table_id != rtm->rtm_table)
+                    table_mismatch++;
+            }
+            struct nl_rtattr *gateway = msg_attr(h, sizeof *rtm, RTA_GATEWAY_);
+            if (gateway != NULL && rtm->rtm_scope >= RT_SCOPE_LINK_) {
+                test_log_if(1, "  route: a route through a gateway has scope %u\n", rtm->rtm_scope);
+                gateway_link_scope++;
+            }
+            if (table_id == RT_TABLE_MAIN_ && rtm->rtm_dst_len == 0) {
+                if (msg_attr(h, sizeof *rtm, RTA_MULTIPATH_) != NULL)
+                    multipath_default++;
+                struct nl_rtattr *oif = msg_attr(h, sizeof *rtm, RTA_OIF_);
+                if (gateway != NULL && ATTR_LEN(gateway) == 4 && oif != NULL && n_nl < 32) {
+                    nl_defaults[n_nl].gateway = attr_u32(gateway);
+                    nl_defaults[n_nl].oif = attr_u32(oif);
+                    n_nl++;
+                }
+            }
+        }
+    }
+    alarm(0);
+    close(fd);
+    check("route.dump_terminated", done, 1);
+    check("route.dump_has_routes", routes >= 1, 1);
+    check("route.every_route_has_rta_table", no_table, 0);
+    check("route.rta_table_matches_rtm_table", table_mismatch, 0);
+    check("route.gateway_route_not_link_scope", gateway_link_scope, 0);
+
+    /* A multipath default names its routers in RTA_MULTIPATH, not RTA_GATEWAY. */
+    int unmatched = 0;
+    for (int i = 0; i < n_proc && multipath_default == 0; i++) {
+        uint32_t ifindex = if_nametoindex(proc_defaults[i].ifname);
+        int found = 0;
+        for (int j = 0; j < n_nl; j++)
+            if (nl_defaults[j].gateway == proc_defaults[i].gateway && nl_defaults[j].oif == ifindex)
+                found = 1;
+        if (!found) {
+            test_log_if(1, "  route: /proc/net/route default via %08X dev %s (index %u) is not "
+                        "an rtnetlink default route with that RTA_GATEWAY and RTA_OIF\n",
+                        proc_defaults[i].gateway, proc_defaults[i].ifname, ifindex);
+            unmatched++;
+        }
+    }
+    check("route.proc_default_gateway_in_rtnetlink", unmatched, 0);
+    test_log_if(test_verbose, "  route: %d routes, %d /proc default gateways, %d rtnetlink\n",
+                routes, n_proc, n_nl);
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     signal(SIGPIPE, SIG_IGN);
@@ -457,6 +873,11 @@ int main(int argc, char **argv) {
 
     /* The SIOCGIFTXQLEN ioctl `ip addr` issues per interface. */
     test_ifr_txqlen();
+
+    /* What waybar's network module needs to find the interface it shows. */
+    test_link_carrier();
+    test_link_get();
+    test_route_gateway();
 
     return finish_suite("netlink_route");
 }

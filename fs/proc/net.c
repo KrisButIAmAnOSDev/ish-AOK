@@ -547,7 +547,9 @@ static int proc_show_route(struct proc_entry *UNUSED(entry), struct proc_data *b
     if (host_route_table_collect(&routes) == 0) {
         for (size_t i = 0; i < routes.count; i++) {
             const struct host_route_entry *route = &routes.entries[i];
-            proc_printf(buf, "%-6.6s  %08X  %08X  %04X  %d  %d  %d  %08X  %u  %d  %d\n",
+            // The whole name, as Linux prints it: a precision here cut
+            // pdp_ip0 or bridge100 to six characters, naming no interface.
+            proc_printf(buf, "%-6s  %08X  %08X  %04X  %d  %d  %d  %08X  %u  %d  %d\n",
                     route->ifname,
                     route->destination_be,
                     route->gateway_be,
