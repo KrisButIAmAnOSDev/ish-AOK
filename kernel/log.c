@@ -40,7 +40,19 @@ static cond_t log_cond = COND_INITIALIZER;
 #define SYSLOG_ACTION_SIZE_UNREAD_ 9
 #define SYSLOG_ACTION_SIZE_BUFFER_ 10
 
-static size_t syslog_read(guest_addr_t buf_addr, size_t len, int flags) {
+// What a read case has taken out of the log and still owes the guest. The copy
+// into guest memory happens after log_lock has been dropped: user_write reaches
+// into the guest address space, which can fault and take the memory lock, and a
+// fault path logs -- and printk takes this same lock.
+struct syslog_copy {
+    char *buf;  // malloc()ed, and NULL when there is nothing to hand over
+    size_t len;
+};
+
+// Take up to `len` bytes out of the log. Caller holds log_lock. Returns the
+// byte count, or a negative errno; the bytes themselves go into *out, for the
+// caller to copy out once the lock is clear.
+static size_t syslog_take(size_t len, int flags, struct syslog_copy *out) {
     size_t available = fifo_size(&log_buf);
     if (flags & FIFO_LAST && available > log_max_since_clear)
         available = log_max_since_clear;
@@ -56,12 +68,37 @@ static size_t syslog_read(guest_addr_t buf_addr, size_t len, int flags) {
         free(buf);
         return _EIO;
     }
-    if (user_write(buf_addr, buf, len)) {
-        free(buf);
-        return _EFAULT;
-    }
-    free(buf);
+    out->buf = buf;
+    out->len = len;
     return len;
+}
+
+// Wait until SYSLOG_ACTION_READ has something to give.
+//
+// Linux parks that read in wait_event_interruptible until there are records
+// past the reader's position (printk.c, syslog_print); returning 0 for "the log
+// is empty" instead turns the main loop of every syslog daemon into a spin.
+// busybox klogd is a klogctl(2, ...) loop that treats 0 as "read nothing, go
+// round again": measured before this, `klogd -n` sat in state R and burned 100
+// ticks a second, a whole core, for as long as it was left running.
+//
+// The condition is a non-empty buffer rather than a position, because this read
+// CONSUMES what it returns -- there is nothing for ish_log_wait_past's absolute
+// position, which the /dev/kmsg stream reader uses, to be compared against.
+//
+// Caller holds log_lock, which wait_for_blocked releases while it sleeps.
+// wait_for_blocked and not wait_for: the task is parked in a syscall, so it
+// must read as sleeping, and a bare address-space poke is a spurious wakeup
+// rather than an interruption -- wait_for would hand that back as _EINTR and
+// fail a read that nothing had interrupted.
+static int syslog_wait_for_data(void) {
+    int err = 0;
+    while (fifo_size(&log_buf) == 0) {
+        err = wait_for_blocked(&log_cond, &log_lock, NULL);
+        if (err < 0)
+            break;
+    }
+    return err;
 }
 
 size_t ish_log_size(void) {
@@ -152,22 +189,41 @@ int ish_log_wait_past(uint64_t pos) {
     return err;
 }
 
-static size_t do_syslog(int type, guest_addr_t buf_addr, int_t len) {
+static size_t do_syslog(int type, guest_addr_t buf_addr, int_t len, struct syslog_copy *out) {
     int res;
     switch (type) {
-        case SYSLOG_ACTION_READ_:
+        case SYSLOG_ACTION_READ_: {
             if (len < 0)
                 return _EINVAL;
-            return syslog_read(buf_addr, len, 0);
+            // Both checked before anything waits, because Linux checks them
+            // before it waits (measured on 6.12: a NULL buffer is EINVAL and a
+            // zero length returns 0 at once, on a log with nothing unread).
+            // They used to fall out of a read that could not block at all; now
+            // that it waits, a guest passing either would wait forever.
+            if (buf_addr == 0)
+                return _EINVAL;
+            if (len == 0)
+                return 0;
+            int err = 0;
+            // Nothing may return out of TASK_MAY_BLOCK. It is a for loop, so
+            // leaving its body any way but the bottom skips task_may_block_end
+            // and leaves the task marked blocked while it goes on running.
+            TASK_MAY_BLOCK {
+                err = syslog_wait_for_data();
+            }
+            if (err < 0)
+                return err;
+            return syslog_take(len, 0, out);
+        }
         case SYSLOG_ACTION_READ_ALL_:
             if (len < 0)
                 return _EINVAL;
-            return syslog_read(buf_addr, len, FIFO_LAST | FIFO_PEEK);
+            return syslog_take(len, FIFO_LAST | FIFO_PEEK, out);
 
         case SYSLOG_ACTION_READ_CLEAR_:
             if (len < 0)
                 return _EINVAL;
-            res = (int)syslog_read(buf_addr, len, FIFO_LAST | FIFO_PEEK);
+            res = (int)syslog_take(len, FIFO_LAST | FIFO_PEEK, out);
             if (res < 0)
                 return res;
             FALLTHROUGH;
@@ -195,10 +251,27 @@ size_t sys_syslog(int_t type, addr_t buf_addr, int_t len) {
 }
 
 size_t sys_syslog_guest(int_t type, guest_addr_t buf_addr, int_t len) {
+    struct syslog_copy copy = { .buf = NULL, .len = 0 };
     lock(&log_lock, 0);
-    size_t retval = do_syslog(type, buf_addr, len);
+    size_t retval = do_syslog(type, buf_addr, len, &copy);
     unlock(&log_lock);
-    return retval;
+
+    // Outside log_lock -- see struct syslog_copy. A destructive READ has
+    // already consumed these bytes by the time the copy fails, so an EFAULT
+    // loses them; Linux loses them the same way, having already advanced
+    // syslog_seq past the records it copied.
+    if (copy.buf != NULL) {
+        if (user_write(buf_addr, copy.buf, copy.len))
+            retval = _EFAULT;
+        free(copy.buf);
+    }
+
+    // Linux ends a waiting SYSLOG_ACTION_READ with -ERESTARTSYS, so SA_RESTART
+    // decides whether the guest ever sees the interruption. Measured on 6.12:
+    // interrupted by a handler without SA_RESTART the call fails with EINTR,
+    // and with SA_RESTART it resumes and returns the message that landed
+    // afterwards. A no-op for every other type, none of which can wait.
+    return (size_t) signal_restart_or_eintr((int_t) retval);
 }
 
 static void log_buf_append(const char *msg) {
