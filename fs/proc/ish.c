@@ -48,6 +48,7 @@ char *(*ish_workspace_status)(void);
 int (*ish_workspace_open)(const char *request);
 
 #include "kernel/hostinfo.h"
+#include "kernel/BatteryStatus.h"
 
 static int proc_ish_show_colors(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf,
@@ -1748,20 +1749,46 @@ static int proc_ish_show_version(struct proc_entry *UNUSED(entry), struct proc_d
     return 0;
 }
 
-extern char* printBatteryStatus(int type);
+// /proc/ish/BAT0 and its two single-value siblings: AOK's own battery files,
+// which predate /sys/class/power_supply here. Their output is unchanged from
+// when the app formatted it, including the level's two decimals and the
+// -100.00 a host with no battery produces (UIDevice's -1, times 100); scripts
+// read these.
+static const char *proc_ish_battery_state_name(enum host_battery_state state) {
+    switch (state) {
+        case HOST_BATTERY_UNPLUGGED:
+            return "Discharging";
+        case HOST_BATTERY_CHARGING:
+            return "Charging";
+        case HOST_BATTERY_FULL:
+            return "Full";
+        default:
+            return "Unknown";
+    }
+}
 
 static int proc_ish_show_battery(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(3));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "battery_level: %.2f\n", battery.level * 100);
+    proc_printf(buf, "battery_state: %s\n", proc_ish_battery_state_name(battery.state));
+    proc_printf(buf, "low_power_mode: %s\n",
+                battery.low_power_mode > 0 ? "Enabled" :
+                battery.low_power_mode == 0 ? "Disabled" : "Unknown");
     return 0;
 }
 
 static int proc_ish_show_battery_capacity(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(2));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "%.2f\n", battery.level * 100);
     return 0;
 }
 
 static int proc_ish_show_battery_status(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(1));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "%s\n", proc_ish_battery_state_name(battery.state));
     return 0;
 }
 

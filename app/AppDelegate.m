@@ -43,6 +43,7 @@
 #import "Terminal.h"
 #import "TerminalViewController.h"
 #include "kernel/checkpoint.h"
+#include "kernel/BatteryStatus.h"
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
 #import "UIViewController+Extras.h"
@@ -3146,14 +3147,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
     generic_unlinkat(AT_PWD, "/var/run");
     generic_symlinkat("/run", AT_PWD, "/var/run");
     
-    // Create directories/links to simulate /sys stuff for battery monitoring
-    generic_mkdirat(AT_PWD, "/sys/class", 0755);
-    generic_mkdirat(AT_PWD, "/sys/class/power_supply", 0755);
-    generic_mkdirat(AT_PWD, "/sys/class/power_supply/BAT0", 0755);
+    // The battery is published by sysfs itself now (/sys/class/power_supply,
+    // fs/proc/root.c). What used to be here built BAT0 as directories and
+    // symlinks inside the root's own /sys, which the sysfs mount below hid on
+    // every boot.
     generic_mkdirat(AT_PWD, "/AOK", 0555);
-    generic_symlinkat("/proc/ish/BAT0_capacity", AT_PWD, "/sys/class/power_supply/BAT0/capacity");
-    generic_symlinkat("/proc/ish/BAT0_status", AT_PWD, "/sys/class/power_supply/BAT0/status");
-    
+
     
     
     // Register clipboard device driver and create device node for it
@@ -4097,6 +4096,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
         [defaults removeObjectForKey:kPreferenceLaunchCommandKey];
         [defaults setBool:NO forKey:@"hail mary"];
     }
+    // The battery the kernel reports, cached on the main queue
+    // (kernel/BatteryStatus.m). First, because this is the earliest anything can
+    // boot the guest, and a guest that asks before the first reading gets none.
+    // Ahead of the recovery check too, so that no later path to ensureBooted has
+    // to know whether it ran; it costs a few property reads.
+    ISHHostStatusStart();
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"recovery"])
         return YES;
 

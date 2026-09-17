@@ -16,6 +16,7 @@
 #include "fs/dev.h"
 #include "fs/proc/ish.h"
 #include "jit/jit.h"
+#include "kernel/BatteryStatus.h"
 #include "kernel/errno.h"
 #include "kernel/hostinfo.h"
 
@@ -172,15 +173,18 @@ char *printUIDevice(void) {
     return "standalone";
 }
 
-char *printBatteryStatus(int type) {
-    switch (type) {
-        case 1:
-            return "Unknown\n";
-        case 2:
-            return "-1\n";
-        default:
-            return "Unknown -1\n";
-    }
+// The command-line twin of kernel/BatteryStatus.m; kernel/BatteryStatus.h says
+// why each needs both. There is no battery source here, so it says UNKNOWN.
+// That is the truth, and it already has a meaning a guest understands: an empty
+// /sys/class/power_supply, as on a Linux machine without a battery.
+void hostBatteryStatus(struct host_battery_status *out) {
+    if (out == NULL)
+        return;
+    *out = (struct host_battery_status) {
+        .state = HOST_BATTERY_UNKNOWN,
+        .level = -1,
+        .low_power_mode = -1,
+    };
 }
 
 void jit_install_thread_exception_handler(void) {

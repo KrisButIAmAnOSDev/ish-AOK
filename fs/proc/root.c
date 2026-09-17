@@ -22,6 +22,7 @@
 #include "kernel/abi.h"
 #include "kernel/init.h"
 #include "kernel/hostinfo.h"
+#include "kernel/BatteryStatus.h"
 // Last, deliberately: this header #defines POLL_* over the SIGPOLL si_code
 // constants glibc declares as an ENUM, so any system header pulled in after
 // it turns those enumerators into numeric literals. Clang on Darwin never
@@ -1226,6 +1227,17 @@ enum sysfs_node_kind {
     sysfs_net_tx_errors,
     sysfs_net_tx_dropped,
     sysfs_net_collisions,
+    sysfs_class_power_supply,
+    sysfs_power_battery,
+    sysfs_battery_uevent,
+    sysfs_battery_type,
+    sysfs_battery_present,
+    sysfs_battery_status,
+    sysfs_battery_capacity,
+    sysfs_power_mains,
+    sysfs_mains_uevent,
+    sysfs_mains_type,
+    sysfs_mains_online,
 };
 
 // A node is identified by (kind, cpu, index). cpu is -1 except under cpuN/,
@@ -1392,6 +1404,43 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_net_tx_errors, sysfs_net_statistics, "tx_errors", SYSFS_REG},
     {sysfs_net_tx_dropped, sysfs_net_statistics, "tx_dropped", SYSFS_REG},
     {sysfs_net_collisions, sysfs_net_statistics, "collisions", SYSFS_REG},
+
+    // /sys/class/power_supply: the battery, where Linux userland looks for it.
+    // waybar's battery module watches this directory with inotify and DISABLED
+    // ITSELF when it was missing ("Could not watch for battery plug/unplug");
+    // btop reads capacity, htop reads uevent.
+    //
+    // The directory always exists. What is under it depends on the host: while
+    // the host reports a battery, BAT0 and an AC adapter, shaped like ACPI's; a
+    // host with no battery -- the CLI, a desktop Mac -- gets an empty
+    // directory, which is what Linux shows on a machine without one. See
+    // sysfs_power_supply_known().
+    //
+    // Only what the host actually reports is published: a state and a
+    // percentage. No energy_*, charge_*, voltage_*, current_*, power_* or
+    // time_to_* files, because iOS gives no such figures and an invented one
+    // is worse than an absent file -- a tool that finds none falls back to
+    // capacity, a tool that finds a wrong one believes it. htop's battery
+    // meter, which needs a full-charge figure, therefore reads N/A.
+    //
+    // BAT0 is listed before AC on purpose. waybar takes as its adapter the
+    // LAST supply in directory order with an `online` or `status` file, and
+    // BAT0 has a status: listed after AC, BAT0 would become the "adapter", and
+    // waybar would decide whether a discharging battery is plugged in from a
+    // BAT0/online that does not exist.
+    {sysfs_class_power_supply, sysfs_class, "power_supply", SYSFS_DIR},
+    {sysfs_power_battery, sysfs_class_power_supply, "BAT0", SYSFS_DIR},
+    {sysfs_power_mains, sysfs_class_power_supply, "AC", SYSFS_DIR},
+
+    {sysfs_battery_uevent, sysfs_power_battery, "uevent", SYSFS_REG},
+    {sysfs_battery_type, sysfs_power_battery, "type", SYSFS_REG},
+    {sysfs_battery_present, sysfs_power_battery, "present", SYSFS_REG},
+    {sysfs_battery_status, sysfs_power_battery, "status", SYSFS_REG},
+    {sysfs_battery_capacity, sysfs_power_battery, "capacity", SYSFS_REG},
+
+    {sysfs_mains_uevent, sysfs_power_mains, "uevent", SYSFS_REG},
+    {sysfs_mains_type, sysfs_power_mains, "type", SYSFS_REG},
+    {sysfs_mains_online, sysfs_power_mains, "online", SYSFS_REG},
 };
 
 #undef SYSFS_DIR
@@ -1520,10 +1569,23 @@ static bool sysfs_net_iface_at(int index, struct net_iface_stats *out) {
     return true;
 }
 
+// The host's battery, if it reports one. A state without a level is treated as
+// no battery at all: every consumer of BAT0 wants its capacity, and there is
+// no honest number to put there.
+static bool sysfs_power_supply_known(struct host_battery_status *battery) {
+    hostBatteryStatus(battery);
+    return battery->state != HOST_BATTERY_UNKNOWN && battery->level >= 0;
+}
+
 // How many instances of this kind exist under one parent.
 static size_t sysfs_net_file_data(struct sysfs_node node, char *buf, size_t bufsize);
+static size_t sysfs_power_supply_file_data(struct sysfs_node node, char *buf, size_t bufsize);
 
 static int sysfs_node_multiplicity(enum sysfs_node_kind kind) {
+    if (kind == sysfs_power_battery || kind == sysfs_power_mains) {
+        struct host_battery_status battery;
+        return sysfs_power_supply_known(&battery) ? 1 : 0;
+    }
     if (kind == sysfs_cpu_dir)
         return sysfs_cpu_count();
     if (kind == sysfs_net_dir)
@@ -1581,6 +1643,10 @@ static bool sysfs_lookup_child(struct sysfs_node parent, const char *name, size_
 
         if (desc->name != NULL) {
             if (strlen(desc->name) != namelen || strncmp(desc->name, name, namelen) != 0)
+                continue;
+            // A named node can still be absent: the power supplies exist only
+            // while the host reports a battery.
+            if (sysfs_node_multiplicity(desc->kind) < 1)
                 continue;
             *child_out = sysfs_node_make(desc->kind, parent.cpu, parent.index);
             return true;
@@ -1866,6 +1932,16 @@ static size_t sysfs_file_data(struct sysfs_node node, char *buf, size_t bufsize)
             return snprintf(buf, bufsize, "0\n");
         case sysfs_block_dev_hidden:
             return snprintf(buf, bufsize, "0\n");
+
+        case sysfs_battery_uevent:
+        case sysfs_battery_type:
+        case sysfs_battery_present:
+        case sysfs_battery_status:
+        case sysfs_battery_capacity:
+        case sysfs_mains_uevent:
+        case sysfs_mains_type:
+        case sysfs_mains_online:
+            return sysfs_power_supply_file_data(node, buf, bufsize);
         default:
             return 0;
     }
@@ -1883,6 +1959,70 @@ static unsigned int sysfs_net_linux_flags(unsigned int host_flags) {
 #else
     return host_flags;           // already Linux's
 #endif
+}
+
+// BAT0 and AC. The contents follow Linux's power_supply class
+// (Documentation/ABI/testing/sysfs-class-power), and uevent is what that class
+// writes for these properties on 6.12: DEVTYPE from the device type, then NAME
+// and TYPE, then one POWER_SUPPLY_* line per property in the order an ACPI
+// battery declares them.
+static size_t sysfs_power_supply_file_data(struct sysfs_node node, char *buf, size_t bufsize) {
+    struct host_battery_status battery;
+    // The battery went away while this file was open.
+    if (!sysfs_power_supply_known(&battery))
+        return 0;
+
+    int capacity = (int) (battery.level * 100.0f + 0.5f);
+    if (capacity > 100)
+        capacity = 100;
+    const char *status;
+    switch (battery.state) {
+        case HOST_BATTERY_CHARGING:
+            status = "Charging";
+            break;
+        case HOST_BATTERY_FULL:
+            status = "Full";
+            break;
+        default:
+            status = "Discharging";
+            break;
+    }
+    // iOS's charging and full both mean plugged in; unplugged means running
+    // from the battery. It has no "Not charging" to report.
+    int online = battery.state == HOST_BATTERY_CHARGING || battery.state == HOST_BATTERY_FULL;
+
+    switch (node.kind) {
+        case sysfs_battery_uevent:
+            return snprintf(buf, bufsize,
+                            "DEVTYPE=power_supply\n"
+                            "POWER_SUPPLY_NAME=BAT0\n"
+                            "POWER_SUPPLY_TYPE=Battery\n"
+                            "POWER_SUPPLY_STATUS=%s\n"
+                            "POWER_SUPPLY_PRESENT=1\n"
+                            "POWER_SUPPLY_CAPACITY=%d\n",
+                            status, capacity);
+        case sysfs_battery_type:
+            return snprintf(buf, bufsize, "Battery\n");
+        case sysfs_battery_present:
+            return snprintf(buf, bufsize, "1\n");
+        case sysfs_battery_status:
+            return snprintf(buf, bufsize, "%s\n", status);
+        case sysfs_battery_capacity:
+            return snprintf(buf, bufsize, "%d\n", capacity);
+        case sysfs_mains_uevent:
+            return snprintf(buf, bufsize,
+                            "DEVTYPE=power_supply\n"
+                            "POWER_SUPPLY_NAME=AC\n"
+                            "POWER_SUPPLY_TYPE=Mains\n"
+                            "POWER_SUPPLY_ONLINE=%d\n",
+                            online);
+        case sysfs_mains_type:
+            return snprintf(buf, bufsize, "Mains\n");
+        case sysfs_mains_online:
+            return snprintf(buf, bufsize, "%d\n", online);
+        default:
+            return 0;
+    }
 }
 
 static size_t sysfs_net_file_data(struct sysfs_node node, char *buf, size_t bufsize) {

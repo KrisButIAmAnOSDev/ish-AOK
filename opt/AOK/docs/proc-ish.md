@@ -15,6 +15,23 @@ cat /proc/ish/BAT0           # both of those plus low-power mode, one per line
 cat /proc/ish/UIDevice       # the UIDevice the app sees: model, OS, orientation
 ```
 
+## The battery
+
+The `BAT0` files are AOK's own, older than the standard ones, and they keep
+their format: the charge has two decimals (`83.00`). With no battery to report
+— a Mac without one, or the command-line build — the state reads `Unknown` and
+the charge is negative.
+
+**Linux tools look in `/sys/class/power_supply` instead**, and the battery is
+there too: `BAT0` with `capacity`, `status`, `present`, `type` and `uevent`,
+and an `AC` adapter whose `online` says whether it is plugged in. That is where
+waybar's battery module and btop look for it. Only what iOS reports is
+published — a percentage and a charging state. There are no energy, voltage,
+current or time-left files, because iOS has no such figures, and a number made
+up to fill a file is worse than no file; htop's battery meter needs one of them
+and shows N/A. With no battery, the directory is empty, as it is on a Linux
+machine without one.
+
 ## Your settings, from the guest
 
 `/proc/ish/defaults/` is a directory, one entry per app preference:
