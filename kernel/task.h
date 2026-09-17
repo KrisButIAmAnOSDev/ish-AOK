@@ -860,6 +860,25 @@ void get_guest_loadavg(uint64_t out[3]);
 // implementations report this, and so should anything that wants guest
 // uptime at a finer grain than their ticks.
 uint64_t guest_uptime_ns(void);
+// The guest's reading of a host clock, for the clocks the guest can see
+// directly. For a boot-relative one (CLOCK_MONOTONIC, CLOCK_BOOTTIME,
+// CLOCK_MONOTONIC_RAW) that is the host's reading minus the guest's origin on
+// that clock, so the guest sees time since ITS boot rather than the host's --
+// the host may have been up for weeks. For any other clock (CLOCK_REALTIME,
+// the CPU-time clocks) it is the host's reading unchanged.
+//
+// Every place a guest-visible absolute time on one of these clocks is read or
+// interpreted must go through this and not timespec_now(): clock_gettime, and
+// the four sites that turn a guest's absolute deadline into an interval
+// (clock_nanosleep/timer_settime/timerfd_settime with TIMER_ABSTIME, and
+// futex FUTEX_WAIT_BITSET). Everything else in the tree -- the timer thread,
+// poll, the socket and futex wait loops -- compares host readings only with
+// other host readings and must keep using timespec_now().
+struct timespec guest_clock_now(clockid_t host_clock);
+// The same rebasing applied to a reading the caller already took, for
+// clock_gettime -- which must keep reporting the host's errno rather than
+// silently substituting a fallback clock the way timespec_now does.
+struct timespec guest_clock_from_host(clockid_t host_clock, struct timespec host);
 // The same in 100 Hz ticks, the unit struct uptime_info carries -- for now
 // rounded to whole tenths of a second, for the /proc/uptime format reason
 // given at the definition.

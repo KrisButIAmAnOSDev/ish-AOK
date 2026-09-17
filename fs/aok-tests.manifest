@@ -138,6 +138,7 @@ fakefs_inode_alias.c
 fifo_open_creat_deadlock.c
 proc_stat_monotonic.c
 proc_uptime_clock.c
+clock_boot_origin.c
 proc_loadavg_rises.c
 blocked_wait_state.c
 proc_readdir_tgid.c

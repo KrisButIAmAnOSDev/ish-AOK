@@ -478,7 +478,11 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
     }
 
     if (flags & TIMER_ABSTIME_) {
-        req = timespec_subtract(req, timespec_now(clock_id));
+        // The deadline is in the GUEST's clock, so "now" must be too -- the
+        // difference is then an interval, which the host sleep below can use
+        // as-is. Subtracting the host's now made every absolute monotonic
+        // sleep look already expired and return instantly.
+        req = timespec_subtract(req, guest_clock_now(clock_id));
         if (!timespec_positive(req))
             return 0;
     }
@@ -688,6 +692,9 @@ static dword_t sys_clock_gettime_guest_abi(dword_t clock, guest_addr_t tp, enum 
         int err = clock_gettime(clock_id, &ts);
         if (err < 0)
             return errno_map();
+        // Rebase: on a boot-relative clock the host's reading is the HOST's
+        // uptime, which on a Mac up for weeks is weeks. See kernel/task.h.
+        ts = guest_clock_from_host(clock_id, ts);
     }
     if (write_guest_timespec_abi(abi, tp, &ts))
         return _EFAULT;
@@ -734,6 +741,9 @@ dword_t sys_clock_gettime64_guest(dword_t clock, guest_addr_t tp) {
         int err = clock_gettime(clock_id, &ts);
         if (err < 0)
             return errno_map();
+        // Rebase: on a boot-relative clock the host's reading is the HOST's
+        // uptime, which on a Mac up for weeks is weeks. See kernel/task.h.
+        ts = guest_clock_from_host(clock_id, ts);
     }
     struct timespec64_ t = timespec_to_guest64(ts);
     
@@ -1913,7 +1923,9 @@ static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, guest_addr_
     }
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
-        struct timespec now = timespec_now(timer->timer->clockid);
+        // Guest deadline minus guest now; the interval that comes out is what
+        // the host-clock timer thread arms on. See clock_nanosleep above.
+        struct timespec now = guest_clock_now(timer->timer->clockid);
         spec.value = timespec_subtract(spec.value, now);
     }
     int err = timer_set(timer->timer, spec, &old_spec);
@@ -2082,7 +2094,8 @@ static int_t sys_timerfd_settime_common(fd_t f, int_t flags, guest_addr_t new_va
 
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
-        struct timespec now = timespec_now(fd->timerfd.timer->clockid);
+        // Guest deadline minus guest now. See clock_nanosleep above.
+        struct timespec now = guest_clock_now(fd->timerfd.timer->clockid);
         spec.value = timespec_subtract(spec.value, now);
     }
 
