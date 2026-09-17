@@ -280,15 +280,44 @@ int main(int argc, char **argv) {
     }
 
     // ---- what the user sees: `dmesg -c` prints ---------------------------
-    // The whole point. Guarded, because the suite runs in roots that may not
-    // ship a dmesg -- and because util-linux's dmesg prefers /dev/kmsg, so it
-    // may never issue the call at all; either way its OUTPUT is the claim.
+    // The whole point. Two things have to be got right for this to mean
+    // anything.
+    //
+    // It must be a dmesg that actually ISSUES SYSLOG_ACTION_READ_CLEAR.
+    // busybox's only method is klogctl, so plain `dmesg -c` is right there.
+    // util-linux's default method is /dev/kmsg, and `dmesg -c` then never
+    // calls syslog(2) at all -- so on a Devuan guest this check passed or
+    // failed on something else entirely. Measured on util-linux 2.41 under
+    // AOK: plain `dmesg` prints BLANK LINES, because /dev/kmsg here emits
+    // "[ctime] text" rather than Linux's "<prio>,<seq>,<usec>,<flag>;text"
+    // record format and util-linux parses every line as an empty record.
+    // (That is a real and separate gap in the /dev/kmsg node, not something
+    // this file can assert on; `dmesg --syslog` is unaffected by it.)
+    //
+    // So: prefer `--syslog`, which forces the klogctl method, and fall back
+    // to plain `-c` for a dmesg that does not know the option -- which is
+    // busybox, whose only method is klogctl anyway. The probe runs BEFORE the
+    // marker is written, because a successful one clears the log.
+    //
+    // What this block is worth, honestly, differs by root. Against the
+    // pre-fix kernel busybox's `dmesg -c` printed NOTHING and these checks
+    // failed, which is the bug as a user meets it. util-linux's
+    // `dmesg --syslog -c` printed the line anyway -- measured, on the same
+    // broken kernel -- so it does not depend on what READ_CLEAR returns and
+    // this block cannot fail there. The klogctl assertions above are the real
+    // coverage on such a root: 14 of them fail against the pre-fix kernel.
     {
+        int have_syslog_opt = system("dmesg --syslog -c >/dev/null 2>&1") == 0;
+        const char *dmesg_cmd = have_syslog_opt
+            ? "dmesg --syslog -c 2>/dev/null"
+            : "dmesg -c 2>/dev/null";
+        test_logf("  %-58s %s\n", "dmesg command", dmesg_cmd);
+
         ck("CLEAR", klogctl_(SYSLOG_CLEAR, NULL, 0), 0);
         ck("wrote the line dmesg should print",
            kmsg_say("syslog_read_clear: DMESG-SHOULD-PRINT-THIS"), 0);
 
-        FILE *p = popen("dmesg -c 2>/dev/null", "r");
+        FILE *p = popen(dmesg_cmd, "r");
         if (p == NULL) {
             test_logf("  %-58s (no popen)\n", "dmesg -c");
         } else {
@@ -305,7 +334,7 @@ int main(int argc, char **argv) {
                    strstr(out, "DMESG-SHOULD-PRINT-THIS") != NULL ? 1 : 0, 1);
 
                 // And the clear took: a second one must not repeat the line.
-                p = popen("dmesg -c 2>/dev/null", "r");
+                p = popen(dmesg_cmd, "r");
                 if (p != NULL) {
                     got = fread(out, 1, sizeof out - 1, p);
                     out[got] = '\0';
