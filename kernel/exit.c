@@ -720,6 +720,8 @@ noreturn void do_exit(struct task *task, int status) {
     if (!task->exit_rusage_counted) {
         struct rusage_ rusage = rusage_get_current();
         rusage_add(&task->group->rusage, &rusage);
+        task->exit_utime = rusage.utime;    // see rusage_get_thread_cpu
+        task->exit_stime = rusage.stime;
         task->exit_rusage_counted = true;
     }
     struct rusage_ group_rusage = task->group->rusage;
@@ -1236,7 +1238,13 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
 
     info_out->child.status = zombie_status(task);
 
+    // The child's own usage AND its reaped descendants', Linux's RUSAGE_BOTH:
+    // that is what wait4 reports, and what a parent's RUSAGE_CHILDREN and
+    // times() accumulate (wait_task_zombie: cutime += tgutime + sig->cutime).
+    // Passing on only the child's own lost every grandchild -- a parent that
+    // reaped a shell was charged nothing for the programs the shell ran.
     struct rusage_ rusage = task->group->rusage;
+    rusage_add(&rusage, &task->group->children_rusage);
     if (!(options & WNOWAIT_)) {
         lock(&current->group->lock, 0);
         rusage_add(&current->group->children_rusage, &rusage);
@@ -1278,8 +1286,10 @@ static bool reap_traced_zombie(struct task *task, struct siginfo_ *info_out,
         return false;
     }
     info_out->child.status = zombie_status(task);
-    if (rusage_out != NULL)
-        *rusage_out = task->group->rusage;
+    if (rusage_out != NULL) {
+        *rusage_out = task->group->rusage;      // RUSAGE_BOTH, as reap_if_zombie
+        rusage_add(rusage_out, &task->group->children_rusage);
+    }
     unlock(&task->group->lock);
 
     if (options & WNOWAIT_)

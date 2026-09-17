@@ -238,6 +238,15 @@ static int proc_kthread_status(pid_t_ pid, const char *name, struct proc_data *b
     return 0;
 }
 
+// The thread directory, /proc/<pid>/task/<tid>/, defined with the task
+// listing further down.
+static struct proc_dir_entry proc_pid_task;
+
+// Clock ticks (USER_HZ = 100), wide enough that no CPU total wraps.
+static unsigned long long proc_ticks_from_timeval(struct timeval_ tv) {
+    return (unsigned long long) tv.sec * 100 + tv.usec / 10000;
+}
+
 // A zombie is still shown: it is what ps reports as state Z, and the only way
 // a monitor learns something exited and was never reaped. Only a task that is
 // mid-exit and not yet a zombie is refused, because its fields are still
@@ -253,9 +262,24 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
         return _ESRCH;
     }
 
-    // Gather CPU time and memory before the main locks (independent of general_lock)
-    unsigned long utime_jiffies, stime_jiffies;
-    task_thread_cpu_time(task, &utime_jiffies, &stime_jiffies);
+    // utime and stime, fields 14 and 15, are the WHOLE PROCESS: every live
+    // thread plus every thread that has already exited. So they are in
+    // /proc/<tid>/stat for any thread of it, as Linux's tgid entries are
+    // (do_task_stat with whole=1). Only /proc/<pid>/task/<tid>/stat is one
+    // thread. Every view used to report the one thread its id named, so a
+    // process whose work ran on a worker thread showed none of it: Thunar's
+    // GLib worker spun a whole core while ps, top, htop and btop all put
+    // Thunar at 0%.
+    //
+    // Before the main locks: both helpers take pids_lock or group->lock.
+    bool thread_view = entry->parent == &proc_pid_task;
+    struct rusage_ cpu = thread_view ? rusage_get_thread_cpu(task)
+                                     : rusage_get_group_cpu_of(task->group);
+    unsigned long long utime_ticks = proc_ticks_from_timeval(cpu.utime);
+    unsigned long long stime_ticks = proc_ticks_from_timeval(cpu.stime);
+    // Fields 16 and 17, in both views: the process's waited-for children,
+    // what getrusage(RUSAGE_CHILDREN) reports. They were a hardcoded 0.
+    unsigned long long cutime_ticks = 0, cstime_ticks = 0;
 
     struct mm *mm = proc_task_mm_retain(task);
     size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
@@ -302,6 +326,8 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     bool stopped = task->group->stopped;
     pgid = task->group->pgid;
     sid = task->group->sid;
+    cutime_ticks = proc_ticks_from_timeval(task->group->children_rusage.utime);
+    cstime_ticks = proc_ticks_from_timeval(task->group->children_rusage.stime);
     struct tty *tty = task->group->tty;
     if (tty != NULL) {
         lock(&tty->lock, 0);
@@ -349,10 +375,10 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%lu ", 0l); // children major faults
 
     // values that would be returned from getrusage
-    proc_printf(buf, "%lu ", utime_jiffies); // user time
-    proc_printf(buf, "%lu ", stime_jiffies); // system time
-    proc_printf(buf, "%ld ", 0l); // children user time
-    proc_printf(buf, "%ld ", 0l); // children system time
+    proc_printf(buf, "%llu ", utime_ticks); // user time
+    proc_printf(buf, "%llu ", stime_ticks); // system time
+    proc_printf(buf, "%llu ", cutime_ticks); // children user time
+    proc_printf(buf, "%llu ", cstime_ticks); // children system time
 
     proc_printf(buf, "%ld ", 20l); // priority (not adjustable)
     proc_printf(buf, "%ld ", 0l); // nice (also not adjustable)

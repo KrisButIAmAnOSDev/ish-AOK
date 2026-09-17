@@ -110,6 +110,7 @@ concurrent_exec_tlb.c
 exec_i386_fault_addr.c
 random_seed.c
 getrusage_group.c
+proc_pid_stat_cputime.c
 pty_line_discipline.c
 proc_pid_io.c
 taskstats_genl.c

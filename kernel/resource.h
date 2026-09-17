@@ -93,6 +93,12 @@ struct tgroup;
 struct rusage_ rusage_get_current(void);
 struct rusage_ rusage_get_group(void);
 struct rusage_ rusage_get_group_of(struct tgroup *group);
+// The same process-wide sum, utime and stime only (nothing else is filled):
+// /proc/<pid>/stat. Takes pids_lock and group->lock.
+struct rusage_ rusage_get_group_cpu_of(struct tgroup *group);
+// One thread's own utime and stime (nothing else is filled), live or already
+// exited: /proc/<pid>/task/<tid>/stat. Takes task->group->lock.
+struct rusage_ rusage_get_thread_cpu(struct task *task);
 // One live thread's usage, for the per-thread CPU clocks (kernel/time.c).
 struct rusage_ rusage_get_task(struct task *task);
 void rusage_add(struct rusage_ *dst, struct rusage_ *src);

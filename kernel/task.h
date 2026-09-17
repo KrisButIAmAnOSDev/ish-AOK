@@ -512,6 +512,14 @@ struct task {
     // ptrace_signal). Locked by ptrace.lock. At the end for the reason given
     // above native_standin_child.
     bool ptrace_delivery_stop;
+
+    // This thread's own final CPU time, recorded by do_exit in the same step
+    // that rolls it into group->rusage and sets exit_rusage_counted; valid only
+    // once that flag is set, and locked by group->lock like it. What
+    // /proc/<pid>/task/<tid>/stat reports for a thread whose host thread is
+    // gone (rusage_get_thread_cpu). At the end for the reason given above
+    // native_standin_child.
+    struct timeval_ exit_utime, exit_stime;
 };
 
 // current will always give the process that is currently executing

@@ -330,7 +330,8 @@ static void rusage_fill_task_counters(struct rusage_ *rusage, struct task *task)
     rusage->maxrss = (dword_t) task_maxrss_kb(task);
 }
 
-struct rusage_ rusage_get_current(void) {
+// The calling host thread's user and system time, and nothing else.
+static struct rusage_ cpu_usage_self(void) {
     struct rusage_ rusage;
     memset(&rusage, 0, sizeof(rusage));
 
@@ -358,24 +359,23 @@ struct rusage_ rusage_get_current(void) {
     rusage.stime.sec = info.system_time.seconds;
     rusage.stime.usec = info.system_time.microseconds;
 #endif
+    return rusage;
+}
+
+struct rusage_ rusage_get_current(void) {
+    struct rusage_ rusage = cpu_usage_self();
     rusage_fill_task_counters(&rusage, current);
     return rusage;
 }
 
-
-// Usage for a live thread other than the caller. rusage_get_current() can
-// only report the *calling* host thread's own usage (getrusage(RUSAGE_THREAD)
-// and mach_thread_self() are both self-only) -- summing across a whole thread
-// group needs a way to query a different thread's host pthread from here.
-struct rusage_ rusage_get_task(struct task *task) {
-    if (task == current)
-        return rusage_get_current();
-
+// A live thread other than the caller: its user and system time, and nothing
+// else. cpu_usage_self() can only report the *calling* host thread's own usage
+// (getrusage(RUSAGE_THREAD) and mach_thread_self() are both self-only) --
+// summing across a whole thread group needs a way to query a different
+// thread's host pthread from here.
+static struct rusage_ cpu_usage_other(struct task *task) {
     struct rusage_ rusage;
     memset(&rusage, 0, sizeof(rusage));
-    // The non-CPU counters live on the task and are readable from here; only
-    // the user/system split needs the host thread.
-    rusage_fill_task_counters(&rusage, task);
 #if __linux__
     // pthread_getcpuclockid's clock only reports combined user+system time --
     // unlike getrusage(RUSAGE_THREAD), there's no Linux API to read another
@@ -406,6 +406,17 @@ struct rusage_ rusage_get_task(struct task *task) {
     rusage.stime.sec = info.system_time.seconds;
     rusage.stime.usec = info.system_time.microseconds;
 #endif
+    return rusage;
+}
+
+// Usage for a live thread other than the caller.
+struct rusage_ rusage_get_task(struct task *task) {
+    if (task == current)
+        return rusage_get_current();
+    struct rusage_ rusage = cpu_usage_other(task);
+    // The non-CPU counters live on the task and are readable from here; only
+    // the user/system split needs the host thread.
+    rusage_fill_task_counters(&rusage, task);
     return rusage;
 }
 
@@ -446,10 +457,23 @@ void rusage_add(struct rusage_ *dst, struct rusage_ *src) {
 // Takes an explicit group rather than assuming current->group, so it can be
 // called from a context with no meaningful `current` (e.g. the setitimer
 // VIRTUAL/PROF sampler, which runs on its own bare timer thread).
-struct rusage_ rusage_get_group_of(struct tgroup *group) {
+//
+// With `counters` false, only utime and stime are summed and filled. That is
+// the half /proc/<pid>/stat prints, and the other half is not free: the
+// maxrss sample in rusage_fill_task_counters trylocks each thread and walks
+// its address space's page table, and ps, top and htop read that file for
+// every process on every refresh.
+static struct rusage_ group_usage(struct tgroup *group, bool counters) {
     complex_lockt(&pids_lock, 0);
     lock(&group->lock, 0);
-    struct rusage_ rusage = group->rusage;
+    struct rusage_ rusage;
+    memset(&rusage, 0, sizeof(rusage));
+    if (counters) {
+        rusage = group->rusage;
+    } else {
+        rusage.utime = group->rusage.utime;
+        rusage.stime = group->rusage.stime;
+    }
     struct task *t;
     list_for_each_entry(&group->threads, t, group_links) {
         // An exiting thread is on this list for a long stretch AFTER do_exit
@@ -464,6 +488,7 @@ struct rusage_ rusage_get_group_of(struct tgroup *group) {
         if (t->exit_rusage_counted)
             continue;
         struct rusage_ live;
+        memset(&live, 0, sizeof(live));
         // The mirror image at the other end of a thread's life: a clone is
         // linked into this list by copy_task() well before task_start() gives
         // it a host thread, and until then task->thread still holds the
@@ -477,17 +502,52 @@ struct rusage_ rusage_get_group_of(struct tgroup *group) {
         // task->thread (which is how pid 1, whose host thread predates
         // task_start, still reports its own CPU).
         if (t == current || t->host_thread_started) {
-            live = rusage_get_task(t);
-        } else {
+            if (counters)
+                live = rusage_get_task(t);
+            else
+                live = t == current ? cpu_usage_self() : cpu_usage_other(t);
+        } else if (counters) {
             // No CPU of its own yet, but the non-CPU counters are readable
             // and are what pid 1 contributes on the sampler-thread path.
-            memset(&live, 0, sizeof(live));
             rusage_fill_task_counters(&live, t);
         }
         rusage_add(&rusage, &live);
     }
     unlock(&group->lock);
     unlock(&pids_lock);
+    return rusage;
+}
+
+struct rusage_ rusage_get_group_of(struct tgroup *group) {
+    return group_usage(group, true);
+}
+
+struct rusage_ rusage_get_group_cpu_of(struct tgroup *group) {
+    return group_usage(group, false);
+}
+
+// One thread's own user and system time: /proc/<pid>/task/<tid>/stat. Asked
+// of its host thread only when the group walk above would ask it -- never
+// before task_start has given the task a host thread of its own, when
+// task->thread is still its creator's and the creator's whole balance would
+// show up here and then vanish. And not once do_exit has rolled the thread's
+// final usage into group->rusage: that is when it recorded exit_utime and
+// exit_stime, and from then on those are the answer, as a zombie's times are
+// on Linux. The host thread is on its way out by then, and a pthread_t that
+// has exited can come to name a different thread.
+struct rusage_ rusage_get_thread_cpu(struct task *task) {
+    struct rusage_ rusage;
+    memset(&rusage, 0, sizeof(rusage));
+    lock(&task->group->lock, 0);
+    if (task->exit_rusage_counted) {
+        rusage.utime = task->exit_utime;
+        rusage.stime = task->exit_stime;
+    } else if (task == current) {
+        rusage = cpu_usage_self();
+    } else if (task->host_thread_started) {
+        rusage = cpu_usage_other(task);
+    }
+    unlock(&task->group->lock);
     return rusage;
 }
 
