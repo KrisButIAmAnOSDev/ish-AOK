@@ -427,18 +427,25 @@ struct task {
     struct task_sockrestart sockrestart;
 
     // current condition/lock, so it can be notified in case of a signal
+    // (whether the wait is interruptible: waiting_interruptible, at the end)
     cond_t *waiting_cond;
     lock_t *waiting_lock;
     bool *waiting_interrupt_flag;
     lock_t waiting_cond_lock;
     bool wait_interrupted;
+    // What the signal that interrupted this syscall's wait says about
+    // restarting it (wake_waiting_task). It belongs to that one syscall:
+    // the dispatchers clear it before each syscall runs, so a syscall that
+    // never asks cannot leave it for the next (signal_restart_state_clear).
     bool restart_interrupted_syscall;
     // Same, but under ERESTARTNOHAND rules: set only when the interrupting
     // signal runs no handler. poll/select/epoll consult this one.
     bool restart_interrupted_syscall_nohand;
     // The syscall whose PC has just been rewound was an _ERESTART_NOHAND one,
     // so a handler about to run must cancel the restart. Set by the dispatcher
-    // at rewind time, consumed by receive_signal.
+    // at rewind time, consumed by receive_signal, and cleared as the next
+    // syscall starts -- the re-execution, after which there is no restart
+    // left to cancel (signal_restart_state_clear).
     bool restart_nohand_pending;
 
     // Set on the OTHER threads of a group by execve, which must leave exactly
@@ -520,6 +527,13 @@ struct task {
     // gone (rusage_get_thread_cpu). At the end for the reason given above
     // native_standin_child.
     struct timeval_ exit_utime, exit_stime;
+
+    // Whether the wait in waiting_cond is a wait_for, which a signal ends, or a
+    // wait_for_ignore_signals, which consumes no interruption: wake_waiting_task
+    // records one only for the first. Published and read under
+    // waiting_cond_lock. At the end for the reason given above
+    // native_standin_child.
+    bool waiting_interruptible;
 };
 
 // current will always give the process that is currently executing

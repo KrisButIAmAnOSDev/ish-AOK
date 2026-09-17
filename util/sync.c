@@ -271,6 +271,7 @@ static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeou
         lock(&current->waiting_cond_lock, 0);
         current->waiting_cond = cond;
         current->waiting_lock = lock;
+        current->waiting_interruptible = interruptible;
         unlock(&current->waiting_cond_lock);
     }
     int rc = 0;
@@ -299,6 +300,7 @@ out:
         lock(&current->waiting_cond_lock, 0);
         current->waiting_cond = NULL;
         current->waiting_lock = NULL;
+        current->waiting_interruptible = false;
         current->waiting_interrupt_flag = NULL;
         unlock(&current->waiting_cond_lock);
     }

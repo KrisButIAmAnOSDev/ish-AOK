@@ -993,6 +993,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     list_init(&task->sockrestart.listen);
 
     task->waiting_cond = NULL;
+    task->waiting_interruptible = false;
     task->waiting_lock = NULL;
     task->waiting_interrupt_flag = NULL;
     task->wait_interrupted = false;

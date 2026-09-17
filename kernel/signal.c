@@ -330,7 +330,14 @@ static int sigaction_to_user(struct task *task, guest_addr_t user_addr, const st
     return 0;
 }
 
-static bool wake_waiting_task(struct task *task) {
+// What a signal interrupting a wait says about restarting the syscall the wait
+// belongs to (signal_wait_interruption), for wake_waiting_task to record.
+struct wait_interruption {
+    bool restart;
+    bool stops;
+};
+
+static bool wake_waiting_task(struct task *task, const struct wait_interruption *interruption) {
     pthread_mutex_lock(&task->waiting_cond_lock.m);
     task->waiting_cond_lock.owner = pthread_self();
 
@@ -339,6 +346,37 @@ static bool wake_waiting_task(struct task *task) {
     bool *waiting_interrupt_flag = task->waiting_interrupt_flag;
     bool interrupted_wait = waiting_interrupt_flag != NULL ||
         (waiting_cond != NULL && waiting_lock != NULL);
+    // Record the interruption before anything below wakes the task, while
+    // holding waiting_cond_lock proves it is still inside the wait: it cannot
+    // leave without taking this lock to unpublish the wait, and wait_for looks
+    // at wait_interrupted only after that.
+    //
+    // It used to be recorded after the wake, once the sender had its
+    // sighand->lock back, and by then the woken task could be through its
+    // restart decision, its handler and into its next syscall. The late
+    // wait_interrupted then cut that syscall's wait short with no signal
+    // pending, and only a restart record left over from the syscall before
+    // hid it, by restarting the call. Once every syscall began by clearing
+    // that record (signal_restart_state_clear), the EINTR reached the guest:
+    // an eventfd read under 500 SA_RESTART signals a second failed with EINTR
+    // 3 to 9 times in 5 seconds, where Linux never does. A counter on both
+    // halves showed each late record followed by a wait that began with
+    // wait_interrupted set and no signal pending.
+    //
+    // And only for a wait that will look at it. wait_for_ignore_signals --
+    // a vfork parent's wait, a group stop, a ptrace stop -- never consumes
+    // wait_interrupted, so the mark outlived it and ended the task's NEXT
+    // wait instead. Measured: SIGUSR1, handled with SA_RESTART, arriving while
+    // a vfork parent waited made the parent's next eventfd read fail with
+    // EINTR at once, 10 times out of 10; Linux, never. The signal itself is
+    // still pending when such a wait ends, so the next wait sees it anyway.
+    bool records = waiting_interrupt_flag != NULL ||
+        (waiting_cond != NULL && waiting_lock != NULL && task->waiting_interruptible);
+    if (records && interruption != NULL) {
+        __atomic_store_n(&task->restart_interrupted_syscall, interruption->restart, __ATOMIC_RELEASE);
+        __atomic_store_n(&task->restart_interrupted_syscall_nohand, interruption->stops, __ATOMIC_RELEASE);
+        __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
+    }
     if (waiting_interrupt_flag != NULL) {
         // Counts the bug in docs/TODO.md's pread_stack_thread_race entry
         // directly, instead of waiting for its ~1% fatal outcome: a stale
@@ -599,12 +637,48 @@ static bool wake_poke_dropped_for(const struct task *task) {
     return strncmp(task->comm, prefix, strlen(prefix)) == 0;
 }
 
-static bool signal_wake_task(struct task *task, struct sighand *sighand, int sig) {
-    if (task == current)
-        return wake_waiting_task(task);
+// What `sig` interrupting one of `task`'s waits says about restarting the
+// syscall the wait belongs to. Call with sighand->lock held: it reads the
+// disposition.
+static bool signal_restart_decided_at_delivery(struct task *task, int sig);
+
+static struct wait_interruption signal_wait_interruption(struct task *task,
+        struct sighand *sighand, int sig) {
+    // A job-control stop is not an interruption. Linux parks the task inside
+    // the wait and resumes it on SIGCONT, so the syscall never returns EINTR
+    // to the guest -- and because no handler runs, that holds even for the
+    // interfaces SA_RESTART cannot rescue (poll, select, epoll_wait). Only a
+    // handler actually running can turn a wait into a guest-visible EINTR.
+    // Until it is delivered, the same goes for any signal a tracer sees first:
+    // see signal_restart_decided_at_delivery.
+    //
+    // sighand->action is not the truth for a signal the native shim is holding
+    // a handler for -- what sits there is the SIG_DFL placeholder
+    // nlibc_set_disposition left behind, so a native program's own SIGTSTP
+    // handler would read as SIGNAL_STOP here and park a poll() that Linux
+    // interrupts. For those the shim's recorded flags are the answer, and a
+    // handler is always what runs, so `stops` is false by construction.
+    bool held = sigset_has(__atomic_load_n(&task->native_held, __ATOMIC_ACQUIRE), sig);
+    int action = held ? SIGNAL_CALL_HANDLER : signal_action(sighand, sig);
+    bool stops = !held && (action == SIGNAL_STOP ||
+        signal_restart_decided_at_delivery(task, sig));
+    bool restart = held
+        ? sigset_has(__atomic_load_n(&task->native_restart, __ATOMIC_ACQUIRE), sig)
+        : (stops || (action == SIGNAL_CALL_HANDLER &&
+            !!(sighand->action[sig].flags & SA_RESTART_)));
+    return (struct wait_interruption) {.restart = restart, .stops = stops};
+}
+
+static void signal_wake_task(struct task *task, struct sighand *sighand, int sig) {
+    // Worked out now, while sighand->lock is held; the wake below drops it.
+    struct wait_interruption interruption = signal_wait_interruption(task, sighand, sig);
+    if (task == current) {
+        wake_waiting_task(task, &interruption);
+        return;
+    }
 
     if (wake_poke_dropped_for(task))
-        return false;   // as if every poke below had been swallowed
+        return;   // as if every poke below had been swallowed
 
     int wake_err = pthread_kill(task->thread, SIGUSR1);
     // Second, independent poke. The SIGUSR1 above is not reliable: on Darwin it
@@ -660,11 +734,10 @@ static bool signal_wake_task(struct task *task, struct sighand *sighand, int sig
     memset(&sighand->lock.owner, 0, sizeof(sighand->lock.owner));
     pthread_mutex_unlock(&sighand->lock.m);
     lock(&sighand->wake_lock, 0);
-    bool interrupted_wait = wake_waiting_task(task);
+    wake_waiting_task(task, &interruption);
     unlock(&sighand->wake_lock);
     pthread_mutex_lock(&sighand->lock.m);
     sighand->lock.owner = pthread_self();
-    return interrupted_wait;
 }
 
 // Wake a task out of whatever it is blocked in, with no signal involved.
@@ -711,7 +784,7 @@ void task_wake_for_freeze(struct task *task) {
     cpu_poke(&task->cpu);
     if (task->sighand != NULL) {
         lock(&task->sighand->wake_lock, 0);
-        wake_waiting_task(task);
+        wake_waiting_task(task, NULL);
         unlock(&task->sighand->wake_lock);
     }
 }
@@ -754,7 +827,7 @@ void task_wake_for_ptrace_trap(struct task *task, struct sighand *sighand) {
     if (live) {
         // A cond_t wait. Without sighand->lock, as signal_wake_task does it.
         lock(&sighand->wake_lock, 0);
-        wake_waiting_task(task);
+        wake_waiting_task(task, NULL);
         unlock(&sighand->wake_lock);
     }
 }
@@ -800,36 +873,6 @@ bool signal_stops_for_tracer(struct task *task, int sig) {
     return task->ptrace.traced && sig != SIGKILL_ && sig != task->ptrace.deliver_sig;
 }
 
-static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {
-    if (!interrupted_wait)
-        return;
-    // A job-control stop is not an interruption. Linux parks the task inside
-    // the wait and resumes it on SIGCONT, so the syscall never returns EINTR
-    // to the guest -- and because no handler runs, that holds even for the
-    // interfaces SA_RESTART cannot rescue (poll, select, epoll_wait). Only a
-    // handler actually running can turn a wait into a guest-visible EINTR.
-    // Until it is delivered, the same goes for any signal a tracer sees first:
-    // see signal_restart_decided_at_delivery.
-    //
-    // sighand->action is not the truth for a signal the native shim is holding
-    // a handler for -- what sits there is the SIG_DFL placeholder
-    // nlibc_set_disposition left behind, so a native program's own SIGTSTP
-    // handler would read as SIGNAL_STOP here and park a poll() that Linux
-    // interrupts. For those the shim's recorded flags are the answer, and a
-    // handler is always what runs, so `stops` is false by construction.
-    bool held = sigset_has(__atomic_load_n(&task->native_held, __ATOMIC_ACQUIRE), sig);
-    int action = held ? SIGNAL_CALL_HANDLER : signal_action(sighand, sig);
-    bool stops = !held && (action == SIGNAL_STOP ||
-        signal_restart_decided_at_delivery(task, sig));
-    bool restart = held
-        ? sigset_has(__atomic_load_n(&task->native_restart, __ATOMIC_ACQUIRE), sig)
-        : (stops || (action == SIGNAL_CALL_HANDLER &&
-            !!(sighand->action[sig].flags & SA_RESTART_)));
-    __atomic_store_n(&task->restart_interrupted_syscall, restart, __ATOMIC_RELEASE);
-    __atomic_store_n(&task->restart_interrupted_syscall_nohand, stops, __ATOMIC_RELEASE);
-    __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
-}
-
 static void deliver_signal_unlocked_locked(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info) {
     if (task->exiting)
         return;
@@ -866,8 +909,7 @@ static void deliver_signal_unlocked_locked(struct task *task, struct sighand *si
             signal_is_blockable(sig) && !signal_is_synchronous_trap(sig))
         return;
 
-    bool interrupted_wait = signal_wake_task(task, sighand, sig);
-    signal_note_interrupted(task, sighand, sig, interrupted_wait);
+    signal_wake_task(task, sighand, sig);
 }
 
 // Deliver a process-directed signal into the thread group's shared queue
@@ -934,8 +976,8 @@ static void deliver_signal_to_group_locked(struct sighand *sighand, int sig, str
         signalfd_wakeup_task(task, sig);
         // Only a member that can TAKE the signal may be woken. The wake marks
         // the member's wait interrupted -- wake_waiting_task stores through
-        // waiting_interrupt_flag, signal_note_interrupted sets wait_interrupted
-        // -- and futex(FUTEX_WAIT*) and rt_sigtimedwait turn that mark straight
+        // waiting_interrupt_flag and sets wait_interrupted -- and
+        // futex(FUTEX_WAIT*) and rt_sigtimedwait turn that mark straight
         // into a guest-visible EINTR without asking whether anything is
         // deliverable to that thread. Linux never picks a thread that blocks
         // the signal (complete_signal/wants_signal), so such a thread must
@@ -948,8 +990,7 @@ static void deliver_signal_to_group_locked(struct sighand *sighand, int sig, str
         if (sigset_has(task_wake_blocked(task) & ~task->waiting, sig) &&
                 signal_is_blockable(sig) && !signal_is_synchronous_trap(sig))
             continue;
-        bool interrupted_wait = signal_wake_task(task, sighand, sig);
-        signal_note_interrupted(task, sighand, sig, interrupted_wait);
+        signal_wake_task(task, sighand, sig);
     }
 }
 
@@ -1639,6 +1680,44 @@ static bool restart_flags_take(bool nohand_only) {
     bool restart = __atomic_exchange_n(&current->restart_interrupted_syscall, false, __ATOMIC_ACQ_REL);
     bool nohand = __atomic_exchange_n(&current->restart_interrupted_syscall_nohand, false, __ATOMIC_ACQ_REL);
     return nohand_only ? nohand : restart;
+}
+
+// What an interruption leaves behind for a restart belongs to one syscall, and
+// both dispatchers clear it as the next syscall starts. Two things:
+//
+// The restart record. Consuming it at the decision was never enough, because
+// plenty of syscalls never make one. sigsuspend, pause, rt_sigtimedwait,
+// msgrcv, msgsnd and semop handed their EINTR straight back, and a wait that
+// COMPLETES -- a sigtimedwait that takes the signal it was waiting for, a wait4
+// that reaps the child whose SIGCHLD interrupted it -- asks nothing at all.
+// Each left its answer set, and the next syscall to be cut short by a signal
+// without parking on a cond_t (a pipe read, which blocks in the host) read it
+// before looking at the signal: a handler with no SA_RESTART restarted the
+// read, and the guest got data that arrived 400ms later instead of EINTR.
+// Measured with an SA_RESTART SIGALRM ending each of those calls and a plain
+// SIGUSR1 at a pipe read after.
+//
+// restart_nohand_pending and restart_sys_pending, which say the PC was just
+// rewound over a syscall, so a handler that runs before it re-executes may
+// cancel the restart. On amd64 nothing cleared them when the re-executed call
+// ended some other way: that dispatcher's restart backstop only ever sets them.
+// The next handler then "cancelled" a restart that was no longer there,
+// stepping the PC forward two bytes into the middle of whatever followed, and
+// the guest died. Measured on x86_64 Alpine: SIGSTOP and SIGCONT inside a
+// nanosleep, then a handled SIGUSR1 to end it, killed the process with SIGILL or
+// SIGSEGV where Linux returns EINTR.
+//
+// A syscall's entry is late enough for all of it: a handler that cancels a
+// restart runs before the rewound syscall re-executes, and the re-execution is
+// the next syscall to start. poll_restart_valid and sleep_restart_valid are
+// left alone; they carry a deadline INTO the re-executed call, which reads them.
+void signal_restart_state_clear(void) {
+    if (current == NULL)
+        return;
+    __atomic_store_n(&current->restart_interrupted_syscall, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&current->restart_interrupted_syscall_nohand, false, __ATOMIC_RELEASE);
+    current->restart_nohand_pending = false;
+    current->restart_sys_pending = false;
 }
 
 // The signal that is about to be delivered, or NULL. Selection mirrors
@@ -3177,7 +3256,13 @@ int_t sys_rt_sigsuspend_guest(guest_addr_t mask_addr, uint_t size) {
     }
     unlock(&current->sighand->lock);
     STRACE("%d done sigsuspend", current->pid);
-    return _EINTR;
+    // ERESTARTNOHAND, as on Linux: only a handler running ends the wait. A
+    // job-control stop used to end it too -- the plain _EINTR here reached the
+    // guest as soon as the process was continued, where Linux resumes the
+    // wait. Measured: SIGSTOP 200ms in and SIGCONT at 400ms, sigsuspend failed
+    // with EINTR at ~406ms; Linux returns at 800ms, when a handled signal
+    // arrives. pause, msgrcv and msgsnd are the same.
+    return signal_restart_or_eintr_nohand(_EINTR);
 }
 
 int_t sys_pause(void) {
@@ -3187,7 +3272,8 @@ int_t sys_pause(void) {
             continue;
     }
     unlock(&current->sighand->lock);
-    return _EINTR;
+    // ERESTARTNOHAND: see sys_rt_sigsuspend_guest.
+    return signal_restart_or_eintr_nohand(_EINTR);
 }
 
 static int_t sys_rt_sigtimedwait_common(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size,

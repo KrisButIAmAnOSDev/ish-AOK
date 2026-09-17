@@ -225,7 +225,11 @@ int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgf
         if (err < 0) {
             unlock(&msg_lock);
             free(msg);
-            return _EINTR;
+            // ERESTARTNOHAND, as on Linux: a handler running ends the wait with
+            // EINTR, but a job-control stop does not -- once continued, the
+            // call goes back to waiting. The plain _EINTR here failed it the
+            // moment the process was continued.
+            return signal_restart_or_eintr_nohand(_EINTR);
         }
     }
     list_add_tail(&queue->messages, &msg->mlist);
@@ -295,7 +299,8 @@ int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
         }
         if (err < 0) {
             unlock(&msg_lock);
-            return _EINTR;
+            // ERESTARTNOHAND, as msgsnd above.
+            return signal_restart_or_eintr_nohand(_EINTR);
         }
     }
 

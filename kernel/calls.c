@@ -4815,6 +4815,11 @@ sqword_t syscall_dispatch_native(qword_t syscall_num, const qword_t raw_args[6])
     if (current == NULL)
         return _EFAULT;
 
+    // As handle_syscall_interrupt: nothing an earlier syscall left for a
+    // restart may decide this one. A re-issue after _ERESTART comes through
+    // here too, and needs none of it -- its decision was already made.
+    signal_restart_state_clear();
+
     STRACE("%d(%s) %d:%d native call %-3llu ", current->pid, current->comm,
            current->reference.count,
            __atomic_load_n(&current->locks_held.count, __ATOMIC_RELAXED),
@@ -5006,8 +5011,13 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     // after a syscall and overwrite a register with EINTR. Nothing else clears
     // them reliably: most of handle_amd64_native_memory_syscall's cases write
     // their result straight to RAX and never pass syscall_result_should_restart.
-    current->restart_nohand_pending = false;
-    current->restart_sys_pending = false;
+    //
+    // So does the restart answer an earlier syscall's interruption recorded:
+    // it is not this syscall's. Nothing before the syscall body below can
+    // record a new one -- the entry stop waits with wait_for_ignore_signals,
+    // which is never marked. The native dispatcher, syscall_dispatch_native,
+    // does the same. See signal_restart_state_clear.
+    signal_restart_state_clear();
 
     const struct syscall_abi_dispatch *dispatch = syscall_dispatch_for_abi(current->abi);
     if (dispatch->table == NULL) {
@@ -5137,7 +5147,9 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         // clearing it on the way past destroyed it before the handler-setup
         // path could read it, turning every handler-cancelled ERESTARTNOHAND
         // back into a restart. That regressed all five of the poll-family
-        // cases this backstop was not even meant to touch.
+        // cases this backstop was not even meant to touch. A flag left set by
+        // an earlier rewind is cleared as each syscall starts instead, at the
+        // top of this function.
         //
         // A CHECKPOINT FREEZE is a restart too, but it arrives as a plain
         // _EINTR: the freezer wakes the wait, the wait returns EINTR, and only
