@@ -159,6 +159,7 @@ ptrace_eventmsg.c
 ptrace_stop_races.c
 ptrace_stop_restart.c
 ptrace_seize_trap_stop.c
+ptrace_spinning_thread.c
 inet_nat_bind.c
 signal_process_target.c
 exec_de_thread.c
