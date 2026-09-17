@@ -2243,7 +2243,6 @@ static NSDictionary *MetricKitDiagnosticSummary(MXDiagnostic *diagnostic, NSStri
 
         _metricManager = metricManager;
         [metricManager addSubscriber:self];
-        NSLog(@"MetricKit diagnostic subscriber registered");
     }
 }
 
@@ -4596,7 +4595,11 @@ void ISHSuspendGuardEnterForeground(void) {
     // Put the listening sockets back. A no-op unless backgrounding recorded
     // some, which is why this is safe on every foreground transition.
     unsigned rebuilt = sockrestart_on_resume();
-    os_log(ISHSuspendLog(), "listening sockets rebuilt on foreground: %{public}u", rebuilt);
+    // Every foreground transition lands here, launch included, and almost none
+    // has anything to rebuild. Log the ones that did; the breadcrumb below
+    // keeps the count either way.
+    if (rebuilt != 0)
+        os_log(ISHSuspendLog(), "listening sockets rebuilt on foreground: %{public}u", rebuilt);
     [ISHDiagnosticsStore recordBreadcrumb:@"application.sockrestartRestored"
                                   details:@{@"listeners": @(rebuilt)}];
     ISHEndSuspendGuard();

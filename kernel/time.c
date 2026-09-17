@@ -391,7 +391,8 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
             // long enough to be mistaken for a signal-delivery bug in AOK.
             if (n == 1)
                 printk("WARNING: host thread went deaf to its wake signal while sleeping "
-                       "(pid=%d comm=%s); repaired. Further occurrences are counted, not logged.\n",
+                       "(pid=%d comm=%s); repaired. Further occurrences are counted in "
+                       "/proc/ish/wake_signals, not logged.\n",
                        current->pid, current->comm);
         }
 
