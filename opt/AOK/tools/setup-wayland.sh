@@ -90,7 +90,10 @@ elif command -v pacman >/dev/null 2>&1; then
 elif command -v apk >/dev/null 2>&1; then
     log "Alpine (apk) detected"
     note "warning: the Alpine path is untested -- please report back what breaks."
-    apk add labwc sway wofi foot wayvnc || die "apk add failed -- see output above"
+    # font-dejavu: on Devuan and Arch the stack pulls in a text font, and on
+    # Alpine nothing does. With only the icon font waybar brings below, every
+    # window title, menu and foot terminal was drawn in Font Awesome.
+    apk add labwc sway wofi foot wayvnc font-dejavu || die "apk add failed -- see output above"
 
 else
     die "no supported package manager found (need apt-get, pacman, or apk)"

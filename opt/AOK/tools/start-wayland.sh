@@ -700,6 +700,31 @@ if [ "$COMPOSITOR_CMD" = "labwc" ] && command -v waybar >/dev/null 2>&1 \
 }
 WAYBAR_CONFIG_EOF
 fi
+# And a style that puts the text font first. waybar's default style.css asks for
+# FontAwesome before any text font. Alpine and Arch ship Font Awesome 7 with a
+# fontconfig alias from that name, and Font Awesome 6 and later draw letters and
+# digits as icons at their ASCII code points, so the whole panel read in icon
+# capitals with no punctuation: the clock said 1623, the address 192168815124.
+# Naming Font Awesome after sans-serif did not help, since the alias binds it
+# more strongly than sans-serif's own match; with sans-serif alone the text is
+# the text font, and the icons still come from Font Awesome, the one font with
+# glyphs at their code points. Debian's Font Awesome 4.7 has no letters, so the
+# panel there looks the same either way. Written only when there is no user
+# style; the system style is imported, so it keeps up with the installed waybar.
+if [ "$COMPOSITOR_CMD" = "labwc" ] && command -v waybar >/dev/null 2>&1 \
+        && [ ! -e "$HOME/.config/waybar/style.css" ] && [ -r /etc/xdg/waybar/style.css ]; then
+    mkdir -p "$HOME/.config/waybar"
+    cat > "$HOME/.config/waybar/style.css" <<'WAYBAR_STYLE_EOF'
+/* Written by /AOK/tools/start-wayland.sh when there was no waybar style yet:
+   waybar's own style, with the text font instead of Font Awesome first (Font
+   Awesome 6 and later would draw every letter as an icon). Edit freely. */
+@import url("file:///etc/xdg/waybar/style.css");
+
+* {
+    font-family: sans-serif;
+}
+WAYBAR_STYLE_EOF
+fi
 
 # Captures the PID of the actual program, not a `cmd | tee` pipeline's last
 # stage -- verified empirically: `$!` after `cmd | tee &` is tee's pid in

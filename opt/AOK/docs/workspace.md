@@ -97,11 +97,14 @@ waybar, the desktop leaves that to it.
 The first session after it is installed writes a config that suits labwc to
 `~/.config/waybar/config.jsonc`. It is written only when you have no waybar config
 of your own, and it is yours to edit. Debian's default in `/etc/xdg/waybar` is
-written for sway, and several of its modules switch themselves off here. Two log
-lines are expected and harmless: `basic_string::_M_create`, a waybar 0.12 bug
-that native Linux prints too, and a warning that it cannot reach the system bus,
-which it only uses to notice suspend. On a root set up before this, install it
-with `sudo apt install waybar fonts-font-awesome` (Devuan) or
+written for sway, and several of its modules switch themselves off here. A
+`style.css` is written beside it the same way: waybar's own style, with the text
+font ahead of Font Awesome, since the Font Awesome 7 that Alpine and Arch ship
+would otherwise draw every letter as an icon. Two log lines are expected and
+harmless: `basic_string::_M_create`, a waybar 0.12 bug that native Linux prints
+too, and a warning that it cannot reach the system bus, which it only uses to
+notice suspend. On a root set up before this, install it with
+`sudo apt install waybar fonts-font-awesome` (Devuan) or
 `sudo apk add waybar font-awesome` (Alpine).
 
 Two caveats worth knowing before you start. It has been run on **amd64** and
