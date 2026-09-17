@@ -2566,6 +2566,47 @@ void group_stop_wait(void) {
 
     while (group->stopped) {
         if (current->ptrace.traced) {
+            // PTRACE_LISTEN: the tracer has already been shown this group-stop
+            // and asked for it to stay in force. Wait it out WITHOUT reporting
+            // again -- a second report is precisely what a listening tracee
+            // must not produce -- and answer the two things that end a listen.
+            if (__atomic_load_n(&current->ptrace.listening, __ATOMIC_ACQUIRE)) {
+                lock(&group->lock, 0);
+                // Every reason to stop waiting is re-asked on each pass: a poke
+                // wakes this wait without consuming an interruption
+                // (wake_waiting_task), which is how PTRACE_INTERRUPT reaches a
+                // listening tracee at all, and is the rule at every other
+                // poke-filtering wait.
+                while (group->stopped &&
+                        __atomic_load_n(&current->ptrace.listening, __ATOMIC_ACQUIRE) &&
+                        !task_trap_stop_pending(current))
+                    wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
+                bool lifted = !group->stopped;
+                unlock(&group->lock);
+
+                // A PTRACE_INTERRUPT ends the listen and re-reports the stop.
+                // The tracee is still group-stopped, so Linux's do_jobctl_trap
+                // reports the STOP SIGNAL again (status 0x80137f) rather than
+                // SIGTRAP; ptrace_group_stop() on the next pass does exactly
+                // that, and consumes the flag as every stop does. Measured on
+                // Linux 6.12.101.
+                if (task_trap_stop_pending(current)) {
+                    ptrace_listen_end();
+                    continue;
+                }
+                // The tracer resumed us instead. Its resume cleared the flag
+                // and lifted the stop, and it expects no report for that.
+                if (!__atomic_load_n(&current->ptrace.listening, __ATOMIC_ACQUIRE))
+                    continue;
+                ptrace_listen_end();
+                // A SIGCONT lifted the stop. Linux tells a listening tracer
+                // about that with a PTRACE_EVENT_STOP carrying SIGTRAP, before
+                // the tracee runs again -- it is how strace knows to print the
+                // SIGCONT and stop expecting the job-control stop to hold.
+                if (lifted)
+                    ptrace_listen_cont_stop();
+                continue;
+            }
             ptrace_group_stop();
             continue;
         }
@@ -2574,6 +2615,13 @@ void group_stop_wait(void) {
             wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
         unlock(&group->lock);
     }
+
+    // A listen never outlives the stop it was asked for. Whatever ended the
+    // job-control stop -- a resume, a SIGCONT, a detach -- a flag left set here
+    // would make the NEXT group-stop be waited out in silence instead of
+    // reported to the tracer.
+    if (__atomic_load_n(&current->ptrace.listening, __ATOMIC_ACQUIRE))
+        ptrace_listen_end();
 
     // We were stopped and have just been resumed. If SIGCONT flagged a
     // reportable continue, wake a parent blocked in wait4/waitid(WCONTINUED)

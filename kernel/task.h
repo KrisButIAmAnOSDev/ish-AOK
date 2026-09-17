@@ -293,10 +293,8 @@ struct task {
         bool traced;
         bool stopped;
         // Attached via PTRACE_SEIZE (vs classic TRACEME/ATTACH). Determines how
-        // a job-control group-stop is reported to the tracer: a seized tracee
-        // gets a PTRACE_EVENT_STOP event-stop (which strace -f recognizes as a
-        // group-stop and resumes with PTRACE_CONT(0)); a classic tracee gets a
-        // plain signal-stop carrying the stop signal.
+        // a job-control group-stop is reported to the tracer, which is the one
+        // thing the two attach styles disagree about: see ptrace_group_stop.
         bool seized;
         bool sysgood;
         bool stop_at_syscall;
@@ -330,6 +328,45 @@ struct task {
         // ptrace_detach_survives.c.
         bool trap_stop;
         struct siginfo_ info;
+        // Whether this stop has a siginfo at all -- Linux's last_siginfo, which
+        // ptrace_stop() sets from the info it is handed and do_jobctl_trap
+        // passes as NULL for an UNSEIZED tracee's group-stop. PTRACE_GETSIGINFO
+        // fails with EINVAL when it is clear.
+        //
+        // This is the only thing that tells a classic tracee's group-stop from
+        // a signal-delivery-stop of the very same SIGSTOP: both report status
+        // 0x137f, and only the group-stop refuses GETSIGINFO. Measured on Linux
+        // 6.12.101; it is how gdb and strace tell the two apart, and AOK
+        // answered both, so every group-stop read as a signal to re-inject.
+        bool has_siginfo;
+
+        // Whether a signal the tracer injects to resume THIS stop is discarded
+        // rather than delivered. Linux splits the stops in exactly two: a
+        // signal-delivery-stop (ptrace_signal) and a syscall stop
+        // (ptrace_report_syscall, which re-sends it explicitly) pass the
+        // injected signal on, while do_jobctl_trap and ptrace_event -- every
+        // group-stop, PTRACE_INTERRUPT stop and PTRACE_EVENT_* stop -- throw
+        // away what ptrace_stop() returns. Measured on Linux 6.12.101:
+        // PTRACE_CONT(SIGUSR1) from a group-stop leaves the tracee running and
+        // unkilled, while the same injection at a syscall stop kills it.
+        //
+        // A flag of its own because it has to outlive the tracer's wait: the
+        // trap_event this could otherwise be read from is cleared by wait4 as
+        // it builds the status word (kernel/exit.c), long before the resume.
+        bool stop_discards_signal;
+
+        // PTRACE_LISTEN: the tracer has been shown this tracee's group-stop and
+        // asked for it to stay in it rather than be resumed. Linux's
+        // JOBCTL_LISTENING. The tracee waits the job-control stop out in
+        // group_stop_wait's listening branch without reporting it again, which
+        // is what keeps `kill -STOP` working on a process strace is attached
+        // to. Two things end a listen: a SIGCONT, reported as a
+        // PTRACE_EVENT_STOP carrying SIGTRAP, and a PTRACE_INTERRUPT, which
+        // re-reports the group-stop.
+        //
+        // Written under `lock` by the tracer and by the tracee itself; read
+        // without it by group_stop_wait, so accessed atomically like trap_stop.
+        bool listening;
         int trap_event;
         qword_t eventmsg;
         int syscall;

@@ -30,6 +30,7 @@ struct task;
 #define PTRACE_SETREGSET_ 0x4205
 #define PTRACE_SEIZE_ 0x4206
 #define PTRACE_INTERRUPT_ 0x4207
+#define PTRACE_LISTEN_ 0x4208
 
 #define NT_PRSTATUS_ 1
 #define NT_PRFPREG_ 2
@@ -199,6 +200,11 @@ dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, dword_t data);
 dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_addr_t data);
 void ptrace_signal_stop(int sig, struct siginfo_ *info);
 void ptrace_group_stop(void);
+// End a PTRACE_LISTEN without reporting anything (ptrace.listening).
+void ptrace_listen_end(void);
+// Report that a SIGCONT has lifted the group-stop a listening tracee was
+// waiting out: a PTRACE_EVENT_STOP carrying SIGTRAP, status 0x80057f.
+void ptrace_listen_cont_stop(void);
 void ptrace_syscall_stop(struct cpu_state *cpu);
 void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventmsg);
 // Take the PTRACE_EVENT_STOP the current task owes its tracer (ptrace.trap_stop),

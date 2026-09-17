@@ -36,6 +36,19 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
     // a child: strace -f takes that one at its delivery-stop and passes it on.
     // Measured on Linux 6.12 by tests/manual/ptrace_tracee_exit.c. From any
     // other stop Linux's send_sig says SI_KERNEL, which SIGINFO_NIL is.
+    // A signal injected to resume a group-stop, or any other event stop, is
+    // discarded rather than delivered (ptrace.stop_discards_signal). Delivering
+    // it made a group-stop inescapable for a tracer that re-injects each stop's
+    // own signal, as gdb and strace both can: the SIGSTOP went straight back
+    // in, the tracee group-stopped again, and a probe logged 2.8 million
+    // consecutive stops in four minutes where Linux takes two and runs on.
+    //
+    // Zeroed here rather than skipped at the send below, so that the group-stop
+    // is lifted as it is for any other signal-free resume -- which is what lets
+    // the tracee actually run.
+    if (resume_sig != 0 && child->ptrace.stop_discards_signal)
+        resume_sig = 0;
+
     struct siginfo_ resume_info = SIGINFO_NIL;
     if (resume_sig != 0 && child->ptrace_delivery_stop) {
         if (resume_sig == child->ptrace.info.sig) {
@@ -48,6 +61,7 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         }
     }
     child->ptrace_delivery_stop = false;
+    child->ptrace.stop_discards_signal = false;
     // Pinned until the end. Everything past the unlock below runs with the
     // tracee free to run, and a tracee that is let go can exit and be freed
     // before this reaches its group or its signal queue. Guard Malloc caught
@@ -61,6 +75,9 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
     if (!stop_at_syscall)
         child->ptrace.syscall_stopped = false;
     child->ptrace.stopped = false;
+    // Any resume ends a PTRACE_LISTEN: the tracee stops waiting the job-control
+    // stop out and runs, which is what the tracer just asked for.
+    __atomic_store_n(&child->ptrace.listening, false, __ATOMIC_RELEASE);
     child->ptrace.signal = 0;
     // A signal injected by the tracer must be delivered (run its action) the
     // next time the tracee processes signals, not re-reported as another
@@ -658,6 +675,11 @@ static bool ptrace_sigkill_pending(void) {
 // and wait never clears it, so a tracer can wait for the stop first and ask
 // for the message afterwards, which is the only order it can ask in.
 //
+// `info` is what PTRACE_GETSIGINFO answers while the tracee sits in the stop,
+// or NULL for a stop that HAS no siginfo -- Linux's ptrace_stop() takes the
+// same argument, and do_jobctl_trap passes NULL for an unseized tracee's
+// group-stop, which is why GETSIGINFO fails there (ptrace.has_siginfo).
+//
 // `trap_stop` marks the stop that answers ptrace.trap_stop itself
 // (ptrace_trap_stop_if_pending), which is owed only while the flag is still set.
 // `delivery` marks a signal-delivery-stop (ptrace_signal_stop), the one stop a
@@ -700,7 +722,9 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
     // landing between the two could relabel an event-stop as its own.
     current->ptrace.trap_event = event;
     current->ptrace.eventmsg = eventmsg;
-    current->ptrace.info = *info;
+    current->ptrace.stop_discards_signal = !delivery && !syscall_stop;
+    current->ptrace.has_siginfo = info != NULL;
+    current->ptrace.info = info != NULL ? *info : SIGINFO_NIL;
     current->ptrace_delivery_stop = delivery;
     // Any stop answers a pending PTRACE_INTERRUPT, as Linux's ptrace_stop
     // clears JOBCTL_TRAP_STOP for every stop: a tracee interrupted on its way
@@ -816,21 +840,37 @@ void ptrace_syscall_stop(struct cpu_state *cpu) {
 // has nothing to resume -- so strace -f following a fork/clone child hangs
 // forever once the child group-stops on the injected SIGSTOP.
 //
-// We route the group-stop through the ptrace stop machinery instead:
-//   - A seized tracee (modern strace -f) is reported as a PTRACE_EVENT_STOP
-//     event-stop (WSTOPSIG == SIGTRAP, event == PTRACE_EVENT_STOP). strace
-//     recognizes this as a group-stop and resumes with PTRACE_CONT(0) rather
-//     than re-injecting the stop signal -- which is what previously produced
-//     the infinite SIGSTOP storm.
-//   - A classic tracee is reported as a plain signal-stop carrying the stop
-//     signal, matching pre-seize ptrace behavior.
+// HOW the stop is reported is the one thing the two attach styles disagree
+// about, and a tracer of either kind must be able to tell a group-stop from a
+// signal-delivery-stop of the same signal. Both arms below are Linux's
+// do_jobctl_trap, measured on 6.12.101:
 //
-// PTRACE_CONT lifts group->stopped (see ptrace_resume_child_locked), so the
-// caller's group-stop loop falls through and the tracee runs. Caveat: this
-// means a genuine job-control stop (Ctrl-Z) of a traced task is released by the
-// tracer's PTRACE_CONT rather than persisting until SIGCONT (Linux "listener"
-// semantics). Distinguishing the auto-attach SIGSTOP from a real one would be
-// required to honor that, and is out of scope here.
+//   - A SEIZED tracee (PTRACE_SEIZE, how strace attaches) gets the STOP SIGNAL
+//     with a PTRACE_EVENT_STOP event: status 0x80137f for SIGSTOP, 0x80147f for
+//     SIGTSTP, 0x80157f for SIGTTIN. The siginfo carries that signal with
+//     si_code (PTRACE_EVENT_STOP << 8) | signal and the tracee's OWN pid.
+//     strace switches on WSTOPSIG to recognise the group-stop, so reporting
+//     SIGTRAP here -- as this used to -- left it unrecognised: strace resumed
+//     with PTRACE_CONT, which lifts the group stop, and `kill -STOP` on a
+//     process under `strace -f` did not stop it at all. The tracee stayed S
+//     where Linux leaves it t, and strace printed nothing where Linux prints
+//     "--- stopped by SIGSTOP ---".
+//
+//   - An UNSEIZED tracee (PTRACE_TRACEME/PTRACE_ATTACH, how gdb attaches) gets
+//     the stop signal with NO event and NO siginfo: status 0x137f, and
+//     PTRACE_GETSIGINFO fails with EINVAL. That EINVAL is the entire
+//     difference between this stop and a signal-delivery-stop of the same
+//     SIGSTOP, which reports the identical status word, and it is how gdb and
+//     strace tell them apart. Answering GETSIGINFO here made every group-stop
+//     look like a signal to re-inject: a probe that injects each stop's own
+//     signal logged 2.8 million consecutive 0x137f stops in four minutes,
+//     where Linux takes exactly two and runs on.
+//
+// A resume ends the stop. PTRACE_CONT lifts group->stopped (see
+// ptrace_resume_child_locked), and an injected signal is discarded rather than
+// re-delivered, as Linux discards what ptrace_stop() returns here. A seizing
+// tracer that wants the tracee to STAY job-control stopped says so with
+// PTRACE_LISTEN, which parks it in group_stop_wait's listening branch.
 void ptrace_group_stop(void) {
     lock(&current->group->lock, 0);
     int stop_sig = (current->group->group_exit_code >> 8) & 0xff;
@@ -838,18 +878,44 @@ void ptrace_group_stop(void) {
     if (stop_sig == 0)
         stop_sig = SIGSTOP_;
 
-    struct siginfo_ info = {
-        .sig = stop_sig,
-        .code = SI_KERNEL_,
-    };
     // No message, as in Linux's do_jobctl_trap. This passed the stop signal,
     // which no tracer could see while wait4 cleared every message.
-    // A group-stop, not a signal-delivery-stop, even when it is reported as
-    // one: nothing is being delivered.
-    if (current->ptrace.seized)
-        ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_STOP_, 0);
-    else
-        ptrace_stop_common(stop_sig, &info, false, false, 0, 0, false);
+    if (current->ptrace.seized) {
+        struct siginfo_ info = {
+            .sig = stop_sig,
+            .code = (PTRACE_EVENT_STOP_ << 8) | stop_sig,
+            .kill.pid = current->pid,
+            .kill.uid = current->uid,
+        };
+        ptrace_stop_common(stop_sig, &info, false, false, PTRACE_EVENT_STOP_, 0, false);
+    } else {
+        // NULL: no siginfo, so PTRACE_GETSIGINFO gives EINVAL. A group-stop,
+        // not a signal-delivery-stop -- nothing is being delivered.
+        ptrace_stop_common(stop_sig, NULL, false, false, 0, 0, false);
+    }
+}
+
+// End a PTRACE_LISTEN. Called by the tracee itself when something has ended the
+// listen (group_stop_wait); a tracer's resume clears the flag directly.
+void ptrace_listen_end(void) {
+    lock(&current->ptrace.lock, 0);
+    __atomic_store_n(&current->ptrace.listening, false, __ATOMIC_RELEASE);
+    unlock(&current->ptrace.lock);
+}
+
+// A SIGCONT has lifted the group-stop a listening tracee was waiting out.
+// Linux reports that to the tracer as a PTRACE_EVENT_STOP carrying SIGTRAP --
+// status 0x80057f, si_code (PTRACE_EVENT_STOP << 8) | SIGTRAP, the tracee's own
+// pid -- before the tracee runs again. Measured on 6.12.101, where strace then
+// prints the SIGCONT and resumes the interrupted syscall.
+void ptrace_listen_cont_stop(void) {
+    struct siginfo_ info = {
+        .sig = SIGTRAP_,
+        .code = (PTRACE_EVENT_STOP_ << 8) | SIGTRAP_,
+        .kill.pid = current->pid,
+        .kill.uid = current->uid,
+    };
+    ptrace_stop_common(SIGTRAP_, &info, false, false, PTRACE_EVENT_STOP_, 0, false);
 }
 
 dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, dword_t data) {
@@ -1162,6 +1228,56 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             return 0;
         }
 
+        // PTRACE_LISTEN: the tracer has seen a group-stop and wants the tracee
+        // to STAY in it rather than be resumed -- what strace does so that
+        // `kill -STOP` on a traced process really stops it. Without this,
+        // reporting the group-stop correctly would be worse than not reporting
+        // it: strace answers a recognised group-stop with LISTEN, and that fell
+        // through to the default arm's EPERM.
+        //
+        // Linux takes it only from a SEIZED tracee, and only at a stop whose
+        // siginfo says PTRACE_EVENT_STOP -- a group-stop or a PTRACE_INTERRUPT
+        // stop. An unseized tracee's group-stop and a signal-delivery-stop both
+        // give EIO. Measured on 6.12.101, along with the 0 for an INTERRUPT
+        // stop, which is why the test is the si_code and not "is a group-stop".
+        case PTRACE_LISTEN_: {
+            STRACE("ptrace(PTRACE_LISTEN, %d, %#llx, %#llx)", pid,
+                    (unsigned long long) addr, (unsigned long long) data);
+            if (addr != 0 || data != 0)
+                return _EIO;
+            struct task *child = find_child(pid);
+            if (!child) return _ESRCH;
+            if (!child->ptrace.seized || !child->ptrace.has_siginfo ||
+                    ((child->ptrace.info.code >> 8) & 0xff) != PTRACE_EVENT_STOP_) {
+                unlock(&child->ptrace.lock);
+                return _EIO;
+            }
+            // Armed only for a tracee that really is job-control stopped, so
+            // the flag can never outlive a stop and swallow the report of the
+            // NEXT one. group->stopped is _Atomic and read without its lock, as
+            // group_stop_wait reads it -- taking it under ptrace.lock would be a
+            // lock order this code deliberately does not have. A tracee
+            // listening at a PTRACE_INTERRUPT stop instead (which Linux also
+            // allows, and answers 0 for) therefore resumes rather than staying
+            // stopped; strace only ever listens at a group-stop.
+            if (child->group->stopped)
+                __atomic_store_n(&child->ptrace.listening, true, __ATOMIC_RELEASE);
+            // A partial resume: the tracee leaves the ptrace stop, so the
+            // tracer's wait4 stops reporting it, but group->stopped is NOT
+            // lifted. It goes straight back to waiting the job-control stop out
+            // in group_stop_wait's listening branch, which is the point. A
+            // SIGCONT that raced the LISTEN is caught there too: the branch
+            // finds the stop already lifted and reports it.
+            child->ptrace.stopped = false;
+            child->ptrace.signal = 0;
+            child->ptrace.trap_event = 0;
+            child->ptrace.eventmsg = 0;
+            child->ptrace_delivery_stop = false;
+            notify(&child->ptrace.cond);
+            unlock(&child->ptrace.lock);
+            return 0;
+        }
+
         case PTRACE_GETREGS_: {
             STRACE("ptrace(PTRACE_GETREGS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
@@ -1367,6 +1483,15 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             struct task *child = find_child(pid);
             if (!child) return _ESRCH;
 
+            // A stop with no siginfo -- an unseized tracee's group-stop -- is
+            // EINVAL, as Linux's ptrace_getsiginfo is for a NULL last_siginfo.
+            // A tracer has no other way to tell that group-stop from a
+            // signal-delivery-stop of the same signal, and answering it made
+            // gdb and strace re-inject the stop signal forever.
+            if (!child->ptrace.has_siginfo) {
+                unlock(&child->ptrace.lock);
+                return _EINVAL;
+            }
             if (data && siginfo_to_user(current, data, &child->ptrace.info)) {
                 unlock(&child->ptrace.lock);
                 return _EFAULT;

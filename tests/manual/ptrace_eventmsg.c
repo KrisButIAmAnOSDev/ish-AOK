@@ -693,11 +693,11 @@ static void seize_case(void) {
     ptrace(PTRACE_CONT, c, 0, (void *) (long) SIGSTOP);
     if (wait_for(c, &st) != c)
         goto hung;
-    // The stop signal in this status word is not checked: AOK reports a
-    // seized group-stop as SIGTRAP where Linux reports the stop signal, a
-    // known divergence kernel/ptrace.c's ptrace_group_stop explains.
-    check(name, "group-stop is a PTRACE_EVENT_STOP", (uint64_t) (st & 0xff00ff),
-          (PTRACE_EVENT_STOP << 16) | 0x7f);
+    // The whole status word, stop signal included. This used to mask the
+    // signal out, because AOK reported a seized group-stop as SIGTRAP where
+    // Linux reports the stop signal that caused it.
+    check(name, "group-stop status", (uint64_t) st,
+          STOP_STATUS(SIGSTOP, PTRACE_EVENT_STOP));
     check(name, "message at the group-stop", read_eventmsg(c), 0);
 
     close(go[1]);

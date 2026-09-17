@@ -44,6 +44,7 @@ futex_core.c
 process_lifecycle.c
 pthread_sync.c
 ptrace_group_stop.c
+ptrace_group_stop_report.c
 ptrace_trap_siginfo.c
 swap_roundtrip.c
 zswap_roundtrip.c

@@ -184,8 +184,16 @@ static int await_group_stop_report(pid_t child, const char *label) {
         int event = (status >> 16) & 0xff;
         test_logf("    stop: sig=%d event=%d status=%#x\n", sig, event, status);
 
-        if (event == PTRACE_EVENT_STOP)
+        if (event == PTRACE_EVENT_STOP) {
+            // A seized group-stop carries the STOP SIGNAL, not SIGTRAP: every
+            // case here gets there through SIGSTOP, so the status word is
+            // exactly 0x80137f. Native and translated programs must report it
+            // identically -- the whole point of this file.
+            if (status != (int) ((PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f))
+                failf(label, (uint64_t) status, 0, 0,
+                      (PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f, 0, 0);
             return 1;
+        }
         // Signal-delivery-stop of SIGSTOP: deliver it, so the tracee actually
         // enters group-stop and reports it next time round.
         int deliver = (sig == SIGSTOP) ? SIGSTOP : 0;

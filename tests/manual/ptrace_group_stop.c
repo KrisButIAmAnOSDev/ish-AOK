@@ -9,8 +9,9 @@
 //
 //   child : raise(SIGSTOP) -> then _exit(42)
 //   tracer: SEIZE child; on the SIGSTOP signal-delivery-stop, deliver SIGSTOP to
-//           force group-stop; expect a PTRACE_EVENT_STOP report; SIGCONT +
-//           PTRACE_CONT to let it finish; verify exit code 42.
+//           force group-stop; expect a PTRACE_EVENT_STOP report carrying the
+//           stop signal; SIGCONT + PTRACE_CONT to let it finish; verify exit
+//           code 42.
 //
 // The second case runs the OTHER order: the tracee is already group-stopped
 // when the tracer seizes it. Linux reports the group-stop on attach
@@ -127,8 +128,16 @@ static void drive_tracee(pid_t child, int want_exit, const char *label) {
         test_logf("stop: sig=%d event=%d status=%#x\n", sig, event, status);
 
         if (event == PTRACE_EVENT_STOP) {
-            // The group-stop report. Lift job control (SIGCONT for real-Linux
-            // listener semantics; harmless on AOK) and continue.
+            // The group-stop report, which carries the STOP SIGNAL -- the whole
+            // point of a seized report, and what strace switches on to
+            // recognise it. tests/manual/ptrace_group_stop_report.c covers the
+            // rest of the reporting rules; this pins the signal here because
+            // every case in this file reaches the event-stop through SIGSTOP.
+            if (status != (int) ((PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f))
+                failf(label, (uint64_t) status, 0, 0,
+                      (PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f, 0, 0);
+            // Lift job control and continue. A tracer that wanted the stop to
+            // HOLD would say PTRACE_LISTEN here instead.
             saw_group_stop = 1;
             kill(child, SIGCONT);
             if (ptrace(PTRACE_CONT, child, 0, 0) != 0) {
