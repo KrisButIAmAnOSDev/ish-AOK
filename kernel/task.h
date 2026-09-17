@@ -761,6 +761,9 @@ static inline bool task_take_swap_io_fault(void) {
     return true;
 }
 dword_t get_count_of_alive_tasks(void);
+// The guest's 1/5/15-minute load averages, scaled by 65536 as sysinfo(2)
+// reports them. Sampled every 5 s by a timer thread, as on Linux, so the
+// answer does not depend on who reads it or how often; see kernel/task.c.
 void get_guest_loadavg(uint64_t out[3]);
 
 // Time since the guest booted, on a monotonic host clock (the one the guest's

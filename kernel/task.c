@@ -399,40 +399,160 @@ uint64_t guest_uptime_ticks(void) {
     return ticks - ticks % 10;
 }
 
-// Linux-style load average computed over the guest's OWN runnable tasks, so
-// /proc/loadavg reflects the guest rather than the host load that the platform
-// getloadavg returns. The EMA is advanced lazily on read, one step per elapsed
-// 5-second interval (the classic calc_load cadence).
+// ---- the guest's load average ---------------------------------------------
+//
+// Linux's calc_load over the guest's OWN runnable tasks, so /proc/loadavg and
+// sysinfo(2) describe the guest rather than the host.
+//
+// It read 0.00 under load: after 65 s of one busy loop, still 0.00, where Linux
+// reads 0.66. The count was "alive minus io-blocked minus one", the one being
+// the reader -- but a task reading /proc/loadavg is inside read(2), and
+// TASK_MAY_BLOCK has already marked it io-blocked, so it was subtracted twice
+// and one busy task counted as none. sysinfo(2) arrived with its caller NOT
+// blocked, so there the same "- 1" was right. guest_count_runnable() now
+// leaves out `current` by identity, which is right for both, whether or not
+// the caller happens to be marked blocked when it counts.
+//
+// The average also used to advance only when somebody read it, applying the
+// reader's instantaneous count to every 5-second step it had missed. For a
+// steady load and a frequent poller that is the same answer, but a load that
+// ended just before a read was never seen at all (15 s of a busy loop, then a
+// read 2 s after it stopped: 0.00 with the count fixed, where Linux reads the
+// decaying average), and a reader that polls every 10 s samples at half
+// Linux's rate, and only ever at the instant it wakes. So, as on Linux, a timer
+// takes the samples: a detached thread that wakes every 5 s, the same shape as
+// the netlink link watcher (fs/sock.c), started when the first process is
+// created. A reader still applies an overdue sample itself, so if that thread
+// cannot be created, or has not been scheduled yet, the average degrades to
+// the old read-driven behaviour rather than freezing.
 #define GUEST_LOAD_FSHIFT 11
 #define GUEST_LOAD_FIXED_1 (1u << GUEST_LOAD_FSHIFT)
-void get_guest_loadavg(uint64_t out[3]) {
-    static const unsigned exp[3] = {1884, 2014, 2037}; // 1/exp(5s/{1,5,15}min) in FIXED_1
-    static lock_t load_lock = LOCK_INITIALIZER;
-    static uint64_t load[3];
-    static time_t last_sec;
+#define GUEST_LOAD_PERIOD_NS (5 * NSEC_PER_SEC_U64)  // Linux's LOAD_FREQ
+#define GUEST_LOAD_MAX_STEPS 64
 
-    // Runnable tasks = alive minus io-blocked, excluding this reader itself.
-    long active = (long) get_count_of_alive_tasks() - (long) get_count_of_blocked_tasks() - 1;
-    if (active < 0)
-        active = 0;
-    struct timespec now = timespec_now(CLOCK_MONOTONIC);
+static lock_t guest_load_lock = LOCK_INITIALIZER;
+static uint64_t guest_load[3];       // FIXED_1-scaled; under guest_load_lock
+static uint64_t guest_load_due_ns;   // uptime of the next sample; 0 = not started
+// guest_load_due_ns, readable without the lock by the fast path.
+static _Atomic uint64_t guest_load_due_hint;
 
-    lock(&load_lock, 0);
-    if (last_sec == 0)
-        last_sec = now.tv_sec;
-    long steps = (now.tv_sec - last_sec) / 5;
-    if (steps > 0) {
-        long do_steps = steps > 64 ? 64 : steps;
-        for (long s = 0; s < do_steps; s++)
-            for (int i = 0; i < 3; i++)
-                load[i] = (load[i] * exp[i] +
-                           (uint64_t) active * GUEST_LOAD_FIXED_1 * (GUEST_LOAD_FIXED_1 - exp[i]))
-                          >> GUEST_LOAD_FSHIFT;
-        last_sec = steps > 64 ? now.tv_sec : last_sec + steps * 5;
+// Runnable in Linux's sense, as near as AOK can tell: alive, not parked in a
+// blocking call, and not the caller. A task sampling the average is running at
+// that instant only BECAUSE it is sampling, so counting it would put a floor
+// of 1.00 under an idle guest; the timer thread has no `current` and excludes
+// nothing. Zombies and exiting tasks stay on alive_pids_list until they are
+// reaped, and do not run. Nor does a task parked by a checkpoint freeze
+// (checkpoint_park_if_frozen), which waits on a condition variable of its own
+// with io_block clear: counted, a guest frozen for a save would have added
+// every one of its tasks to the average once the timer took samples on its
+// own.
+static long guest_count_runnable(void) {
+    long count = 0;
+    complex_lockt(&pids_lock, 0);
+    struct pid *pid_entry;
+    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
+        struct task *task = pid_entry->task;
+        if (task == NULL || task == current || task->io_block ||
+                task->zombie || task->exiting ||
+                atomic_load_explicit(&task->ckpt_frozen, memory_order_relaxed))
+            continue;
+        count++;
     }
+    unlock(&pids_lock);
+    return count;
+}
+
+// Linux's calc_load, including the round-up that lets a rising average
+// actually reach the count instead of stalling a fraction below it.
+static uint64_t guest_calc_load(uint64_t load, uint64_t exp, uint64_t active) {
+    uint64_t newload = load * exp + active * (GUEST_LOAD_FIXED_1 - exp);
+    if (active >= load)
+        newload += GUEST_LOAD_FIXED_1 - 1;
+    return newload / GUEST_LOAD_FIXED_1;
+}
+
+// Take whatever samples are due. Cheap when none is: one clock read and one
+// atomic load, no lock.
+static void guest_loadavg_sample(void) {
+    static const uint64_t exp[3] = {1884, 2014, 2037}; // exp(-5s/{1,5,15}min) in FIXED_1
+    uint64_t now = guest_uptime_ns();
+    uint64_t due = atomic_load_explicit(&guest_load_due_hint, memory_order_acquire);
+    if (due != 0 && now < due && due - now <= GUEST_LOAD_PERIOD_NS)
+        return;
+
+    // Counted before guest_load_lock, which therefore never nests pids_lock.
+    uint64_t active = (uint64_t) guest_count_runnable() * GUEST_LOAD_FIXED_1;
+    lock(&guest_load_lock, 0);
+    // The clock again, under the lock. A `now` read before it could predate a
+    // catch-up another caller has just applied, and a schedule that moved past
+    // a stale `now` by more than a period looks exactly like a new boot below
+    // -- which would zero the average.
+    now = guest_uptime_ns();
+    if (guest_load_due_ns == 0 || guest_load_due_ns > now + GUEST_LOAD_PERIOD_NS) {
+        // The first sample of this boot -- or uptime restarted under a new
+        // one, and the old machine's average is not this one's.
+        memset(guest_load, 0, sizeof(guest_load));
+        guest_load_due_ns = (now / GUEST_LOAD_PERIOD_NS + 1) * GUEST_LOAD_PERIOD_NS;
+    } else if (now >= guest_load_due_ns) {
+        // Several due at once means the sampler was not running (an app that
+        // was suspended, or no sampler at all); like Linux catching up after a
+        // tickless idle, apply the present count to each, up to a limit.
+        uint64_t steps = 1 + (now - guest_load_due_ns) / GUEST_LOAD_PERIOD_NS;
+        uint64_t apply = steps < GUEST_LOAD_MAX_STEPS ? steps : GUEST_LOAD_MAX_STEPS;
+        for (uint64_t s = 0; s < apply; s++)
+            for (int i = 0; i < 3; i++)
+                guest_load[i] = guest_calc_load(guest_load[i], exp[i], active);
+        guest_load_due_ns += steps * GUEST_LOAD_PERIOD_NS;
+    }
+    atomic_store_explicit(&guest_load_due_hint, guest_load_due_ns, memory_order_release);
+    unlock(&guest_load_lock);
+}
+
+static void *guest_loadavg_thread(void *unused) {
+    (void) unused;
+    // Darwin names the calling thread and takes only the name; see
+    // update_thread_name and kernel/swap.c's kswapd.
+#if __APPLE__
+    pthread_setname_np("loadavg");
+#else
+    pthread_setname_np(pthread_self(), "loadavg");
+#endif
+    for (;;) {
+        guest_loadavg_sample();
+        uint64_t now = guest_uptime_ns();
+        uint64_t due = atomic_load_explicit(&guest_load_due_hint, memory_order_acquire);
+        uint64_t wait = due > now ? due - now : 0;
+        if (wait > GUEST_LOAD_PERIOD_NS)
+            wait = GUEST_LOAD_PERIOD_NS;
+        // A millisecond past the boundary, so the sample is due when it looks.
+        wait += 1000000;
+        struct timespec nap = {
+            .tv_sec = (time_t) (wait / NSEC_PER_SEC_U64),
+            .tv_nsec = (long) (wait % NSEC_PER_SEC_U64),
+        };
+        nanosleep(&nap, NULL);
+    }
+    return NULL;
+}
+
+static void guest_loadavg_start(void) {
+    static atomic_bool started;
+    if (atomic_exchange_explicit(&started, true, memory_order_acq_rel))
+        return;
+    guest_loadavg_sample();   // starts the schedule at this boot
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, guest_loadavg_thread, NULL) == 0)
+        pthread_detach(thread);
+    else
+        printk("WARNING: no load average sampler thread; the average advances only when read\n");
+}
+
+void get_guest_loadavg(uint64_t out[3]) {
+    guest_loadavg_sample();   // nothing to do unless a sample is overdue
+    lock(&guest_load_lock, 0);
     for (int i = 0; i < 3; i++)
-        out[i] = load[i] << (16 - GUEST_LOAD_FSHIFT);
-    unlock(&load_lock);
+        out[i] = guest_load[i] << (16 - GUEST_LOAD_FSHIFT);
+    unlock(&guest_load_lock);
 }
 
 // ---- CPU time counters that never run backward ------------------------------
@@ -941,6 +1061,9 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
         list_add(&parent->children, &task->siblings);
     }
     unlock(&pids_lock);
+    // The machine now exists, so its load average starts being sampled.
+    if (parent == NULL)
+        guest_loadavg_start();
     return task;
 }
 
