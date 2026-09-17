@@ -88,11 +88,11 @@ up before this, install it once with `sudo apt install dbus-daemon` (Devuan) or
 `sudo apk add dbus` (Alpine), then reopen the applet.
 
 `waybar`, a panel along the top of the desktop, is installed too, with the Font
-Awesome font its icons use. Start it from a foot terminal:
-
-```sh
-waybar &   # taskbar, clock, CPU, memory, disk, network and battery
-```
+Awesome font its icons use: a taskbar, the clock, CPU, memory, disk, network and
+battery. It starts with the desktop. To turn it off, right-click the desktop and
+pick **Applications › Hide Panel**; it stays off in later sessions until
+**Show Panel** turns it back on. If your own `~/.config/labwc/autostart` starts
+waybar, the desktop leaves that to it.
 
 The first session after it is installed writes a config that suits labwc to
 `~/.config/waybar/config.jsonc`. It is written only when you have no waybar config

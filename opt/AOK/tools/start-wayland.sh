@@ -257,10 +257,12 @@ fi
 COMPOSITOR_PID=""
 FOOT_PID=""
 WAYVNC_PID=""
+PANEL_PID=""
 
 cleanup() {
     trap - TERM INT HUP EXIT
     rm -f "$READY_FILE"
+    [ -n "$PANEL_PID" ] && kill "$PANEL_PID" 2>/dev/null
     [ -n "$WAYVNC_PID" ] && kill "$WAYVNC_PID" 2>/dev/null
     [ -n "$FOOT_PID" ] && kill "$FOOT_PID" 2>/dev/null
     [ -n "$COMPOSITOR_PID" ] && kill "$COMPOSITOR_PID" 2>/dev/null
@@ -450,6 +452,12 @@ if [ "$COMPOSITOR_CMD" = "labwc" ]; then
 #!/bin/sh
 set -- /usr/share/applications/*.desktop
 echo '<openbox_pipe_menu>'
+# The panel's switch (panel.sh), labelled by whether waybar is running now.
+if command -v waybar >/dev/null 2>&1; then
+    if pgrep -u "$(id -u)" -x waybar >/dev/null 2>&1; then panel_label="Hide Panel"; else panel_label="Show Panel"; fi
+    printf '<item label="%s"><action name="Execute" command="%s/.config/labwc/panel.sh toggle"/></item>\n<separator/>\n' \
+        "$panel_label" "$HOME"
+fi
 if [ -e "$1" ]; then
     awk '
         function emit() {
@@ -476,6 +484,32 @@ fi
 echo '</openbox_pipe_menu>'
 LIST_APPS_EOF
     chmod +x "$HOME/.config/labwc/list-apps.sh"
+
+    # The panel's switch, behind the Applications menu's Show/Hide Panel. The
+    # choice lasts: hiding it leaves panel-off behind, and a session started with
+    # that file present does not start waybar.
+    cat > "$HOME/.config/labwc/panel.sh" <<'PANEL_EOF'
+#!/bin/sh
+off="$HOME/.config/labwc/panel-off"
+running() { pgrep -u "$(id -u)" -x waybar >/dev/null 2>&1; }
+case "${1:-toggle}" in
+    toggle)
+        if running; then
+            pkill -u "$(id -u)" -x waybar
+            : > "$off"
+        else
+            rm -f "$off"
+            exec waybar
+        fi
+        ;;
+    start)
+        [ -e "$off" ] && exit 0
+        running && exit 0
+        exec waybar
+        ;;
+esac
+PANEL_EOF
+    chmod +x "$HOME/.config/labwc/panel.sh"
 fi
 if [ "$COMPOSITOR_CMD" = "labwc" ] && [ ! -f "$HOME/.config/labwc/menu.xml" ]; then
     cat > "$HOME/.config/labwc/menu.xml" <<MENU_EOF
@@ -844,5 +878,17 @@ echo "READY $WAYVNC_PORT"
 # timeout tears it down. Fail loudly instead -- die() persists the reason.
 { printf '%s\n' "$WAYVNC_PORT" > "$READY_FILE"; } 2>/dev/null \
     || die "cannot write $READY_FILE (stale file owned by another uid?) -- the applet cannot see this session"
+
+# waybar, the panel, starts with the desktop: after the ready file, so its GTK
+# startup never delays the applet connecting. panel.sh leaves it off when the
+# user hid it (Applications > Hide Panel), and it is skipped when the user's own
+# labwc autostart starts waybar, which would make two.
+if [ "$COMPOSITOR_CMD" = "labwc" ] && command -v waybar >/dev/null 2>&1 \
+        && [ -x "$HOME/.config/labwc/panel.sh" ] \
+        && ! grep -qs waybar "$HOME/.config/labwc/autostart"; then
+    log "starting the panel (waybar)"
+    spawn_logged panel "$HOME/.config/labwc/panel.sh" start
+    PANEL_PID=$SPAWN_PID
+fi
 
 wait "$COMPOSITOR_PID" "$FOOT_PID" "$WAYVNC_PID"
