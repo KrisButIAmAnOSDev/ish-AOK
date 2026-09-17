@@ -20,6 +20,7 @@ mount-root.sh
 manage-roots.sh
 suspend.sh
 setup-wayland.sh
+setup-wayland-extras.sh
 start-wayland.sh
 ktop/ktop.c
 ktop/Makefile

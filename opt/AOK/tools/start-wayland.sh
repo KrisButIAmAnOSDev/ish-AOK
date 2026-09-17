@@ -55,15 +55,17 @@
 # makes wayvnc refuse when its neatvnc is older than 0.9.2, which crashes when
 # the desktop shrinks under a connected client (see the wayvnc launch below).
 #
-# First-run only, a labwc setup gets seeded under $HOME/.config/labwc/ and
+# A labwc setup gets seeded under $HOME/.config/labwc/ and
 # $HOME/.local/share/themes/ (see below): a right-click root menu (New
-# Terminal, an Applications submenu listing whatever's apt-installed,
-# Reconfigure, Exit), a handful of Alt-based keybindings for the same
-# actions (DisplayRFBView.m forwards Alt/Alt+Shift+<letter> and Alt+Return
+# Terminal, Launcher, an Applications submenu grouping whatever is installed
+# by category, Reconfigure, Exit), a handful of Alt-based keybindings for the
+# same actions (DisplayRFBView.m forwards Alt/Alt+Shift+<letter> and Alt+Return
 # as their own UIKeyCommands for this -- Control stays free for in-terminal
 # Ctrl combos), and a themerc styled after the app's own Workspace "Graphite"
 # palette (dark background, mint-accented active window/menu highlights)
-# instead of labwc's plain stock look.
+# instead of labwc's plain stock look. The menu and keybindings are written
+# when missing, or over an unedited default from an earlier version; a file
+# the user has changed is kept.
 # ---------------------------------------------------------------------------
 set -u
 
@@ -464,6 +466,17 @@ fi
 # Fixed by parsing Terminal=true and prefixing "foot " onto the command in
 # that case; confirmed on-device that `foot btop` spawns a real foot window
 # with btop correctly attached to its own pty.
+#
+# The Applications menu is grouped into submenus by each program's first
+# freedesktop main category (Games, Graphics, Internet, ...), sorted by name.
+# One flat list outgrew the screen: labwc menus do not scroll, and with the
+# extras installed only 29 of 96 entries fitted a 720-pixel desktop
+# (sgt-puzzles alone adds about 40). So a submenu holds at most 24 entries, and a
+# longer group is split into parts named by their first letters, "Games (A–L)".
+# Still one awk process for every .desktop file. Only the [Desktop Entry]
+# group is read (a [Desktop Action] group has its own Name= and Exec=), and
+# entries that are not applications, or that OnlyShowIn/NotShowIn keep off this
+# desktop, are left out.
 if [ "$COMPOSITOR_CMD" = "labwc" ]; then
     mkdir -p "$HOME/.config/labwc"
     # Regenerated on every session start (not gated on "doesn't already
@@ -480,25 +493,125 @@ if command -v waybar >/dev/null 2>&1; then
         "$panel_label" "$HOME"
 fi
 if [ -e "$1" ]; then
-    awk '
-        function emit() {
-            gsub(/%[a-zA-Z]/, "", execline)
+    awk -v max_items=24 '
+        function xml(s) {
+            gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s)
+            return s
+        }
+        # Exec= without its field codes (%f, %U, ...), and %% as %.
+        function strip_field_codes(s,    out, i, c) {
+            out = ""
+            while ((i = index(s, "%")) > 0) {
+                out = out substr(s, 1, i - 1)
+                c = substr(s, i + 1, 1)
+                if (c == "%") out = out "%"
+                s = substr(s, i + 2)
+            }
+            return out s
+        }
+        # Whether a ;-separated OnlyShowIn/NotShowIn list names this desktop.
+        function names_this_desktop(list,    n, i, names) {
+            n = split(list, names, ";")
+            for (i = 1; i <= n; i++)
+                if (names[i] != "" && (names[i] in this_desktop)) return 1
+            return 0
+        }
+        function section_for(categories,    n, i, names) {
+            n = split(categories, names, ";")
+            for (i = 1; i <= n; i++)
+                if (names[i] in section_of) return section_of[names[i]]
+            return "Other"
+        }
+        # A part of a split submenu is named by the first letters of its first
+        # and last entries, when both are plain letters or digits.
+        function initial(s,    c) {
+            c = substr(s, 1, 1)
+            return c ~ /^[A-Za-z0-9]$/ ? toupper(c) : ""
+        }
+        function finish(    s, n) {
+            if (type != "Application" || hidden || name == "" || execline == "") return
+            if (only_show_in != "" && !names_this_desktop(only_show_in)) return
+            if (not_show_in != "" && names_this_desktop(not_show_in)) return
+            execline = strip_field_codes(execline)
             if (terminal == "true") execline = "foot " execline
-            gsub(/&/, "\\&amp;", name); gsub(/</, "\\&lt;", name); gsub(/>/, "\\&gt;", name); gsub(/"/, "\\&quot;", name)
-            gsub(/&/, "\\&amp;", execline); gsub(/</, "\\&lt;", execline); gsub(/>/, "\\&gt;", execline); gsub(/"/, "\\&quot;", execline)
-            printf "<item label=\"%s\"><action name=\"Execute\" command=\"%s\"/></item>\n", name, execline
+            s = section_for(categories)
+            n = ++count[s]
+            label[s, n] = name
+            command[s, n] = execline
+        }
+        BEGIN {
+            section_of["AudioVideo"] = "Multimedia"; section_of["Audio"] = "Multimedia"
+            section_of["Video"] = "Multimedia"; section_of["Development"] = "Development"
+            section_of["Education"] = "Education"; section_of["Game"] = "Games"
+            section_of["Graphics"] = "Graphics"; section_of["Network"] = "Internet"
+            section_of["Office"] = "Office"; section_of["Science"] = "Science"
+            section_of["Settings"] = "Settings"; section_of["System"] = "System"
+            section_of["Utility"] = "Accessories"
+            sections = split("Accessories Development Education Games Graphics Internet Multimedia Office Science Settings System Other", section_order, " ")
+            desktops = ENVIRON["XDG_CURRENT_DESKTOP"]
+            if (desktops == "") desktops = "labwc:wlroots"
+            n = split(desktops, names, ":")
+            for (i = 1; i <= n; i++) this_desktop[names[i]] = 1
         }
         FNR == 1 {
-            if (!hidden && name != "" && execline != "") emit()
-            hidden = 0; name = ""; execline = ""; terminal = ""
+            if (NR > 1) finish()
+            group = ""; type = ""; hidden = 0; name = ""; execline = ""; terminal = ""
+            categories = ""; only_show_in = ""; not_show_in = ""
         }
+        { sub(/\r$/, "") }
+        /^\[/ { group = $0; next }
+        group != "[Desktop Entry]" { next }
+        /^Type=/ { type = substr($0, 6) }
         /^NoDisplay=true/ { hidden = 1 }
         /^Hidden=true/ { hidden = 1 }
         /^Name=/ && name == "" { name = substr($0, 6) }
         /^Exec=/ && execline == "" { execline = substr($0, 6) }
         /^Terminal=true/ { terminal = "true" }
+        /^Categories=/ { categories = substr($0, 12) }
+        /^OnlyShowIn=/ { only_show_in = substr($0, 12) }
+        /^NotShowIn=/ { not_show_in = substr($0, 11) }
         END {
-            if (!hidden && name != "" && execline != "") emit()
+            if (NR > 0) finish()
+            menus = 0
+            for (o = 1; o <= sections; o++) {
+                s = section_order[o]
+                n = count[s] + 0
+                if (n == 0) continue
+                # Insertion sort by name, ignoring case.
+                for (i = 2; i <= n; i++) {
+                    l = label[s, i]; c = command[s, i]; key = tolower(l)
+                    for (j = i - 1; j >= 1 && tolower(label[s, j]) > key; j--) {
+                        label[s, j + 1] = label[s, j]; command[s, j + 1] = command[s, j]
+                    }
+                    label[s, j + 1] = l; command[s, j + 1] = c
+                }
+                parts = int((n + max_items - 1) / max_items)
+                per_part = int((n + parts - 1) / parts)
+                # Parts are named by letters only when every part gets a
+                # different name that way; otherwise they are numbered.
+                numbered = 0
+                for (p = 1; p <= parts && parts > 1; p++) {
+                    first = (p - 1) * per_part + 1
+                    last = first + per_part - 1
+                    if (last > n) last = n
+                    a = initial(label[s, first]); b = initial(label[s, last])
+                    part_name[p] = a == b ? a : a "–" b
+                    if (a == "" || b == "") numbered = 1
+                    for (q = 1; q < p; q++)
+                        if (part_name[q] == part_name[p]) numbered = 1
+                }
+                for (p = 1; p <= parts; p++) {
+                    first = (p - 1) * per_part + 1
+                    last = first + per_part - 1
+                    if (last > n) last = n
+                    title = s
+                    if (parts > 1) title = s " (" (numbered ? p " of " parts : part_name[p]) ")"
+                    printf "<menu id=\"apps-%d\" label=\"%s\">\n", ++menus, xml(title)
+                    for (i = first; i <= last; i++)
+                        printf "<item label=\"%s\"><action name=\"Execute\" command=\"%s\"/></item>\n", xml(label[s, i]), xml(command[s, i])
+                    print "</menu>"
+                }
+            }
         }
     ' "$@"
 fi
@@ -531,14 +644,66 @@ case "${1:-toggle}" in
 esac
 PANEL_EOF
     chmod +x "$HOME/.config/labwc/panel.sh"
+
+    # The launcher behind the root menu's Launcher item and Alt+Shift+D: fuzzel,
+    # which setup-wayland-extras.sh installs with its tools, or else wofi, which
+    # setup-wayland.sh installs. Both search the installed applications and start
+    # the one picked, in foot when it is a terminal program.
+    cat > "$HOME/.config/labwc/launcher.sh" <<'LAUNCHER_EOF'
+#!/bin/sh
+if command -v fuzzel >/dev/null 2>&1; then
+    exec fuzzel --terminal=foot
+elif command -v wofi >/dev/null 2>&1; then
+    exec wofi --show drun --term=foot
 fi
-if [ "$COMPOSITOR_CMD" = "labwc" ] && [ ! -f "$HOME/.config/labwc/menu.xml" ]; then
-    cat > "$HOME/.config/labwc/menu.xml" <<MENU_EOF
+LAUNCHER_EOF
+    chmod +x "$HOME/.config/labwc/launcher.sh"
+fi
+
+# menu.xml and rc.xml below are defaults: written when missing, and never over a
+# file the user has edited. A default that an earlier version of this script
+# wrote and nobody has touched since is replaced by the current one, though, so
+# additions such as the Launcher reach desktops set up before them. Those old
+# defaults are recognised by cksum, computed with the home directory written as
+# ~ because menu.xml names files in it; "crc:size" values in $2. The new content
+# is read from stdin.
+config_cksum() {
+    awk -v home="$HOME" '
+        home != "" { while ((i = index($0, home)) > 0) $0 = substr($0, 1, i - 1) "~" substr($0, i + length(home)) }
+        { print }' "$1" | cksum | awk '{ print $1 ":" $2 }'
+}
+install_default_config() {
+    config_target="$1"
+    config_new="$config_target.new.$$"
+    cat > "$config_new" || { rm -f "$config_new"; return 1; }
+    if [ -e "$config_target" ]; then
+        config_current="$(config_cksum "$config_target")"
+        config_replace=0
+        if [ -n "$config_current" ] && [ "$config_current" != "$(config_cksum "$config_new")" ]; then
+            for config_old in $2; do
+                [ "$config_old" = "$config_current" ] && config_replace=1
+            done
+        fi
+        if [ "$config_replace" = 0 ]; then
+            rm -f "$config_new"
+            return 0
+        fi
+        log "replacing $config_target, an unedited default from an earlier version of this script, with the current one"
+    fi
+    mv -f "$config_new" "$config_target"
+}
+
+if [ "$COMPOSITOR_CMD" = "labwc" ]; then
+    # The one earlier default menu.xml (6b57294a to 583ce462).
+    install_default_config "$HOME/.config/labwc/menu.xml" "2481222110:490" <<MENU_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
   <menu id="root-menu" label="Root">
     <item label="New Terminal">
       <action name="Execute"><command>foot</command></action>
+    </item>
+    <item label="Launcher">
+      <action name="Execute"><command>$HOME/.config/labwc/launcher.sh</command></action>
     </item>
     <separator/>
     <menu id="apps-pipemenu" label="Applications" execute="$HOME/.config/labwc/list-apps.sh"/>
@@ -594,9 +759,13 @@ fi
 # keybindings already gave that setup). Alt+Return/Tab/Shift+Q/Shift+R/
 # Shift+E mirror the same actions the right-click menu already offers,
 # using the same Alt-based scheme DisplayRFBView.m forwards (Control stays
-# free for in-terminal Ctrl combos).
-if [ "$COMPOSITOR_CMD" = "labwc" ] && [ ! -f "$HOME/.config/labwc/rc.xml" ]; then
-    cat > "$HOME/.config/labwc/rc.xml" <<'RC_XML_EOF'
+# free for in-terminal Ctrl combos). Alt+Shift+D opens the launcher, sway's
+# $mod+d with Shift added: plain Alt+D would take kill-word from readline in
+# every terminal. labwc expands ~ in an Execute command.
+if [ "$COMPOSITOR_CMD" = "labwc" ]; then
+    # The earlier defaults: 2c7e6aa7 to 02cfc17f, 6fc49f06 (it maximized every
+    # window), and c862512d to 583ce462.
+    install_default_config "$HOME/.config/labwc/rc.xml" "1331651033:528 1672038269:1609 240916693:1110" <<'RC_XML_EOF'
 <?xml version="1.0"?>
 <labwc_config>
   <theme>
@@ -625,6 +794,9 @@ if [ "$COMPOSITOR_CMD" = "labwc" ] && [ ! -f "$HOME/.config/labwc/rc.xml" ]; the
     </keybind>
     <keybind key="A-S-e">
       <action name="Exit"/>
+    </keybind>
+    <keybind key="A-S-d">
+      <action name="Execute"><command>~/.config/labwc/launcher.sh</command></action>
     </keybind>
   </keyboard>
 </labwc_config>

@@ -107,6 +107,35 @@ notice suspend. On a root set up before this, install it with
 `sudo apt install waybar fonts-font-awesome` (Devuan) or
 `sudo apk add waybar font-awesome` (Alpine).
 
+Right-click the desktop for its menu. **New Terminal** opens foot, **Launcher**
+searches the installed programs, and **Applications** has a submenu for each
+category: Games, Graphics, Internet and so on. labwc menus do not scroll, so a
+category with more than 24 programs is split into parts named by their first
+letters, such as **Games (A–N)**. The same actions have keys: Alt+Return opens a
+terminal, Alt+Shift+D the launcher, Alt+Tab switches windows, Alt+Shift+Q closes
+one, Alt+Shift+R reloads labwc's settings and Alt+Shift+E ends the session.
+
+The menu and the keys live in `~/.config/labwc/menu.xml` and `rc.xml`, which are
+yours to edit: a file you have changed is never replaced. One still exactly as an
+earlier AOK wrote it is brought up to date, which is how an existing desktop gets
+the Launcher.
+
+More programs that run well on this desktop come in three optional sets:
+
+```sh
+sudo sh /AOK/tools/setup-wayland-extras.sh games   # puzzles, solitaire, Mines, Chess, terminal games
+sudo sh /AOK/tools/setup-wayland-extras.sh tools   # launcher, notifications, clipboard, screenshots, viewers, editor, files, browser
+sudo sh /AOK/tools/setup-wayland-extras.sh x11     # Xwayland, xterm and the X fonts, for X11-only programs
+```
+
+Name several sets at once, or `all`. The Launcher is fuzzel once **tools** is
+installed, and wofi before. Program names differ between distributions and a
+few programs are missing from Alpine and Arch; the script installs what each has
+and lists what it could not. X11 programs run from the menu and from the first
+terminal alike, since the session sets `DISPLAY`; Xwayland starts with the first
+one, which takes a few seconds. SDL games are told to use Wayland, and
+`/usr/games`, where Devuan puts games, is on `PATH`.
+
 Two caveats worth knowing before you start. It has been run on **amd64** and
 **arm64** guests — the packages exist for the other architectures in Devuan and
 may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)

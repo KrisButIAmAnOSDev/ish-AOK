@@ -245,3 +245,5 @@ fi
 log "done"
 note "labwc, sway, wofi, foot, and wayvnc are installed."
 note "The Display applet will launch the stack automatically from here on."
+note "Games, desktop tools and X11 support are optional extras:"
+note "  sudo sh /AOK/tools/setup-wayland-extras.sh games tools x11"
