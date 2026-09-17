@@ -666,10 +666,8 @@ static void test_rcvtimeo(void) {
         expect_timed_out(fd, (enum method) m, "timed");
 
     /* A signal inside the timed wait ends it with EINTR -- even with
-     * SA_RESTART, because Linux never restarts a timed socket wait. read() is
-     * not asked this: AOK's read dispatcher restarts every EINTR an
-     * SA_RESTART handler caused, on every socket. */
-    for (int m = M_RECV; m <= M_RECVMSG; m++) {
+     * SA_RESTART, because Linux never restarts a timed socket wait. */
+    for (int m = M_RECV; m <= M_READ; m++) {
         char buf[4096];
         restart_hits = 0;
         long start = now_ms();

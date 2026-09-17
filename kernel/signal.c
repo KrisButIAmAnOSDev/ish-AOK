@@ -1683,6 +1683,12 @@ bool signal_should_restart_syscall(void) {
     return restart;
 }
 
+int_t signal_eintr_no_restart(int_t res) {
+    if (res == _EINTR && current != NULL)
+        (void) restart_flags_take(false);
+    return res;
+}
+
 // Whether a signal would go nowhere if sent to us right now. The terminal
 // job-control checks need to know this WITHOUT sending anything: Linux treats
 // an ignored or blocked SIGTTOU as permission to proceed, and only turns an

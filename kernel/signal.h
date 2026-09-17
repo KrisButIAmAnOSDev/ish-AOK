@@ -233,9 +233,10 @@ bool signal_should_restart_syscall_nohand(void);
 // Do NOT call it from anything in signal(7)'s never-restarted list: poll,
 // select, epoll_wait, nanosleep, the sigwait family, System V IPC (msgrcv,
 // msgsnd, semop -- these use ERESTARTNOHAND, which a running handler cancels),
-// io_getevents, or a socket call with SO_RCVTIMEO/SO_SNDTIMEO set. Those must
-// keep returning _EINTR; restarting them hangs a guest that relies on the
-// interruption to make progress.
+// io_getevents, or a socket call with SO_RCVTIMEO/SO_SNDTIMEO set (that one is
+// signal_eintr_no_restart, below). Those must keep returning _EINTR;
+// restarting them hangs a guest that relies on the interruption to make
+// progress.
 static inline int_t signal_restart_or_eintr(int_t res) {
     if (res == _EINTR && signal_should_restart_syscall())
         return _ERESTART;
@@ -250,6 +251,22 @@ static inline int_t signal_restart_or_eintr_nohand(int_t res) {
         return _ERESTART_NOHAND;
     return res;
 }
+
+// The never-restarted form, for a socket wait with SO_RCVTIMEO/SO_SNDTIMEO
+// armed: Linux ends it with sock_intr_errno(timeo), which is -EINTR however the
+// interruption came -- an SA_RESTART handler, or a stop and a SIGCONT with no
+// handler at all.
+//
+// It still consumes the interruption's recorded restart answer, as the two
+// forms above do. A signal that interrupts a wait parked on a cond_t records
+// whether that wait may be restarted (signal_note_interrupted), and the next
+// restart decision reads the record first -- so a timed wait that answered
+// EINTR without reading it left the answer for the NEXT interrupted syscall.
+// Measured: after a timed netlink recv was interrupted by an SA_RESTART
+// handler, a pipe read interrupted by a handler WITHOUT SA_RESTART restarted,
+// and returned data that arrived later instead of EINTR.
+int_t signal_eintr_no_restart(int_t res);
+
 // send a signal to current if it's not blocked or ignored, return whether that worked
 // exists specifically for sending SIGTTIN/SIGTTOU
 bool signal_is_ignored_or_blocked(int sig);

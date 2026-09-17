@@ -959,10 +959,32 @@ dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     return sys_mknodat_common(at_f, path_addr, mode, dev);
 }
 
-static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
+// SA_RESTART for the read/write family: an _EINTR from the fd op becomes a
+// restart when the handler that caused it asked for one.
+//
+// Unless the op decided that already (fd_ops.decides_restart), because the
+// decision is not always the handler's to make. signal(7) never restarts a
+// socket wait with SO_RCVTIMEO/SO_SNDTIMEO armed, whatever SA_RESTART says, and
+// only fs/sock.c knows whether the wait that was interrupted had one. It
+// answers _ERESTART or _EINTR itself; converting its _EINTR here too restarted
+// exactly the calls Linux never does. A read with a 600ms SO_RCVTIMEO and an
+// SA_RESTART signal at 150ms came back EAGAIN after ~756ms, having waited the
+// timeout out a second time, where Linux gives EINTR after 150ms. recv,
+// recvfrom and recvmsg never had this: nothing converts their result again.
+//
+// A checkpoint freeze's _EINTR goes through either way unconverted -- no
+// handler asks for a restart -- and syscall_result_should_restart makes it one.
+static int_t io_restart_or_eintr(int_t res, bool fd_decides_restart) {
+    return fd_decides_restart ? res : signal_restart_or_eintr(res);
+}
+
+// *decides_restart reports the fd's fd_ops.decides_restart, for the dispatcher,
+// which never sees the struct fd.
+static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size, bool *decides_restart) {
     struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
+    *decides_restart = fd->ops->decides_restart;
     if (S_ISDIR(fd->type))
         return _EISDIR;
 
@@ -1027,12 +1049,12 @@ static dword_t sys_read_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size) 
     }
     
     int_t res = 0;
+    bool decides_restart = false;
     
     TASK_MAY_BLOCK {
-        res = (int_t)sys_read_buf(fd_no, buf, size);
+        res = (int_t)sys_read_buf(fd_no, buf, size, &decides_restart);
     }
-    if (res == _EINTR && signal_should_restart_syscall())
-        res = _ERESTART;
+    res = io_restart_or_eintr(res, decides_restart);
     amd64_tty_stdio_trace("read", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : 0);
     if (res >= 0) {
         if (user_write(buf_addr, buf, res))
@@ -1139,10 +1161,13 @@ static int fsize_limit_check(struct fd *fd, size_t *size) {
     return 0;
 }
 
-static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
+// See sys_read_buf for *decides_restart, which may be NULL here.
+static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size, bool *decides_restart) {
     struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
+    if (decides_restart != NULL)
+        *decides_restart = fd->ops->decides_restart;
 
     int limit_err = fsize_limit_check(fd, &size);
     if (limit_err < 0)
@@ -1207,10 +1232,11 @@ static dword_t sys_write_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size)
 
     STRACE("write(%d, %#llx, %d)", fd_no, (unsigned long long) buf_addr, size);
 
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, buf, size);
+        res = sys_write_buf(fd_no, buf, size, &decides_restart);
     }
-    res = (dword_t) signal_restart_or_eintr((int_t) res);
+    res = (dword_t) io_restart_or_eintr((int_t) res, decides_restart);
     amd64_tty_stdio_trace("write", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : size);
 out:
     if (buf != stack_buf) free(buf);
@@ -1224,7 +1250,7 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
 ssize_t fd_write_host_buf(fd_t fd_no, const void *buf, size_t size) {
     ssize_t res;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, (void *) buf, size);
+        res = sys_write_buf(fd_no, (void *) buf, size, NULL);
     }
     return res;
 }
@@ -1266,10 +1292,11 @@ static dword_t sys_readv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iov
         }
     }
     ssize_t res = 0;
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_read_buf(fd_no, buf, io_size);
+        res = sys_read_buf(fd_no, buf, io_size, &decides_restart);
     }
-    res = signal_restart_or_eintr((int_t) res);
+    res = io_restart_or_eintr((int_t) res, decides_restart);
     if (res < 0)
         goto error;
 
@@ -1348,10 +1375,11 @@ static dword_t sys_writev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
         STRACE(" {base=%#llx, len=%zu}", (unsigned long long) iovec[i].base, iovec[i].len);
         offset += copy_len;
     }
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, buf, offset);
+        res = sys_write_buf(fd_no, buf, offset, &decides_restart);
     }
-    res = signal_restart_or_eintr((int_t) res);
+    res = io_restart_or_eintr((int_t) res, decides_restart);
     amd64_tty_stdio_trace("writev", fd_no, iovec_addr, (dword_t) offset, res, buf,
             res > 0 ? (size_t) res : offset);
 error:

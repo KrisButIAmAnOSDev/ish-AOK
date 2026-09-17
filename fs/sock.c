@@ -2196,6 +2196,23 @@ static void socket_io_wait_resolve(struct socket_io_wait *wait, struct fd *sock,
     wait->has_deadline = true;
 }
 
+// Linux's sock_intr_errno(timeo): what a guest socket call answers when a
+// signal cuts it short. SA_RESTART may restart it only while no SO_RCVTIMEO/
+// SO_SNDTIMEO is armed -- signal(7) puts a timed socket wait in the
+// never-restarted list, because a restart would silently extend a timeout the
+// guest asked for.
+//
+// This is the whole decision, not a first opinion. socket_fdops sets
+// decides_restart, so the read/write dispatchers take a socket's _EINTR as
+// final (kernel/fs.c); every _EINTR sock_read and sock_write return has to have
+// been decided by now, here or by an equivalent that knows the timeout (the
+// netlink receive's).
+static int socket_intr_errno(struct fd *sock, short events, struct socket_io_wait *wait) {
+    if (!wait->resolved)
+        socket_io_wait_resolve(wait, sock, events);
+    return wait->has_deadline ? signal_eintr_no_restart(_EINTR) : signal_restart_or_eintr(_EINTR);
+}
+
 // The one place a guest socket call sleeps. `wait` carries the SO_RCVTIMEO/
 // SO_SNDTIMEO budget for the whole syscall; pass NULL from iSH's own internal
 // handshakes, which must not inherit a guest's timeout.
@@ -2315,14 +2332,10 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         // purely spurious poke (a TLB-shootdown SIGUSR1, or a notify for a
         // signal this task has blocked) just re-enters the wait.
         if (socket_guest_signal_pending()) {
-            // SA_RESTART: the blocking socket calls are restartable, EXCEPT
-            // when SO_RCVTIMEO/SO_SNDTIMEO is armed -- signal(7) puts a
-            // timed socket wait in the never-restarted list, because a
-            // restart would silently extend a timeout the guest asked for.
             // A NULL `wait` is one of iSH's own internal handshakes, which
-            // has no guest syscall to restart.
-            err = (wait != NULL && !wait->has_deadline)
-                    ? signal_restart_or_eintr(_EINTR) : _EINTR;
+            // has no timeout of the guest's and leaves the decision to the
+            // call it runs inside.
+            err = wait != NULL ? socket_intr_errno(sock, events, wait) : _EINTR;
             break;
         }
     }
@@ -3788,8 +3801,9 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
 out:
     unlock(&sock->socket.netlink_reply_lock);
     // Outside the lock: signal_should_restart_syscall takes sighand->lock.
-    if (ret == _EINTR && !timed)
-        ret = signal_restart_or_eintr(ret);
+    // socket_intr_errno's decision, for the timeout this wait kept itself.
+    if (ret == _EINTR)
+        ret = timed ? signal_eintr_no_restart(ret) : signal_restart_or_eintr(ret);
     if (getenv("ISH_NETLINK_DIAG") != NULL)
         printk("NLDIAG: recvmsg pid=%d flags=%#x cap=%zu avail=%zu ret=%d trunc=%d\n",
                current->pid, fake_flags, capacity, available, ret,
@@ -5360,8 +5374,9 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
         // SA_RESTART: accept() is restartable, but not with SO_RCVTIMEO armed
         // (signal(7)) -- restarting would silently extend the guest's timeout.
         int mapped = errno_map();
-        if (mapped == _EINTR && !has_deadline)
-            mapped = signal_restart_or_eintr(mapped);
+        if (mapped == _EINTR)
+            mapped = has_deadline ? signal_eintr_no_restart(mapped)
+                                  : signal_restart_or_eintr(mapped);
         return mapped;
     }
 
@@ -9169,9 +9184,11 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
     if (fd->real_fd < 0)
         return _EOPNOTSUPP;
     if (fd->socket.domain == AF_LOCAL_) {
+        // The peer handshake waits with none of the guest's timeout, so an
+        // interruption there is an untimed wait's: restartable.
         int err = unix_socket_finish_peer(fd);
         if (err < 0)
-            return err;
+            return signal_restart_or_eintr(err);
     }
     // AF_LOCAL datagrams arrive with an in-band cred header (see struct
     // unix_dgram_cred_hdr): land it in a scratch struct via a 2-iov recvmsg
@@ -9195,8 +9212,17 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
                 res = read(fd->real_fd, buf, size);
             if (res >= 0)
                 break;
+            // Before the retry check, whose pending-signal test takes a lock
+            // and can clobber errno.
+            bool host_eintr = errno == EINTR;
             if (socket_should_retry_io_eintr(fd, 0))
                 continue;
+            if (host_eintr) {
+                // A guest signal cut the host call itself short.
+                res = socket_intr_errno(fd, POLLIN, &wait);
+                errno = 0;
+                goto out_read;
+            }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
                 int wait_err = socket_wait_ready(fd, POLLIN, &wait);
@@ -9326,8 +9352,15 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
                 }
                 continue;
             }
+            bool host_eintr = errno == EINTR; // see sock_read
             if (socket_should_retry_io_eintr(fd, 0))
                 continue;
+            if (host_eintr) {
+                // A guest signal cut the host call itself short.
+                res = sent > 0 ? (ssize_t) sent : socket_intr_errno(fd, POLLOUT, &wait);
+                errno = 0;
+                goto out_write;
+            }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
                 int wait_err = socket_wait_ready(fd, POLLOUT, &wait);
@@ -9542,6 +9575,8 @@ const struct fd_ops socket_fdops = {
     .name = "socket",
     .read = sock_read,
     .write = sock_write,
+    // See socket_intr_errno.
+    .decides_restart = true,
     .close = sock_close,
     .poll = sock_poll,
     .getflags = sock_getflags,

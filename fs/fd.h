@@ -490,6 +490,17 @@ struct fd_ops {
     // identify one; guessing from stat.mode conflates families that share a
     // mode. A name is the smallest thing that makes the question answerable.
     const char *name;
+
+    // ->read and ->write make their own SA_RESTART decision: _ERESTART for an
+    // interruption a handler may restart, _EINTR only for one it may not. The
+    // read/write dispatchers (kernel/fs.c) then leave an _EINTR alone instead
+    // of deciding again, which is all that makes a never-restarted wait
+    // expressible through them.
+    //
+    // Set by sockets, where the answer depends on the wait: signal(7) never
+    // restarts one with SO_RCVTIMEO/SO_SNDTIMEO armed, and only the op knows
+    // whether the wait that was interrupted had a timeout.
+    bool decides_restart;
 };
 
 struct fdtable {
