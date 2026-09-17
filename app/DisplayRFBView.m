@@ -494,6 +494,14 @@ static uint32_t DisplayRFBKeysymForKeyCommandInput(NSString *input) {
     static const uint32_t keysymAltL = 0xFFE9;
     static const uint32_t keysymShiftL = 0xFFE1;
     uint32_t keysym = DisplayRFBKeysymForKeyCommandInput(input);
+    // A letter goes as its uppercase keysym, the symbol the key makes with Shift
+    // held. wayvnc presses the key at the level that makes the keysym it is sent;
+    // for a lowercase letter that is the unshifted level, so it sent the key with
+    // Shift and Alt lifted. labwc never saw Alt+Shift, none of its Alt+Shift
+    // bindings (close, reconfigure, exit, the launcher) fired, and the letter was
+    // typed into the focused window instead.
+    if (keysym >= 'a' && keysym <= 'z')
+        keysym -= 'a' - 'A';
     [_rfbClient sendKeyEvent:keysymAltL down:YES];
     [_rfbClient sendKeyEvent:keysymShiftL down:YES];
     [_rfbClient sendKeyEvent:keysym down:YES];
