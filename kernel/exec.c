@@ -63,6 +63,7 @@ static inline int user_memset(guest_addr_t start, byte_t val, dword_t len);
 static inline guest_addr_t copy_string(guest_addr_t sp, const char *string);
 static inline guest_addr_t args_copy(guest_addr_t sp, struct exec_args args);
 static size_t args_size(struct exec_args args);
+static inline size_t args_strings_size(struct exec_args args);
 static ssize_t user_read_exec_ptr(guest_addr_t addr, qword_t *ptr_out);
 static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_addr, ssize_t *argc_out,
         char **argv_out, char **envp_out);
@@ -987,16 +988,25 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
     guest_addr_t file_addr = sp = copy_string(sp, file);
     if (sp == 0)
         goto beyond_hope;
+    // The strings back to back, as Linux's copy_strings() leaves them: the
+    // environment's below the file name, the arguments' directly below those,
+    // and no list terminator after either. So arg_end == env_start, and each
+    // range ends at its last string's NUL -- exactly the bytes
+    // /proc/<pid>/cmdline and environ return, and fs/proc/pid.c's setproctitle
+    // rule reads on from one range into the other only because they touch.
+    // The blocks' own terminators used to be copied and counted, so both files
+    // ended in an extra NUL (`xargs -0` saw a trailing empty argument, and an
+    // empty environment read back as one NUL instead of nothing).
     guest_addr_t envp_addr = sp = args_copy(sp, envp);
     if (sp == 0)
         goto beyond_hope;
     save->mm->env_start = sp;
-    save->mm->env_end = sp + args_size(envp);
+    save->mm->env_end = sp + args_strings_size(envp);
     guest_addr_t argv_addr = sp = args_copy(sp, argv);
     if (sp == 0)
         goto beyond_hope;
     save->mm->argv_start = sp;
-    save->mm->argv_end = sp + args_size(argv);
+    save->mm->argv_end = sp + args_strings_size(argv);
     sp = align_stack(sp);
 
     guest_addr_t platform_addr = sp = copy_string(sp, task_abi_desc(save).elf_platform);
@@ -1279,10 +1289,18 @@ static inline guest_addr_t copy_string(guest_addr_t sp, const char *string) {
     return sp;
 }
 
+// The block's strings, each with its NUL, without the list terminator after
+// the last one: args_size() less that one byte.
+static inline size_t args_strings_size(struct exec_args args) {
+    return args_size(args) - 1;
+}
+
+// Copies the strings only (see args_strings_size); the stack layout in
+// elf_exec depends on nothing separating one block from the next.
 static inline guest_addr_t args_copy(guest_addr_t sp, struct exec_args args) {
-    size_t size = args_size(args);
+    size_t size = args_strings_size(args);
     sp -= size;
-    if (user_write(sp, args.args, size))
+    if (size != 0 && user_write(sp, args.args, size))
         return 0;
     return sp;
 }
@@ -1836,6 +1854,17 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     // thread that is not the leader takes the leader's pid in exec_de_thread,
     // and the tracer needs the old one to tell which of its tasks is gone.
     pid_t_ old_pid = current->pid;
+
+    // An empty argv runs the program with one empty argument, as Linux has
+    // since 5.18 (fs/exec.c: "When argv is empty, add an empty string ("") as
+    // argv[0] to ensure confused userspace programs that start processing
+    // from argv[1] won't end up walking envp"). Measured on 6.12: argc is 1
+    // and /proc/<pid>/cmdline is a single NUL. It also keeps every loader
+    // below from meeting argv.count == 0 -- the #! path's argv.count - 1
+    // would wrap.
+    static const char empty_argv[] = {'\0', '\0'};   // "", then the terminator
+    if (argv.count == 0)
+        argv = (struct exec_args) {.count = 1, .args = empty_argv};
 
     // open_exec decides what the file IS and whether this caller may execute
     // it before opening it, which is Linux's do_open_execat order. This used

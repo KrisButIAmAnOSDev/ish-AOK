@@ -33,6 +33,11 @@
 #define PRCTL_SET_MM_ARG_END_ 9
 #define PRCTL_SET_MM_ENV_START_ 10
 #define PRCTL_SET_MM_ENV_END_ 11
+#define PRCTL_SET_MM_AUXV_ 12
+#define PRCTL_SET_MM_MAP_ 14
+#define PRCTL_SET_MM_MAP_SIZE_ 15
+// vm.mmap_min_addr, as fs/proc/sys.c reports it and emu/memory.c enforces it.
+#define PRCTL_MMAP_MIN_ADDR_ 65536
 
 #define PRCTL_CAP_LAST_CAP_ 63
 #define PRCTL_DEFAULT_TIMERSLACK_NS_ 50000
@@ -58,7 +63,7 @@ static bool prctl_cap_test(const dword_t caps[2], uint_t cap) {
     return (caps[cap / 32] & (1u << (cap % 32))) != 0;
 }
 
-int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED(arg4), qword_t UNUSED(arg5)) {
+int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t arg4, qword_t arg5) {
     switch (option) {
         case PRCTL_SET_PDEATHSIG_:
             current->pdeath_signal = (dword_t) arg2;
@@ -157,33 +162,59 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
             return 0;
         case PRCTL_GET_TIMERSLACK_:
             return PRCTL_DEFAULT_TIMERSLACK_NS_;
-        case PRCTL_SET_MM_:
-            if (!superuser())
+        case PRCTL_SET_MM_: {
+            // kernel/sys.c's prctl_set_mm(), for the four fields AOK keeps
+            // (the ranges /proc/<pid>/cmdline and environ read). Its argument
+            // check comes BEFORE the capability check, so a stray arg4 or arg5
+            // is EINVAL even unprivileged -- measured on 6.12.
+            if (arg5 != 0 || (arg4 != 0 && arg2 != PRCTL_SET_MM_AUXV_ &&
+                              arg2 != PRCTL_SET_MM_MAP_ && arg2 != PRCTL_SET_MM_MAP_SIZE_))
+                return _EINVAL;
+            if (!current_capable(CAP_SYS_RESOURCE_))
                 return _EPERM;
+            qword_t addr_max = guest_abi_user_addr_max(current->abi);
+            if (arg3 >= addr_max || arg3 < PRCTL_MMAP_MIN_ADDR_)
+                return _EINVAL;
             lock(&current->general_lock, 0);
             if (current->mm == NULL) {
                 unlock(&current->general_lock);
                 return _EINVAL;
             }
+            guest_addr_t range[4] = {
+                current->mm->argv_start, current->mm->argv_end,
+                current->mm->env_start, current->mm->env_end,
+            };
             switch (arg2) {
-                case PRCTL_SET_MM_ARG_START_:
-                    current->mm->argv_start = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ARG_END_:
-                    current->mm->argv_end = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ENV_START_:
-                    current->mm->env_start = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ENV_END_:
-                    current->mm->env_end = (guest_addr_t) arg3;
-                    break;
+                case PRCTL_SET_MM_ARG_START_: range[0] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ARG_END_: range[1] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ENV_START_: range[2] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ENV_END_: range[3] = (guest_addr_t) arg3; break;
                 default:
                     unlock(&current->general_lock);
                     return _EINVAL;
             }
+            // validate_prctl_map_addr(): every field inside the address space,
+            // and each start at or below its end with the new value in place --
+            // which is why a caller moving a range upward has to set the end
+            // first (systemd's rename_process() does exactly that dance). A
+            // range was accepted inverted, and the /proc readers then saw an
+            // arg_end below arg_start. Not modelled: the EFAULT for an address
+            // with no mapping at or above it.
+            bool valid = range[0] <= range[1] && range[2] <= range[3];
+            for (int i = 0; i < 4; i++)
+                if (range[i] >= addr_max || range[i] < PRCTL_MMAP_MIN_ADDR_)
+                    valid = false;
+            if (!valid) {
+                unlock(&current->general_lock);
+                return _EINVAL;
+            }
+            current->mm->argv_start = range[0];
+            current->mm->argv_end = range[1];
+            current->mm->env_start = range[2];
+            current->mm->env_end = range[3];
             unlock(&current->general_lock);
             return 0;
+        }
         case PRCTL_SET_CHILD_SUBREAPER_:
             if (arg2 > 1)
                 return _EINVAL;

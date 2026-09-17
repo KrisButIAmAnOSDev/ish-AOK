@@ -86,54 +86,84 @@ static int proc_pid_copy_user_range(struct task *task, struct mem *mem, addr_t s
     return 0;
 }
 
-static int proc_pid_copy_cmdline_range(struct task *task, struct mem *mem, addr_t start,
-                                       size_t size, addr_t env_start, addr_t env_end,
-                                       struct proc_data *buf) {
-    if (mem == NULL || size == 0)
-        return 0;
-
-    char *data = malloc(size);
-    if (data == NULL)
-        return _ENOMEM;
-    if (user_read_task_mem(task, mem, start, data, size) == 0) {
-        char *first_nul = memchr(data, '\0', size);
-        if (first_nul != NULL && first_nul > data) {
-            size_t title_len = first_nul - data;
-            bool has_tail = false;
-            for (char *p = first_nul + 1; p < data + size; p++) {
-                if (*p != '\0') {
-                    has_tail = true;
-                    break;
-                }
-            }
-            if (has_tail && memchr(data, ':', title_len) != NULL) {
-                proc_buf_append(buf, data, title_len);
-                proc_buf_append(buf, "\0", 1);
-                free(data);
-                return 0;
-            }
-        }
-
-        size_t visible = size;
-        if (data[size - 1] != '\0' && env_end > env_start) {
-            visible = strnlen(data, size);
-            if (visible == size) {
-                size_t env_size = env_end - env_start;
-                char *expanded = realloc(data, size + env_size);
-                if (expanded == NULL) {
-                    free(data);
-                    return _ENOMEM;
-                }
-                data = expanded;
-                if (user_read_task_mem(task, mem, env_start, data + size, env_size) == 0)
-                    visible = strnlen(data, size + env_size);
-                else
-                    visible = size;
-            }
-        }
-        proc_buf_append(buf, data, visible);
+// Read [start, end) into `page` a page segment at a time, stopping at the first
+// segment that cannot be read -- access_remote_vm()'s rule, so a range running
+// into unmapped memory yields its readable prefix rather than nothing. With a
+// NULL `buf` the bytes go no further than `page` (at most `limit` of them);
+// otherwise every segment is appended to `buf`. Returns the bytes read.
+static size_t proc_pid_read_prefix(struct task *task, struct mem *mem, guest_addr_t start,
+                                   guest_addr_t end, char *page, size_t limit,
+                                   struct proc_data *buf) {
+    size_t done = 0;
+    guest_addr_t at = start;
+    while (at < end && (buf != NULL || done < limit)) {
+        size_t chunk = PAGE_SIZE - (size_t) (at & (PAGE_SIZE - 1));
+        if (chunk > end - at)
+            chunk = (size_t) (end - at);
+        if (buf == NULL && chunk > limit - done)
+            chunk = limit - done;
+        char *dest = buf != NULL ? page : page + done;
+        if (user_read_task_mem(task, mem, at, dest, chunk) != 0)
+            break;
+        if (buf != NULL)
+            proc_buf_append(buf, page, chunk);
+        done += chunk;
+        at += chunk;
     }
-    free(data);
+    return done;
+}
+
+// /proc/<pid>/cmdline, by fs/proc/base.c's get_mm_cmdline():
+//
+//   - Nothing before exec has laid out an environment (env_end == 0), and
+//     nothing for an empty or inverted argument range.
+//   - [arg_start, arg_end) exactly -- each argument and its one NUL.
+//   - Unless the byte at arg_end - 1 is not a NUL: a setproctitle() wrote over
+//     the terminator, and the answer is the first string at arg_start with its
+//     NUL, one page at most, and never past env_end. That string may run on
+//     into the environment, but only when the environment starts where the
+//     arguments end; otherwise arg_end is the limit.
+//
+// All three are measured on Linux 6.12 by tests/manual/proc_cmdline_environ.c,
+// which also covers what this replaced: a title containing ':' was cut at its
+// first NUL, a rule Linux does not have, and the addresses were held in the
+// 32-bit addr_t, so a PR_SET_MM range above 4 GiB (systemd's rename_process
+// maps one) read as ENOMEM.
+static int proc_pid_copy_cmdline(struct task *task, struct mem *mem, guest_addr_t arg_start,
+                                 guest_addr_t arg_end, guest_addr_t env_start,
+                                 guest_addr_t env_end, struct proc_data *buf) {
+    if (mem == NULL || env_end == 0 || arg_start >= arg_end)
+        return 0;
+    if (env_start != arg_end || env_end < env_start)
+        env_start = env_end = arg_end;
+
+    char *page = malloc(PAGE_SIZE);
+    if (page == NULL)
+        return _ENOMEM;
+    char last;
+    if (user_read_task_mem(task, mem, arg_end - 1, &last, 1) == 0 && last != '\0') {
+        size_t got = proc_pid_read_prefix(task, mem, arg_start, env_end, page, PAGE_SIZE, NULL);
+        size_t len = strnlen(page, got);
+        if (len < got)
+            len++; // the NUL that ended it
+        proc_buf_append(buf, page, len);
+    } else {
+        proc_pid_read_prefix(task, mem, arg_start, arg_end, page, 0, buf);
+    }
+    free(page);
+    return 0;
+}
+
+// /proc/<pid>/environ: [env_start, env_end), by environ_read()'s rules.
+static int proc_pid_copy_environ(struct task *task, struct mem *mem, guest_addr_t env_start,
+                                 guest_addr_t env_end, struct proc_data *buf) {
+    if (mem == NULL || env_end == 0 || env_start >= env_end)
+        return 0;
+    char *page = malloc(PAGE_SIZE);
+    if (page == NULL)
+        return _ENOMEM;
+    proc_pid_read_prefix(task, mem, env_start, env_end, page, 0, buf);
+    free(page);
     return 0;
 }
 
@@ -239,12 +269,12 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     dword_t tty_dev = 0;
     int tty_fg_group = 0;
     long thread_count = 0;
-    addr_t stack_start = 0;
-    addr_t start_brk = 0;
-    addr_t argv_start = 0;
-    addr_t argv_end = 0;
-    addr_t env_start = 0;
-    addr_t env_end = 0;
+    guest_addr_t stack_start = 0;
+    guest_addr_t start_brk = 0;
+    guest_addr_t argv_start = 0;
+    guest_addr_t argv_end = 0;
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
     sigset_t_ pending = 0;
     sigset_t_ blocked = 0;
     int exit_signal = 0;
@@ -253,12 +283,13 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
 
     lock(&task->general_lock, 0);
     if (mm != NULL) {
-        stack_start = (addr_t)mm->stack_start;
-        start_brk = (addr_t)mm->start_brk;
-        argv_start = (addr_t)mm->argv_start;
-        argv_end = (addr_t)mm->argv_end;
-        env_start = (addr_t)mm->env_start;
-        env_end = (addr_t)mm->env_end;
+        // All six whole: a 64-bit guest's addresses do not fit addr_t.
+        stack_start = mm->stack_start;
+        start_brk = mm->start_brk;
+        argv_start = mm->argv_start;
+        argv_end = mm->argv_end;
+        env_start = mm->env_start;
+        env_end = mm->env_end;
     }
     uint64_t start_time_ticks = task->start_time_ticks;
     pid = task->pid;
@@ -340,7 +371,7 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     // bunch of shit that can only be accessed by a debugger
     proc_printf(buf, "%lu ", 0l); // startcode
     proc_printf(buf, "%lu ", 0l); // endcode
-    proc_printf(buf, "%lu ", (unsigned long)stack_start);
+    proc_printf(buf, "%llu ", (unsigned long long) stack_start);
     proc_printf(buf, "%lu ", 0l); // kstkesp
     proc_printf(buf, "%lu ", 0l); // kstkeip
 
@@ -375,11 +406,11 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%ld ", 0l); // cguest_time
     proc_printf(buf, "%lu ", 0ul); // start_data
     proc_printf(buf, "%lu ", 0ul); // end_data
-    proc_printf(buf, "%lu ", (unsigned long)start_brk); // start_brk
-    proc_printf(buf, "%lu ", (unsigned long)argv_start); // arg_start
-    proc_printf(buf, "%lu ", (unsigned long)argv_end); // arg_end
-    proc_printf(buf, "%lu ", (unsigned long)env_start); // env_start
-    proc_printf(buf, "%lu ", (unsigned long)env_end); // env_end
+    proc_printf(buf, "%llu ", (unsigned long long) start_brk); // start_brk
+    proc_printf(buf, "%llu ", (unsigned long long) argv_start); // arg_start
+    proc_printf(buf, "%llu ", (unsigned long long) argv_end); // arg_end
+    proc_printf(buf, "%llu ", (unsigned long long) env_start); // env_start
+    proc_printf(buf, "%llu ", (unsigned long long) env_end); // env_end
     proc_printf(buf, "%d", 0); // exit_code
     proc_printf(buf, "\n");
 
@@ -496,22 +527,28 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     if (pid_is_kthread((dword_t) entry->pid, NULL))
         return 0;
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true)) {
-        proc_put_task(task);
+    if (task == NULL)
         return _ESRCH;
+    // Past the start of exit -- exiting, or a zombie waiting to be reaped --
+    // there is no address space to describe, and Linux reads that as empty
+    // (get_task_mm() is NULL once exit_mm has run), not as an error. This
+    // answered ESRCH for a directory that was still there to be listed.
+    if (task->exiting) {
+        proc_put_task(task);
+        return 0;
     }
-    
+
     int err = 0;
     struct mm *mm = NULL;
-    addr_t start = 0;
-    addr_t env_start = 0;
-    addr_t env_end = 0;
-    size_t size = 0;
+    guest_addr_t arg_start = 0;
+    guest_addr_t arg_end = 0;
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
     lock(&task->general_lock, 0);
 
     if (task->mm != NULL) {
-        start = task->mm->argv_start;
-        size = task->mm->argv_end - start;
+        arg_start = task->mm->argv_start;
+        arg_end = task->mm->argv_end;
         env_start = task->mm->env_start;
         env_end = task->mm->env_end;
     }
@@ -521,7 +558,7 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     // was no image to load. Its arguments are kept on the task instead, already
     // in this file's format. Before the mm == NULL bail below, since a task can
     // be running one with no address space left at all.
-    if (size == 0 && task->native_cmdline != NULL && task->native_cmdline_len != 0) {
+    if (arg_start == arg_end && task->native_cmdline != NULL && task->native_cmdline_len != 0) {
         size_t len = task->native_cmdline_len;
         char *copy = malloc(len);
         if (copy != NULL)
@@ -544,11 +581,11 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     mm_retain(mm);
     unlock(&task->general_lock);
 
-    err = proc_pid_copy_cmdline_range(task, &mm->mem, start, size, env_start, env_end, buf);
+    err = proc_pid_copy_cmdline(task, &mm->mem, arg_start, arg_end, env_start, env_end, buf);
     mm_release(mm);
     proc_put_task(task);
     return err;
-    
+
 out_free_task:
     unlock(&task->general_lock);
     proc_put_task(task);
@@ -579,10 +616,18 @@ static int proc_pid_comm_show(struct proc_entry *entry, struct proc_data *buf) {
 }
 
 static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf) {
+    // A kernel thread, and (below) a task past exit_mm, have no environment to
+    // show: Linux opens the file and reads nothing. Only a reader the file's
+    // mode lets in gets this far -- once the mm is gone the file is root's, so
+    // anyone else was refused at open, which is also what Linux does.
+    if (pid_is_kthread((dword_t) entry->pid, NULL))
+        return 0;
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true)) {
-        proc_put_task(task);
+    if (task == NULL)
         return _ESRCH;
+    if (task->exiting) {
+        proc_put_task(task);
+        return 0;
     }
     // Same credential rule as /proc/<pid>/mem: this is the target's address
     // space by another name. environ in particular carries whatever secrets a
@@ -594,19 +639,19 @@ static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf
 
     int err = 0;
     struct mm *mm = NULL;
-    addr_t start = 0;
-    size_t size = 0;
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
     lock(&task->general_lock, 0);
     if (task->mm == NULL)
         goto out_free_task;
 
-    start = task->mm->env_start;
-    size = task->mm->env_end - start;
+    env_start = task->mm->env_start;
+    env_end = task->mm->env_end;
     mm = task->mm;
     mm_retain(mm);
     unlock(&task->general_lock);
 
-    err = proc_pid_copy_user_range(task, &mm->mem, start, size, buf);
+    err = proc_pid_copy_environ(task, &mm->mem, env_start, env_end, buf);
     mm_release(mm);
     proc_put_task(task);
     return err;
