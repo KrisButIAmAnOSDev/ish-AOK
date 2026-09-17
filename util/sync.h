@@ -133,6 +133,10 @@ void cond_destroy(cond_t *cond);
 // relative and is UPDATED to the time left, so waiting again with the same
 // pointer keeps the original deadline. See sync.c for why it slices.
 int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout);
+// wait_for for a syscall the guest is blocked in (msgrcv, semop, io_getevents,
+// a FUSE request): the task reads as sleeping for the wait, and a bare barrier
+// poke is a spurious wakeup (0) rather than _EINTR. See sync.c.
+int wait_for_blocked(cond_t *cond, lock_t *lock, struct timespec *timeout);
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout);
 void notify(cond_t *cond);
 void notify_once(cond_t *cond);

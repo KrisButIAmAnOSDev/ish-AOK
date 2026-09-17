@@ -300,10 +300,10 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
             if (!timespec_positive(remaining)) {
                 err = _ETIMEDOUT;
             } else {
-                err = wait_for(&set->cond, &sem_lock, &remaining);
+                err = wait_for_blocked(&set->cond, &sem_lock, &remaining);
             }
         } else {
-            err = wait_for(&set->cond, &sem_lock, NULL);
+            err = wait_for_blocked(&set->cond, &sem_lock, NULL);
         }
         set->waiters--;
         if (for_zero)

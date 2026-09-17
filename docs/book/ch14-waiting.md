@@ -271,7 +271,57 @@ interval timers whose CPU-time variants are driven by a sampler because the
 underlying timer subsystem only offers monotonic and realtime clocks
 (Chapter 10).
 
-## 14.6 The pattern
+## 14.6 Saying you are asleep
+
+A blocked task owes one thing Chapter 12 did not list: it has to say it is
+blocked. AOK has no scheduler of its own to ask, so "asleep" is a flag,
+`io_block`, which `TASK_MAY_BLOCK` sets around a call that may wait. Three
+things read it. `/proc/<pid>/stat` says `S` for a task with the flag and `R`
+without it. The guest load average counts every task without it. And the
+address-space barrier, which sends SIGUSR1 to a process's other threads when one
+of them maps or unmaps memory so that they let go of the address space, skips a
+task that has it, because a thread parked in a syscall holds nothing to let go
+of.
+
+`read`, `write`, `poll`, `futex`, `wait4` and `nanosleep` set it. `epoll_wait`,
+`msgrcv`, `msgsnd`, `semop`, `io_getevents` and every FUSE request made from
+`stat` or `mkdir` never did. A child idling in `epoll_wait` read `R` for as long
+as anyone looked, and one left there for 65 seconds lifted the 1-minute load
+average from 0.00 to 0.66. Every node, asyncio, dbus or systemd process sitting
+in its event loop added one to `uptime`.
+
+The barrier made the rest worse than untidy. `wait_for` reports a bare SIGUSR1
+as an interruption without asking whether a signal is pending, so a thread in
+`msgrcv` whose siblings called `mmap` failed with `EINTR` a few milliseconds
+into its wait, with nothing sent. (`epoll_wait` was spared only because
+`poll_wait` already ignored a bare poke.) A FUSE `stat` was cut short the same
+way and told the daemon its request had been interrupted. The guest never saw
+that `EINTR`, but only because the path walk looked the name up again.
+
+The fix, `wait_for_blocked`, has two halves, and it needs both. It sets
+`io_block` across the wait, putting back the old value rather than clearing it,
+because a FUSE request can be made from inside `read`, which has set it already.
+And it believes `_EINTR` only when a signal or a checkpoint freeze is actually
+pending, reporting anything else as a spurious wakeup the caller re-checks. The
+flag alone leaves a race, because the barrier can read it just before it is set.
+That race is rare enough to have been seen once in some hundreds of tries, on an
+`inotify` read, so the test forces it: `ISH_TEST_POKE_BLOCKED_TASKS` makes the
+barrier poke a named task even while it is asleep. Forced, it showed which other
+waits trusted the flag alone. A FIFO open, an `eventfd`, `inotify` or terminal
+read and `rt_sigtimedwait` all returned `EINTR` within milliseconds.
+
+> **The test that passed on the bug**
+>
+> A poke sets a flag its target clears only when it next runs guest code, and
+> the barrier skips a thread whose flag is still up. So a thread blocked in a
+> syscall is poked at most once. The first version of `blocked_wait_state`
+> started its mapping thread first and the waiting thread second, and for the
+> FUSE request that one poke was always delivered on the way in, at a host
+> syscall before the wait existed. The check passed on the unfixed kernel.
+> Started the other way round, waiter first and siblings once it is waiting,
+> the poke has nowhere to land but the wait.
+
+## 14.7 The pattern
 
 Every subsystem in this chapter is the same two-part construction: a thing to
 wait on, and a thing to wake it. In every single case, the bugs were in the
@@ -297,7 +347,11 @@ spends most of its time on threads that are asleep when they should not be.
 [kernel/aio.c](../../kernel/aio.c), [kernel/sysvsem.c](../../kernel/sysvsem.c),
 [kernel/sysvmsg.c](../../kernel/sysvmsg.c), [kernel/time.c](../../kernel/time.c),
 [kernel/signal.c](../../kernel/signal.c) (`signalfd_wakeup_task`),
+[util/sync.c](../../util/sync.c) (`wait_for_blocked`),
+[kernel/task.c](../../kernel/task.c) (`task_poke_shared_mem`, `guest_count_runnable`),
+[fs/fuse.c](../../fs/fuse.c),
 `tests/manual/futex_robust_requeue.c`, `tests/manual/pidfd_epoll_deadlock.c`,
+`tests/manual/blocked_wait_state.c`,
 [docs/TODO.md](../../docs/TODO.md).
 
 *Story:* `sudo something >/dev/null` segfaulting before `main` — because Darwin's

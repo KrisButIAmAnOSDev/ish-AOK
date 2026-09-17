@@ -1224,6 +1224,27 @@ extern _Atomic long quiesce_pokes_sent;
 extern _Atomic long quiesce_pokes_skipped;
 extern _Atomic long quiesce_reader_naps;
 
+// ISH_TEST_POKE_BLOCKED_TASKS=<comm prefix>: poke a task whose comm starts with
+// this even while it is io_block, as though the barrier had read the flag a
+// moment before the task set it. That race is real -- an inotify read, which is
+// io_block, came back EINTR with no signal sent once in some hundreds of tries
+// -- and too rare to test, so without this the other half of the defence
+// (wait_for_blocked in util/sync.c reporting a bare poke as a spurious wakeup)
+// could only ever be reasoned about. tests/manual/blocked_wait_state.c is the
+// reader. Deliberately narrow, like ISH_TEST_LOSE_WAKE_POKES in kernel/signal.c:
+// a comm prefix, never every task.
+static bool poke_blocked_task_for_test(const struct task *task) {
+    static const char *prefix = NULL;
+    static int looked_up = 0;
+    if (!looked_up) {
+        prefix = getenv("ISH_TEST_POKE_BLOCKED_TASKS");
+        looked_up = 1;
+    }
+    if (prefix == NULL || *prefix == '\0' || task == NULL)
+        return false;
+    return strncmp(task->comm, prefix, strlen(prefix)) == 0;
+}
+
 void task_poke_shared_mem(struct task *task, struct mem *mem) {
     // A NULL `task` is a caller with no `current` -- kswapd, and anything else
     // that takes the address-space barrier from a host thread rather than a
@@ -1263,7 +1284,7 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
         // enters JIT right after this check is covered by mem_write_lock_with_
         // pokes re-poking every 64 attempts: by then io_block is clear and the
         // trylockw it now blocks forces another poke round that catches it.
-        if (other->io_block) {
+        if (other->io_block && !poke_blocked_task_for_test(other)) {
             atomic_fetch_add_explicit(&quiesce_pokes_skipped, 1, memory_order_relaxed);
             continue;
         }

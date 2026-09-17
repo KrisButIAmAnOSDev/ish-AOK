@@ -158,6 +158,17 @@ currently absences rather than half-implementations:
 - **A path five components deep is six requests.** Same cause. The design note
   in `fs/fuse.c` argues the trade was right to make first, and it was, but the
   measured cost is real on a deep tree.
+- **A name that does not exist costs nine requests, not one.** Measured
+  2026-09-17 with the daemon in `tests/manual/blocked_wait_state.c`: one
+  `stat` of a missing name in the mount root sent READLINK and GETATTR of the
+  root, the LOOKUP, then READLINK, GETATTR, READLINK and GETATTR of the root
+  again and the LOOKUP twice more. Linux 6.12 (camd, as root) sent the one
+  LOOKUP. Two things are separable from the cache: READLINK of a node whose
+  attributes already say it is a directory, and the walk being repeated after
+  a failed lookup. The repeat is also what kept a poke's spurious EINTR on a
+  FUSE request from reaching the guest before `wait_for_blocked` (the daemon
+  still got the FUSE_INTERRUPT), so find out what it is for before removing
+  it.
 - **A mapping and `read()` are coherent only at sync points.** `mmap` is backed
   by a per-nodeid host stand-in for the page cache (see the chapter), while
   `read`/`write` go straight to the daemon. Linux's page cache makes the two
@@ -1161,6 +1172,31 @@ does not cover the desktop, plus a key command. Cmd+S matches shell mode and
 looks free there: DisplayRFBView forwards only Cmd+= + - 0 to the guest, and
 deliberately not Cmd+letter. Confirm it does not also reach the Wayland
 session before claiming it.
+
+### A wait that trusts io_block alone can still be poked into EINTR
+
+**Established (2026-09-17).** The address-space barrier
+(`task_poke_shared_mem`) skips a task that is `io_block`, but it can read the
+flag a moment before a task entering a blocking call sets it. The poke then
+lands inside the wait, and `wait_for` reports it as `_EINTR` with no signal
+pending. Seen unforced once in several hundred tries: an `inotify` read on the
+Devuan arm64 root came back EINTR at 0ms with no handler run, while a sibling
+thread mapped memory. `ISH_TEST_POKE_BLOCKED_TASKS=<comm prefix>` forces the
+race (kernel/task.c). Forced, on the Alpine arm64 root, with one sibling
+spinning and one mapping: a FIFO open, an `eventfd` read, an `inotify` read, a
+pty read and `rt_sigtimedwait` all returned EINTR within 1-11ms. poll, select,
+epoll, futex, waitpid, nanosleep, a pipe read and recv already ignore a bare
+poke. So does everything on `wait_for_blocked` (util/sync.c): msgrcv, msgsnd,
+semop, semtimedop, io_getevents and FUSE requests, where the forced run is
+what proved that half of it (`tests/manual/blocked_wait_state.c`).
+
+**Next step.** Move the other `wait_for` callers that return its `_EINTR`
+unexamined onto `wait_for_blocked`. It restores `io_block` rather than
+clearing it, so it nests inside `TASK_MAY_BLOCK`. They are: fs/fifo.c,
+kernel/eventfd.c, kernel/inotify.c, fs/tty.c, the timerfd read in
+kernel/time.c, the kmsg wait in kernel/log.c, the `/dev/fuse` read in
+fs/fuse.c, and in kernel/signal.c pause, rt_sigsuspend, rt_sigtimedwait and
+the signalfd read. Prove each with the knob, before and after.
 
 ### A task blocked OPENING a FIFO still cannot be frozen if its wake is lost
 

@@ -214,7 +214,7 @@ int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgf
             return _EAGAIN;
         }
         queue->waiters++;
-        err = wait_for(&queue->snd_cond, &msg_lock, NULL);
+        err = wait_for_blocked(&queue->snd_cond, &msg_lock, NULL);
         queue->waiters--;
         if (queue->removed) {
             msg_queue_maybe_free(queue);
@@ -286,7 +286,7 @@ int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
             return _ENOMSG;
         }
         queue->waiters++;
-        int err = wait_for(&queue->rcv_cond, &msg_lock, NULL);
+        int err = wait_for_blocked(&queue->rcv_cond, &msg_lock, NULL);
         queue->waiters--;
         if (queue->removed) {
             msg_queue_maybe_free(queue);

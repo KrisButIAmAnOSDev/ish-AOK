@@ -312,6 +312,45 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
     return wait_for_internal(cond, lock, timeout, false);
 }
 
+// wait_for, for a wait a guest syscall is blocked in. A bare wait_for gets two
+// things wrong there, and both were measured on an arm64 guest.
+//
+// The task reads as running. /proc/<pid>/stat says 'S' only for a task with
+// io_block set (fs/proc/pid.c), and the guest load average counts every task
+// without it (guest_count_runnable in kernel/task.c). A child parked in msgrcv,
+// msgsnd, semop, semtimedop or io_getevents showed 'R' for as long as it
+// waited, where Linux shows 'S'. read, poll, futex and the rest set io_block
+// with TASK_MAY_BLOCK; these waits never did.
+//
+// A poke ends the wait. The address-space barrier (task_poke_shared_mem)
+// SIGUSR1s every sibling that is not io_block when a thread maps or unmaps
+// memory, and wait_for reports the poke as _EINTR without asking whether any
+// signal is pending. So a thread in msgrcv, msgsnd, semop or io_getevents
+// failed with EINTR 0-10ms into the wait, with no signal sent, while its
+// siblings ran and called mmap. io_block keeps the barrier away, but it can
+// read the flag just before this sets it, so the answer is checked as well:
+// only a pending signal or a checkpoint freeze is an interruption. Anything
+// else is a spurious wakeup and returns 0. The caller re-checks its condition,
+// as it must after any wakeup, and waits again -- and that wait does not come
+// straight back, because wait_for has already consumed the poke's mark. Same
+// two halves as the netlink receive wait in fs/sock.c.
+//
+// io_block is put back as it was rather than cleared: a FUSE request can be
+// made from inside read(2) or write(2), which have already set it.
+int wait_for_blocked(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+    bool was_blocked = false;
+    if (current != NULL) {
+        was_blocked = current->io_block;
+        current->io_block = true;
+    }
+    int err = wait_for(cond, lock, timeout);
+    if (current != NULL)
+        current->io_block = was_blocked;
+    if (err == _EINTR && !task_wake_signal_pending() && !checkpoint_freeze_pending())
+        return 0;
+    return err;
+}
+
 void notify(cond_t *cond) {
     pthread_cond_broadcast(&cond->cond);
 }

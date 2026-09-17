@@ -507,7 +507,7 @@ int_t sys_io_getevents_guest(guest_addr_t ctx_id, sqword_t min_nr, sqword_t nr,
         // "wait forever" -- passing it to wait_for would do the latter.
         if (timeout != NULL && timeout->tv_sec == 0 && timeout->tv_nsec == 0)
             break;
-        int err = wait_for(&ctx->cond, &ctx->lock, timeout);
+        int err = wait_for_blocked(&ctx->cond, &ctx->lock, timeout);
         if (err == _ETIMEDOUT)
             break;
         if (err < 0) {

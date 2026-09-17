@@ -306,11 +306,20 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
     bool guest_infinite = (timeout_ts_ptr == NULL);
     struct timespec bounded = { .tv_sec = 2 };
     int res;
-    do {
-        context.n = 0;
-        res = poll_wait(epoll->epollfd.poll, epoll_callback, &context,
-                        guest_infinite ? &bounded : timeout_ts_ptr);
-    } while (guest_infinite && res == 0);
+    // io_block, as poll and select set it around the same poll_wait. Without
+    // it a process sitting in its event loop read 'R' in /proc/<pid>/stat for
+    // the whole wait (Linux: 'S') and added 1 to the guest load average, which
+    // counts every task that is not io_block -- one for each node, python
+    // asyncio, dbus or systemd process idling in epoll_wait. It also keeps the
+    // address-space barrier from poking the waiter, which poll_wait would only
+    // have ignored.
+    TASK_MAY_BLOCK {
+        do {
+            context.n = 0;
+            res = poll_wait(epoll->epollfd.poll, epoll_callback, &context,
+                            guest_infinite ? &bounded : timeout_ts_ptr);
+        } while (guest_infinite && res == 0);
+    }
     // epoll_wait is EINTR on a pending signal, full stop -- it does not
     // restart. Linux's ep_poll() breaks out with -EINTR the moment
     // signal_pending() is true and never reaches the restart machinery, while

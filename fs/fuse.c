@@ -589,11 +589,18 @@ static int fuse_conn_call(struct fuse_conn *conn, uint32_t opcode, uint64_t node
     struct timespec *wait_bound = dying ? &deadline : NULL;
 
     lock(&conn->lock, 0);
+    // Both waits below are wait_for_blocked: they are reached from stat,
+    // getdents, mkdir, unlink and the rest, none of which marks the task
+    // io_block the way read and write do. With plain wait_for a process
+    // waiting on its daemon read 'R' and counted toward the load average, and
+    // a sibling thread's mmap poked the wait into a spurious EINTR -- which
+    // also sent the daemon a FUSE_INTERRUPT for a request nobody interrupted.
+    //
     // Everything except INIT itself queues behind a completed handshake, so
     // the daemon never sees a request it hasn't negotiated struct sizes for.
     if (wait && opcode != FUSE_INIT) {
         while (!conn->initialized && !conn->dead) {
-            if (wait_for(&conn->cond, &conn->lock, wait_bound)) {
+            if (wait_for_blocked(&conn->cond, &conn->lock, wait_bound)) {
                 unlock(&conn->lock);
                 fuse_req_free(req);
                 return _EINTR;
@@ -616,7 +623,7 @@ static int fuse_conn_call(struct fuse_conn *conn, uint32_t opcode, uint64_t node
 
     lock(&conn->lock, 0);
     while (!req->answered && !conn->dead) {
-        if (wait_for(&conn->cond, &conn->lock, wait_bound)) {
+        if (wait_for_blocked(&conn->cond, &conn->lock, wait_bound)) {
             if (dying)
                 conn->exit_gave_up = true;
             // Interrupted. If the daemon hasn't read it yet it can be pulled
