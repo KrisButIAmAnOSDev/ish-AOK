@@ -633,16 +633,37 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         unlock(&task->sighand->lock);
     }
 
-    // A child the tracer is now attached to starts life stopped: Linux queues
-    // it a SIGSTOP (ptrace_init_task) before it runs at all, so the tracer's
-    // first report of the new task is always that stop. This was sent after
-    // task_start, and a child whose first act was _exit could, rarely, be gone
-    // before it arrived. Its tracer then never heard of it -- or, waiting on
-    // the pid the event named, reaped it from under its real parent, whose own
-    // waitpid then failed. Seen once in 2000 traced vforks, and once in 15 runs
-    // of tests/manual/ptrace_eventmsg.c.
-    if (trace_child)
-        signal_queue_before_start(task, SIGSTOP_, SIGINFO_NIL);
+    // A child the tracer is now attached to starts life owing it a stop, which
+    // is the tracer's first report of the new task. Linux's ptrace_init_task
+    // decides which: a tracer that seized is owed a PTRACE_EVENT_STOP
+    // (JOBCTL_TRAP_STOP), any other a SIGSTOP. Both are set before the task
+    // runs at all, and task_thread takes them before its first instruction.
+    //
+    // A seized child used to get the SIGSTOP too. strace -f takes a seized
+    // tracee's SIGSTOP for a real signal and injects it, so every child it
+    // followed printed "--- SIGSTOP {si_code=SI_KERNEL} ---", really stopped,
+    // and sent its parent a SIGCHLD with CLD_STOPPED. No signal could have
+    // replaced it: glibc blocks every signal around pthread_create's and
+    // posix_spawn's clone, and the child starts with that mask.
+    //
+    // The SIGSTOP is a bare pending bit in Linux, with no siginfo queued, so
+    // the tracer reads SI_USER from pid 0. Measured on 6.12.
+    //
+    // This was sent after task_start, and a child whose first act was _exit
+    // could, rarely, be gone before it arrived. Its tracer then never heard of
+    // it -- or, waiting on the pid the event named, reaped it from under its
+    // real parent, whose own waitpid then failed. Seen once in 2000 traced
+    // vforks, and once in 15 runs of tests/manual/ptrace_eventmsg.c.
+    if (trace_child) {
+        if (task->ptrace.seized) {
+            // Nothing else can see the task yet but its tracer, which learns
+            // the pid only from the event below.
+            task->ptrace.trap_stop = true;
+        } else {
+            struct siginfo_ stop_info = { .sig = SIGSTOP_, .code = SI_USER_ };
+            signal_queue_before_start(task, SIGSTOP_, stop_info);
+        }
+    }
 
     if (task_start(task) < 0) {
         // Host thread limit or memory exhaustion: the child never ran.
@@ -685,8 +706,10 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // disposition: the tracer can suppress it (signal_stops_for_tracer).
         // Linux only turns a fatal signal into a SIGKILL for an untraced task
         // (complete_signal), so a tracee's vfork wait ends for SIGKILL alone.
-        // PTRACE_INTERRUPT's trap is a SIGTRAP, whose disposition is
-        // terminate, and it ended the wait too. Measured with the child blocked
+        // PTRACE_INTERRUPT's trap was a SIGTRAP then, whose disposition is
+        // terminate, and it ended the wait too; it is a flag now
+        // (ptrace.trap_stop), which this wait never looks at. Measured with the
+        // child blocked
         // on a pipe: after PTRACE_INTERRUPT, or a SIGINT the tracer then
         // resumed without, the parent stopped at once, returned from vfork
         // before the child had finished, and died of SIGSEGV on the stack they

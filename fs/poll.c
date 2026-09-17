@@ -770,7 +770,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         // so the dispatcher can rewind over it and the task can park. The
         // EINTR never reaches the guest; syscall_result_should_restart turns
         // it into a restart while the freeze is on.
+        // A PTRACE_EVENT_STOP the task owes its tracer is the same kind of
+        // thing, and it restarts the call the same way.
         bool signal_pending = checkpoint_freeze_pending() ||
+            task_trap_stop_pending(current) ||
             !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
         unlock(&current->sighand->lock);
         if (signal_pending) {
@@ -811,7 +814,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         // so the dispatcher can rewind over it and the task can park. The
         // EINTR never reaches the guest; syscall_result_should_restart turns
         // it into a restart while the freeze is on.
+        // A PTRACE_EVENT_STOP the task owes its tracer is the same kind of
+        // thing, and it restarts the call the same way.
         bool signal_pending = checkpoint_freeze_pending() ||
+            task_trap_stop_pending(current) ||
             !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
                 unlock(&current->sighand->lock);
                 if (signal_pending) {
@@ -958,7 +964,10 @@ poll_wait_done:
         // so the dispatcher can rewind over it and the task can park. The
         // EINTR never reaches the guest; syscall_result_should_restart turns
         // it into a restart while the freeze is on.
+        // A PTRACE_EVENT_STOP the task owes its tracer is the same kind of
+        // thing, and it restarts the call the same way.
         bool signal_pending = checkpoint_freeze_pending() ||
+            task_trap_stop_pending(current) ||
             !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
             unlock(&current->sighand->lock);
             if (!signal_pending)
@@ -984,7 +993,8 @@ poll_wait_done:
                 lock(&current->sighand->lock, 0);
                 sigset_t_ raised = current->pending | current->sighand->pending;
                 sigset_t_ masked = task_wake_blocked(current);
-                bool signal_pending = !!(raised & ~masked);
+                bool signal_pending = !!(raised & ~masked) ||
+                    task_trap_stop_pending(current);
                 sigset_t_ stuck = raised & masked;
                 unlock(&current->sighand->lock);
                 if (signal_pending)

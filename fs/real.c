@@ -72,7 +72,11 @@ static bool realfs_guest_signal_pending(void) {
     // realfs_fdops), so without this anything blocked reading one -- a
     // `while read` loop at the end of a pipeline, a `cat` -- never parked, and
     // the checkpoint refused on "did not reach a syscall boundary".
-    if (checkpoint_freeze_pending())
+    //
+    // A PTRACE_EVENT_STOP the task owes its tracer ends it too, and is no more
+    // a signal than the freeze: PTRACE_INTERRUPT of a task blocked reading a
+    // pipe, whatever its mask. The read restarts after the stop.
+    if (checkpoint_freeze_pending() || task_trap_stop_pending(current))
         return true;
     lock(&current->sighand->lock, 0);
     sigset_t_ pending = (current->pending | current->sighand->pending) &

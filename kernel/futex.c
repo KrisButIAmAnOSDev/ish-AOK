@@ -276,8 +276,9 @@ static bool futex_wait_has_pending_signal(void) {
         return false;
     // A CHECKPOINT FREEZE too: not a signal, and this function exists to
     // ignore bare pokes, so it has to be asked about on its own. See the same
-    // addition in fs/poll.c and kernel/exit.c.
-    if (checkpoint_freeze_pending())
+    // addition in fs/poll.c and kernel/exit.c. And a PTRACE_EVENT_STOP the
+    // task owes its tracer, for the same reason.
+    if (checkpoint_freeze_pending() || task_trap_stop_pending(current))
         return true;
     // Consume any interrupt marker left by a host-side SIGUSR1 poke (mem
     // quiesce while a sibling thread mmaps a stack, for example). A poke is

@@ -307,28 +307,28 @@ struct task {
         // delivered (run its action) on the next receive, not re-trapped through
         // signal_delivery_stop — otherwise an injected signal loops forever.
         int deliver_sig;
-        // No field here records PTRACE_INTERRUPT's outstanding trap, and that
-        // is deliberate -- it is identified by its si_code instead. The reason
-        // it needs identifying at all:
+        // A PTRACE_EVENT_STOP this task owes its tracer: Linux's
+        // JOBCTL_TRAP_STOP. PTRACE_INTERRUPT sets it, and so does the clone
+        // that hands a seizing tracer a new child, whose first stop it is. The
+        // task takes it at its next signal checkpoint, before any signal and
+        // whatever its mask says (ptrace_trap_stop_if_pending). Any stop at all
+        // answers it (ptrace_stop_common), and a detach drops it.
         //
-        // AOK implements PTRACE_INTERRUPT by actually sending SIGTRAP, because
-        // that is what wakes a tracee out of a blocking wait. While the task is
-        // traced the signal never reaches the program -- signal_delivery_stop
-        // intercepts it and reports the stop. The moment the tracer detaches it
-        // is an ordinary SIGTRAP again, and SIGTRAP's default action is to
-        // terminate: a tracee interrupted and then detached before it consumed
-        // the trap died of signal 5.
+        // Written under `lock`. Read without it, as task_trap_stop_pending, by
+        // every wait that has to end so the task can stop -- the same waits
+        // that ask checkpoint_freeze_pending, for the same reason.
         //
-        // That is what killed every process `strace -p` ever attached to. Its
-        // detach interrupts a running tracee and then waits, and a program
-        // making a syscall every few milliseconds usually reaches a
-        // syscall-stop of its own first -- so strace saw the stop it wanted,
-        // detached, and left the interrupt's SIGTRAP in the queue. Linux has no
-        // such window: its interrupt is JOBCTL_TRAP_STOP, a flag rather than a
-        // signal, and __ptrace_unlink clears it on detach.
-        //
-        // See SI_PTRACE_INTERRUPT_ and ptrace_discard_interrupt_traps
-        // (kernel/signal.c), and tests/manual/ptrace_detach_survives.c.
+        // Until 2026-09-17 this was a queued SIGTRAP, and everything a signal
+        // does differently from a flag was a bug. A tracee with SIGTRAP blocked
+        // was never stopped, and one ignoring it dropped the interrupt. A new
+        // child could not be given one at all: glibc blocks every signal around
+        // pthread_create's and posix_spawn's clone, so the child got a SIGSTOP
+        // instead, which strace -f injected as a real signal. And an interrupt
+        // still queued when the tracer detached was an ordinary SIGTRAP from
+        // then on, which is how every process `strace -p` attached to used to
+        // die. See tests/manual/ptrace_seize_trap_stop.c and
+        // ptrace_detach_survives.c.
+        bool trap_stop;
         struct siginfo_ info;
         int trap_event;
         qword_t eventmsg;

@@ -149,12 +149,16 @@ emulator underneath it differs.
 
 **What is left, and it is smaller than what closed.**
 
-- **`PTRACE_INTERRUPT` should not use a signal at all.** The tag makes the
-  detach safe; it does not make the mechanism right. A tracee with SIGTRAP set
-  to `SIG_IGN` is never interrupted, because `send_signal` drops the signal and
-  nothing stops — a silent no-op where Linux stops the task. The real shape is
-  a per-task flag the interruptible-wait path notices, like Linux's jobctl bit.
-  Contained, and now the only thing standing between this and correct.
+- ~~**`PTRACE_INTERRUPT` should not use a signal at all.**~~ **Done
+  2026-09-17.** It is now `ptrace.trap_stop`, a per-task flag like Linux's
+  `JOBCTL_TRAP_STOP`, and the SIGTRAP, its `SI_PTRACE_INTERRUPT_` tag and the
+  detach-time discard are gone. A tracee with SIGTRAP ignored or blocked now
+  stops, an interrupt sent while it is stopped is taken once it resumes, and a
+  `read` the interrupt broke into restarts instead of returning `EINTR`. The
+  same flag gives a seized tracer's new children their Linux first stop,
+  `PTRACE_EVENT_STOP` rather than a SIGSTOP, which `strace -f` had been
+  printing and injecting into every child. Covered by
+  `tests/manual/ptrace_seize_trap_stop.c`.
 - **`PTRACE_DETACH` still does not unlink `ptrace_siblings`.** Found while
   chasing this and left alone deliberately: it is not what killed anything, and
   changing list membership under the detach path deserved its own change rather

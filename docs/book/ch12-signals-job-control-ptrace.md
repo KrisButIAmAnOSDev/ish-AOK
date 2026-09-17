@@ -201,7 +201,8 @@ syscall chose between `ERESTART` and `EINTR` by looking at the handler it
 expected to run. A tracer makes that guess wrong. A traced task's signal goes to
 a signal-delivery-stop first, and the tracer may resume without it — gdb does,
 for `SIGINT` — so no handler runs and Linux restarts the call. `PTRACE_INTERRUPT`'s
-`SIGTRAP` is never delivered at all. AOK had guessed `EINTR` from both, so a
+`SIGTRAP`, as it was then, was never delivered at all. AOK had guessed `EINTR`
+from both, so a
 program blocked in `read` failed as soon as a debugger interrupted it and let it
 go. Now such a call is set to restart, and whichever handler really runs first
 decides (`signal_restart_decided_at_delivery`), which is where Linux's
@@ -393,6 +394,39 @@ because they are about how to prove a resumption happened at all:
   saying whether it was the control or the subject that hung. The first A/B run
   was misread for exactly that reason.
 
+**A stop the tracer is owed is not a signal.** Two stops a seized tracee reports
+have no signal behind them in Linux: the one `PTRACE_INTERRUPT` asks for, and a
+new child's first stop when its parent's tracer seized and follows forks. Both
+are `JOBCTL_TRAP_STOP`, a bit the task takes at its next signal check, before
+any signal and whatever its mask says, and both report `PTRACE_EVENT_STOP`
+(status `0x80057f`).
+
+AOK used signals for both, and each place a signal behaves differently from a
+flag was a bug:
+
+- The interrupt was a queued `SIGTRAP`. A tracee with SIGTRAP blocked was never
+  stopped, one with it set to `SIG_IGN` never received it, and one still
+  queued when the tracer detached was an ordinary fatal SIGTRAP from then on,
+  which is how `strace -p` used to kill what it attached to.
+- A new child got a `SIGSTOP` whether its tracer had seized or not. `strace -f`
+  seizes, and it takes a seized tracee's SIGSTOP for a real signal: it printed
+  `--- SIGSTOP ---` for every child, injected the signal, and the child really
+  stopped and sent its parent a `SIGCHLD` with `CLD_STOPPED`. A signal could not
+  have replaced the SIGSTOP either, because glibc blocks every signal around the
+  clone in `pthread_create` and `posix_spawn`, and the child starts with that
+  mask.
+
+Now it is a flag, `ptrace.trap_stop`. `PTRACE_INTERRUPT` sets it and wakes the
+task with the same pokes a signal uses. Clone sets it on a seized tracer's new
+child. `handle_interrupt`, `native_checkpoint` and a new task's first moments
+take it before any signal, any stop clears it, and a detach drops it. Every
+wait that ends for a pending signal also asks `task_trap_stop_pending`, in the
+same places it asks about a checkpoint freeze. The restart predicates count a
+trap as a stop, so a `read` the interrupt broke into restarts once the tracer
+resumes the task, as it does in Linux, instead of returning `EINTR`.
+`tests/manual/ptrace_seize_trap_stop.c` holds each of these to what Linux 6.12
+measured.
+
 ## 12.9 What this costs the rest of Part III
 
 Everything that blocks has to satisfy three obligations that come from this
@@ -420,6 +454,7 @@ right to be. Those three obligations are why.
 [fs/tty.c](../../fs/tty.c), [fs/tty.h](../../fs/tty.h),
 [util/sync.c](../../util/sync.c) (`signal_thread_unwedge_wake_sigs`),
 `tests/manual/ptrace_group_stop.c`, `tests/manual/native_ptrace_group_stop.c`,
+`tests/manual/ptrace_seize_trap_stop.c`,
 `tests/manual/tty_hangup_reopen.c`, [docs/TODO.md](../../docs/TODO.md).
 
 *Story:* `PTRACE_SEIZE` of an already-stopped tracee hanging forever — a race

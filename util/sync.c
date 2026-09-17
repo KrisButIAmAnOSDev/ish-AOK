@@ -86,6 +86,12 @@ void cond_destroy(cond_t *cond) {
 static bool is_signal_pending(lock_t *lock) {
     if (!current)
         return false;
+    // A PTRACE_EVENT_STOP the task owes its tracer ends a wait as a deliverable
+    // signal does, whatever the mask: the task has to reach the checkpoint
+    // where it stops. It is a flag, not a signal (ptrace.trap_stop in
+    // kernel/task.h), and task_wake_signal_pending answers for it too.
+    if (task_trap_stop_pending(current))
+        return true;
     // A process-directed signal (e.g. SIGCHLD delivered via
     // send_signal_to_group, see kernel/exit.c/kernel/signal.c) only ever sets
     // current->sighand->pending, never current->pending -- deliver_signal_to_

@@ -217,11 +217,10 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
         tracee->ptrace.trap_event = 0;
         tracee->ptrace.eventmsg = 0;
         tracee->ptrace.seized = false;
-        // Same reason as the explicit PTRACE_DETACH path: an unconsumed
-        // PTRACE_INTERRUPT trap is a stop request, and once this task is
-        // untraced it is a fatal SIGTRAP instead. A tracer that dies between
-        // interrupting a tracee and seeing the stop must not kill it.
-        ptrace_discard_interrupt_traps(tracee);
+        // A stop still owed goes with the tracer, as on the PTRACE_DETACH path:
+        // a tracer that dies between interrupting a tracee and seeing the stop
+        // must not leave it one to take with nobody to report it to.
+        __atomic_store_n(&tracee->ptrace.trap_stop, false, __ATOMIC_RELEASE);
         if (tracee->ptrace.stopped) {
             tracee->ptrace.stopped = false;
             notify(&tracee->ptrace.cond);
@@ -1084,6 +1083,10 @@ static bool wait_interrupted_by_signal(void) {
     // restart turns it into a restart while the freeze is on, so the wait
     // re-enters on the far side of the checkpoint.
     if (checkpoint_freeze_pending())
+        return true;
+    // So does a PTRACE_EVENT_STOP the task owes its tracer, for the same
+    // reason; the restart predicates restart the wait after the stop.
+    if (task_trap_stop_pending(current))
         return true;
     lock(&current->sighand->lock, 0);
     // See kernel/signal.h: a shim-held signal must end this wait too.

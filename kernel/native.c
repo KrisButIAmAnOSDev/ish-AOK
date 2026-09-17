@@ -820,6 +820,12 @@ void native_checkpoint(void) {
     // callbacks in kernel/native_libc.c for the whole story.
     bool defer = nlibc_stdio_defer_fatal();
 
+    // A PTRACE_EVENT_STOP the tracer is owed comes before any signal, as it
+    // does in handle_interrupt. Not deferred inside stdio: a stop runs no
+    // handler and exits nothing, and parking with a stream lock held is fine,
+    // as for group_stop_wait below.
+    ptrace_trap_stop_if_pending();
+
     if (has_saved_mask || ((pending | group_pending) & ~blocked) != 0) {
         // receive_signals runs the default action, which for SIGINT means
         // do_exit_group -- so this call may not return, and that is the point:
@@ -836,6 +842,7 @@ void native_checkpoint(void) {
     // its tracer and the tracer's wait4 hung forever. Parking WHILE holding a
     // stdio lock is fine -- the owner is alive and will release it on SIGCONT.
     group_stop_wait();
+    ptrace_trap_stop_if_pending();
 
     // The checkpoint freezer's parking place for a native program. It never
     // reaches task_run_current's loop -- that loop is for translated code --

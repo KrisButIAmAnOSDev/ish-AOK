@@ -649,7 +649,7 @@ static void seize_case(void) {
         char ch;
         // Not retried on EINTR. Linux restarts a read that PTRACE_INTERRUPT
         // broke into once the tracer resumes the task, and so does AOK now; see
-        // ptrace_stop_restart.
+        // ptrace_stop_restart and ptrace_seize_trap_stop.
         if (read(go[0], &ch, 1) != 1)
             _exit(99);
         raise(SIGSTOP);

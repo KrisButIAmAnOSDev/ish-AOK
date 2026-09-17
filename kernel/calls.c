@@ -6804,6 +6804,10 @@ void handle_interrupt(int interrupt) {
             sys_exit(interrupt);
             break;
     }
+    // A PTRACE_EVENT_STOP the tracer is owed -- PTRACE_INTERRUPT's -- is taken
+    // before any signal, as Linux's get_signal takes JOBCTL_TRAP_STOP, and
+    // whatever the mask. A lockless look when nothing is owed.
+    ptrace_trap_stop_if_pending();
     // Host-side wakeups (for example thread pokes or interrupted waits) often
     // arrive with no guest-visible pending signal work. Avoid serializing all
     // runnable threads on sighand->lock in that common case.
@@ -6819,6 +6823,9 @@ void handle_interrupt(int interrupt) {
     // handling and the second copy this used to be lacked all of the ptrace
     // half of it.
     group_stop_wait();
+    // An interrupt sent while a stop above held the task is owed from the
+    // moment that stop ends, as Linux's get_signal loops back to look again.
+    ptrace_trap_stop_if_pending();
 }
 
 

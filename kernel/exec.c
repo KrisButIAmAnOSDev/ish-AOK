@@ -2022,9 +2022,13 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
             .kill.pid = current->pid,
             .kill.uid = current->uid,
         };
+        // Without PTRACE_O_TRACEEXEC, the legacy post-exec SIGTRAP goes only
+        // to a tracee that was not seized (Linux's ptrace_event). A seized one
+        // got it too, and a tracer that injects what it does not expect
+        // killed the program it had just spawned.
         if (current->ptrace.options & PTRACE_O_TRACEEXEC_)
             ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXEC_, old_pid);
-        else
+        else if (!current->ptrace.seized)
             ptrace_signal_stop(SIGTRAP_, &info);
     }
 

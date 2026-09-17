@@ -2046,7 +2046,10 @@ static bool socket_guest_signal_pending(void) {
     // refused on "did not reach a syscall boundary". Measured on the CLI
     // 2026-09-11: a child blocked in recv() on a UDP socket refused the save
     // before this change and parks after it.
-    if (checkpoint_freeze_pending())
+    //
+    // A PTRACE_EVENT_STOP the task owes its tracer ends a socket wait for the
+    // same reason, and is no more a signal than the freeze.
+    if (checkpoint_freeze_pending() || task_trap_stop_pending(current))
         return true;
     lock(&current->sighand->lock, 0);
     sigset_t_ pending = (current->pending | current->sighand->pending) &

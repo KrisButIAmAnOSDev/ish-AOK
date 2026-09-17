@@ -30,7 +30,9 @@
 // no such window: its interrupt is JOBCTL_TRAP_STOP, a flag, cleared by
 // __ptrace_unlink. Fixed by tagging the trap with SI_PTRACE_INTERRUPT_ and
 // discarding it on both detach paths; interrupt_then_detach_case below is the
-// shape that reproduces it.
+// shape that reproduces it. The interrupt has since become a flag like Linux's
+// (ptrace.trap_stop, 2026-09-17), which both detach paths clear, and this test
+// guards that too.
 //
 // Two more bugs found beside it, both covered here. waitpid(<tid>, __WALL) on
 // a traced non-leader must report that thread's stop -- AOK hung, because

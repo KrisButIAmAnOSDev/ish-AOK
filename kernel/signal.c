@@ -716,20 +716,62 @@ void task_wake_for_freeze(struct task *task) {
     }
 }
 
+// Wake a task that now owes its tracer a PTRACE_EVENT_STOP (ptrace.trap_stop),
+// so that it reaches the checkpoint where it stops -- out of guest code, a host
+// call or a cond_t wait, as a signal would get it out of them.
+//
+// The pokes signal_wake_task makes, and nothing that depends on a signal: no
+// restart record and no wait_interrupted. The waits it breaks find
+// task_trap_stop_pending where they look for a pending signal, and the restart
+// predicates ask the flag directly -- a stop runs no handler, so the syscall
+// restarts. Not signal_wake_task itself, whose work is decided by the signal it
+// is given, and there is none.
+//
+// The caller holds a reference on `task` and on `sighand`, taken under
+// pids_lock -- do_exit clears ->sighand under that lock and releases it after
+// -- and holds no lock now, since the wake can block on the lock the task is
+// waiting under.
+void task_wake_for_ptrace_trap(struct task *task, struct sighand *sighand) {
+    lock(&sighand->lock, 0);
+    // Until task_start, task->thread is still the parent's pthread; a task
+    // that has not run yet looks for the flag before its first instruction
+    // (task_thread). One on its way out has nothing left to stop for, and
+    // poking a thread that has exited is undefined.
+    bool live = atomic_load_explicit(&task->host_thread_started, memory_order_acquire) &&
+        !task->zombie && !task->exiting &&
+        !atomic_load_explicit(&task->exit_finished, memory_order_acquire);
+    if (live) {
+        // A host call, both pokes: see signal_wake_task for why one is not
+        // enough. The notify pipe's fd is read under sighand->lock.
+        pthread_kill(task->thread, SIGUSR1);
+        pthread_kill(task->thread, SIGUSR2);
+        poll_notify_poke(task->poll_notify_fd);
+        // Guest code.
+        if (task->cpu.poked_ptr)
+            cpu_poke(&task->cpu);
+    }
+    unlock(&sighand->lock);
+    if (live) {
+        // A cond_t wait. Without sighand->lock, as signal_wake_task does it.
+        lock(&sighand->wake_lock, 0);
+        wake_waiting_task(task);
+        unlock(&sighand->wake_lock);
+    }
+}
+
 // Whether a signal that interrupted a syscall can say yet if that syscall
 // restarts. Its disposition normally does -- a handler with SA_RESTART restarts
-// it, one without gives EINTR, a stop restarts it -- but for two kinds of signal
-// the disposition is not what will happen.
+// it, one without gives EINTR, a stop restarts it -- but not for a signal a
+// tracer sees first.
 //
-// PTRACE_INTERRUPT's trap is never delivered. AOK interrupts a tracee by
-// queueing it a real SIGTRAP (Linux sets JOBCTL_TRAP_STOP, a flag), and the
-// trap is consumed by the tracee's ptrace stop, dropped by ptrace_stop_common
-// when another stop got there first, or discarded by a detach. Read by SIGTRAP's
-// disposition, terminate, it meant "no restart": a read() blocked on a pipe
-// failed with EINTR once the tracer resumed it, 10 runs out of 10, where Linux
-// 6.12 restarted it 10 out of 10 because no handler ran.
+// (PTRACE_INTERRUPT was the other kind while it queued a real SIGTRAP: read by
+// SIGTRAP's disposition, terminate, it meant "no restart", and a read() blocked
+// on a pipe failed with EINTR once the tracer resumed it, 10 runs out of 10,
+// where Linux 6.12 restarted it 10 out of 10. The interrupt is now
+// ptrace.trap_stop, a flag with no disposition at all, and the restart
+// predicates answer for it with task_trap_stop_pending.)
 //
-// Any signal a tracer sees first. receive_signals turns it into a
+// A signal a tracer sees first. receive_signals turns it into a
 // signal-delivery-stop, and the tracer chooses what happens next. Resumed with
 // no signal, nothing is delivered and Linux restarts the call -- that is gdb's
 // ^C and `continue` on a program waiting for input, and AOK failed the read.
@@ -750,9 +792,7 @@ void task_wake_for_freeze(struct task *task) {
 //
 // Callers exclude a signal the native shim holds a handler for. receive_signals
 // never dequeues one, so no tracer ever sees it.
-static bool signal_restart_decided_at_delivery(struct task *task, int sig, int code) {
-    if (sig == SIGTRAP_ && code == SI_PTRACE_INTERRUPT_)
-        return true;
+static bool signal_restart_decided_at_delivery(struct task *task, int sig) {
     return signal_stops_for_tracer(task, sig);
 }
 
@@ -760,8 +800,7 @@ bool signal_stops_for_tracer(struct task *task, int sig) {
     return task->ptrace.traced && sig != SIGKILL_ && sig != task->ptrace.deliver_sig;
 }
 
-static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, int code,
-        bool interrupted_wait) {
+static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {
     if (!interrupted_wait)
         return;
     // A job-control stop is not an interruption. Linux parks the task inside
@@ -769,8 +808,8 @@ static void signal_note_interrupted(struct task *task, struct sighand *sighand, 
     // to the guest -- and because no handler runs, that holds even for the
     // interfaces SA_RESTART cannot rescue (poll, select, epoll_wait). Only a
     // handler actually running can turn a wait into a guest-visible EINTR.
-    // Until it is delivered, the same goes for PTRACE_INTERRUPT's trap and for
-    // any signal a tracer sees first: see signal_restart_decided_at_delivery.
+    // Until it is delivered, the same goes for any signal a tracer sees first:
+    // see signal_restart_decided_at_delivery.
     //
     // sighand->action is not the truth for a signal the native shim is holding
     // a handler for -- what sits there is the SIG_DFL placeholder
@@ -781,7 +820,7 @@ static void signal_note_interrupted(struct task *task, struct sighand *sighand, 
     bool held = sigset_has(__atomic_load_n(&task->native_held, __ATOMIC_ACQUIRE), sig);
     int action = held ? SIGNAL_CALL_HANDLER : signal_action(sighand, sig);
     bool stops = !held && (action == SIGNAL_STOP ||
-        signal_restart_decided_at_delivery(task, sig, code));
+        signal_restart_decided_at_delivery(task, sig));
     bool restart = held
         ? sigset_has(__atomic_load_n(&task->native_restart, __ATOMIC_ACQUIRE), sig)
         : (stops || (action == SIGNAL_CALL_HANDLER &&
@@ -828,7 +867,7 @@ static void deliver_signal_unlocked_locked(struct task *task, struct sighand *si
         return;
 
     bool interrupted_wait = signal_wake_task(task, sighand, sig);
-    signal_note_interrupted(task, sighand, sig, info.code, interrupted_wait);
+    signal_note_interrupted(task, sighand, sig, interrupted_wait);
 }
 
 // Deliver a process-directed signal into the thread group's shared queue
@@ -910,7 +949,7 @@ static void deliver_signal_to_group_locked(struct sighand *sighand, int sig, str
                 signal_is_blockable(sig) && !signal_is_synchronous_trap(sig))
             continue;
         bool interrupted_wait = signal_wake_task(task, sighand, sig);
-        signal_note_interrupted(task, sighand, sig, info.code, interrupted_wait);
+        signal_note_interrupted(task, sighand, sig, interrupted_wait);
     }
 }
 
@@ -1028,39 +1067,6 @@ static bool signal_list_still_has_locked(struct list *queue, int sig) {
 
 static bool signal_still_pending_locked(struct task *task, int sig) {
     return signal_list_still_has_locked(&task->queue, sig);
-}
-
-// Take back the SIGTRAPs PTRACE_INTERRUPT queued and the tracee never consumed.
-//
-// Called from the detach paths only -- explicit PTRACE_DETACH, and the
-// tracer-death sweep in kernel/exit.c. A ptrace-interrupt trap is a stop
-// request, not a signal the program is entitled to see, so it must not outlive
-// the tracing relationship that created it: unconsumed, it is delivered to a
-// now-untraced process, and SIGTRAP's default action is to terminate. Linux
-// never has one to discard (its interrupt is JOBCTL_TRAP_STOP, a flag), so this
-// is the AOK-specific half of __ptrace_unlink's task_clear_jobctl_pending.
-//
-// Identified by si_code rather than counted. A count kept alongside the send
-// would over-count whenever send_signal drops the signal instead of queueing it
-// -- SIGTRAP set to SIG_IGN, a task already exiting -- and an over-count eats
-// the next SIGTRAP the guest raises for itself. The tag cannot be wrong in
-// either direction: it is on exactly the traps this mechanism queued.
-void ptrace_discard_interrupt_traps(struct task *task) {
-    struct sighand *sighand = task->sighand;
-    if (sighand == NULL)
-        return;
-    lock(&sighand->lock, 0);
-    struct sigqueue *sigqueue, *tmp;
-    list_for_each_entry_safe(&task->queue, sigqueue, tmp, queue) {
-        if (sigqueue->info.sig != SIGTRAP_ ||
-                sigqueue->info.code != SI_PTRACE_INTERRUPT_)
-            continue;
-        list_remove(&sigqueue->queue);
-        free(sigqueue);
-    }
-    if (!signal_still_pending_locked(task, SIGTRAP_))
-        sigset_del(&task->pending, SIGTRAP_);
-    unlock(&sighand->lock);
 }
 
 // Scans both `task`'s own (thread-directed) queue and, if present, its
@@ -1702,10 +1708,14 @@ bool signal_should_restart_syscall_nohand(void) {
     //
     // A signal whose delivery decides (signal_restart_decided_at_delivery)
     // restarts too, like a stop; if a handler does run before the call
-    // re-executes, receive_signal cancels the restart.
-    bool stops = best != NULL && !signal_native_held(best->info.sig) &&
-        (signal_action(sighand, best->info.sig) == SIGNAL_STOP ||
-         signal_restart_decided_at_delivery(current, best->info.sig, best->info.code));
+    // re-executes, receive_signal cancels the restart. With no signal to
+    // deliver, what ended the wait may be a PTRACE_EVENT_STOP the task owes its
+    // tracer, and that stop runs no handler either.
+    bool stops = best != NULL ?
+        !signal_native_held(best->info.sig) &&
+            (signal_action(sighand, best->info.sig) == SIGNAL_STOP ||
+             signal_restart_decided_at_delivery(current, best->info.sig)) :
+        task_trap_stop_pending(current);
     unlock(&sighand->lock);
     return stops;
 }
@@ -1731,7 +1741,11 @@ bool signal_should_restart_syscall(void) {
     struct sigqueue *best = signal_next_deliverable_locked(sighand);
     if (best == NULL) {
         unlock(&sighand->lock);
-        return false;
+        // A PTRACE_EVENT_STOP the task owes its tracer ends a wait without any
+        // signal, and restarts the call like a stop does: no handler runs.
+        // Linux's read() interrupted by PTRACE_INTERRUPT returns the data that
+        // arrives after PTRACE_CONT; this returned EINTR.
+        return task_trap_stop_pending(current);
     }
     int sig = best->info.sig;
     // A native program's handler, which the kernel is only holding a
@@ -1740,10 +1754,10 @@ bool signal_should_restart_syscall(void) {
         unlock(&sighand->lock);
         return signal_native_restarts(sig);
     }
-    // PTRACE_INTERRUPT's trap, or a signal a tracer will see before anything
-    // is delivered: restart, and let receive_signal cancel it if a handler
-    // without SA_RESTART runs first. See signal_restart_decided_at_delivery.
-    if (signal_restart_decided_at_delivery(current, sig, best->info.code)) {
+    // A signal a tracer will see before anything is delivered: restart, and
+    // let receive_signal cancel it if a handler without SA_RESTART runs first.
+    // See signal_restart_decided_at_delivery.
+    if (signal_restart_decided_at_delivery(current, sig)) {
         unlock(&sighand->lock);
         return true;
     }

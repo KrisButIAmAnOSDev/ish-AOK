@@ -75,15 +75,6 @@ struct sigaction_ {
 #define SI_TKILL_ -6
 #define SI_KERNEL_ 128
 
-// Internal, never reported to a guest: the si_code AOK stamps on the SIGTRAP
-// that PTRACE_INTERRUPT queues, so the detach path can tell that trap apart
-// from one the program raised for itself and discard only its own. Chosen
-// outside the range any guest-reachable path produces -- kill/tkill give
-// SI_USER/SI_TKILL, sigqueue gives SI_QUEUE, and a real trap gives TRAP_BRKPT
-// or TRAP_TRACE -- so no guest signal can ever be mistaken for one of these.
-// See kernel/ptrace.c's PTRACE_INTERRUPT and ptrace_discard_interrupt_traps.
-#define SI_PTRACE_INTERRUPT_ 0x1507
-
 // SIGCHLD si_code values (CLD_*). Linux reports these to a SA_SIGINFO SIGCHLD
 // handler and to waitid(2), with si_status carrying the *bare* exit code or
 // signal number (not the wait(2)-encoded status word).
@@ -218,15 +209,16 @@ void deliver_signal(struct task *task, int sig, struct siginfo_ info);
 // PARENT's pthread, copied by task_create_. The task takes the signal before
 // its first instruction only if its start path looks for one (task_thread).
 void signal_queue_before_start(struct task *task, int sig, struct siginfo_ info);
-// Discard the unconsumed SIGTRAPs that PTRACE_INTERRUPT queued to this task,
-// identified by SI_PTRACE_INTERRUPT_. Called on detach: see the definition in
-// signal.c for why an interrupt trap must not outlive the tracing relationship.
-void ptrace_discard_interrupt_traps(struct task *task);
 // true when the next unblocked pending signal would run a handler with SA_RESTART
 bool signal_should_restart_syscall(void);
 // Wake a task out of whatever it is blocked in, with no signal involved --
 // kernel/checkpoint.c's freezer. See the definition.
 void task_wake_for_freeze(struct task *task);
+// The same, for a task that now owes its tracer a PTRACE_EVENT_STOP
+// (ptrace.trap_stop, kernel/task.h). The caller holds a reference on `task` and
+// on `sighand`, which is `task`'s, and no lock. See the definition.
+struct sighand;
+void task_wake_for_ptrace_trap(struct task *task, struct sighand *sighand);
 bool signal_should_restart_syscall_nohand(void);
 
 // Turn a wait's _EINTR into _ERESTART when the handler that interrupted it was
@@ -293,6 +285,12 @@ void group_stop_wait(void);
 // syscall checkpoint. Delivery decisions keep using ->blocked directly.
 #define task_wake_blocked(task) ((task)->blocked & ~(task)->native_held)
 
+// Whether `task` owes its tracer a PTRACE_EVENT_STOP (ptrace.trap_stop in
+// kernel/task.h). It is not a signal and nothing blocks it, so every wait that
+// ends for a deliverable signal has to end for it as well, and a syscall it cut
+// short restarts: the stop runs no handler.
+#define task_trap_stop_pending(task) __atomic_load_n(&(task)->ptrace.trap_stop, __ATOMIC_ACQUIRE)
+
 // Replace the blocked mask outright, the way SIG_SETMASK does, for code acting
 // on a task's behalf with no guest syscall to carry the set: native_spawn_opts
 // gives a spawned child the mask a forked child would have restored for itself.
@@ -350,8 +348,8 @@ void sighand_release(struct sighand *sighand);
 int signal_action(struct sighand *sighand, int sig);
 // Whether receive_signals will stop for task's tracer before `sig` is
 // delivered, which makes signal_action's answer a guess: the tracer may deliver
-// it, suppress it, or deliver something else. PTRACE_INTERRUPT's trap is always
-// such a signal while the task is traced.
+// it, suppress it, or deliver something else. (PTRACE_INTERRUPT is no signal at
+// all: see ptrace.trap_stop and task_trap_stop_pending.)
 bool signal_stops_for_tracer(struct task *task, int sig);
 void deliver_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info);
 struct tgroup;

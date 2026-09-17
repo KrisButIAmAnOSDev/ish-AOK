@@ -21,7 +21,7 @@
 //
 // interrupt_lands_on_syscall_stop
 //   A PTRACE_INTERRUPT that reaches a tracee on its way into another stop is
-//   answered by that stop. AOK's interrupt is a queued SIGTRAP, which the other
+//   answered by that stop. AOK's interrupt was a queued SIGTRAP, which the other
 //   stop left behind: that stop read 0x80857f instead of 0x857f, and the
 //   SIGTRAP then arrived as a second, plain SIGTRAP stop (0x57f), which a
 //   tracer re-injects. strace -f killed the program it started with SIGTRAP in

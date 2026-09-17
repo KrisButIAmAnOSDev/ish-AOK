@@ -9,11 +9,12 @@
 // -- and strace -p interrupts its target to detach from it. ptrace_eventmsg's
 // seize case retried its read on EINTR because of this.
 //
-// AOK's PTRACE_INTERRUPT queues the tracee a real SIGTRAP, because that is what
-// wakes it out of the wait (Linux sets JOBCTL_TRAP_STOP, a flag). The syscall
+// AOK's PTRACE_INTERRUPT queued the tracee a real SIGTRAP, because that is what
+// woke it out of the wait (Linux sets JOBCTL_TRAP_STOP, a flag). The syscall
 // then chose between EINTR and a restart by the pending signal's disposition,
 // and SIGTRAP's is terminate, so it chose EINTR, for a signal that is never
-// delivered at all.
+// delivered at all. The interrupt is now a flag too (ptrace.trap_stop, see
+// ptrace_seize_trap_stop), and the restart predicates answer for it directly.
 //
 // The same choice was wrong for every signal a tracer sees first. A tracer can
 // resume a signal-delivery-stop without the signal; then nothing is delivered

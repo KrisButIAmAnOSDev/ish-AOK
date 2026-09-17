@@ -201,6 +201,10 @@ void ptrace_signal_stop(int sig, struct siginfo_ *info);
 void ptrace_group_stop(void);
 void ptrace_syscall_stop(struct cpu_state *cpu);
 void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventmsg);
+// Take the PTRACE_EVENT_STOP the current task owes its tracer (ptrace.trap_stop),
+// if it owes one. Call where the task looks for signals, before taking any, with
+// no lock held.
+void ptrace_trap_stop_if_pending(void);
 void ptrace_attach_fork_child(struct task *child, struct task *tracee);
 
 #endif /* KERNEL_PTRACE_H */
