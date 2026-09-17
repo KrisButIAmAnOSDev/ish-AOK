@@ -15135,7 +15135,10 @@ static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewControll
     [super viewDidDisappear:animated];
     [_timer invalidate];
     _timer = nil;
-    UIDevice.currentDevice.batteryMonitoringEnabled = NO;
+    // Battery monitoring stays on. It is one process-wide switch, and the
+    // kernel turned it on at launch for /proc/ish/BAT0 and
+    // /sys/class/power_supply (kernel/BatteryStatus.m): turning it off here
+    // took the battery away from every guest as soon as this applet closed.
 }
 
 - (void)refreshInfo:(id)sender {
@@ -15341,7 +15344,10 @@ static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewControll
     [super viewDidDisappear:animated];
     [_timer invalidate];
     _timer = nil;
-    UIDevice.currentDevice.batteryMonitoringEnabled = NO;
+    // Battery monitoring stays on. It is one process-wide switch, and the
+    // kernel turned it on at launch for /proc/ish/BAT0 and
+    // /sys/class/power_supply (kernel/BatteryStatus.m): turning it off here
+    // took the battery away from every guest as soon as this applet closed.
 }
 
 - (UILabel *)monitorValueLabelWithMonospaced:(BOOL)monospaced {

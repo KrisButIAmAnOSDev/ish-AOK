@@ -8,6 +8,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <os/lock.h>
+#include <stdatomic.h>
 #include <string.h>
 #import "BatteryStatus.h"
 
@@ -24,6 +25,12 @@
 // again whenever iOS says something changed. A reader holds the lock only long
 // enough to copy the values out, and formats from its own copy.
 static os_unfair_lock host_status_lock = OS_UNFAIR_LOCK_INIT;
+
+// How old a reading may be before the next reader asks for a new one, and the
+// flag that keeps a burst of readers from queueing a refresh each.
+#define HOST_STATUS_MAX_AGE_SECONDS 2.0
+static double host_status_taken_at;
+static atomic_bool host_status_refresh_queued;
 
 // Big enough for any IANA name: the longest, America/Argentina/ComodRivadavia,
 // is 32 bytes.
@@ -85,6 +92,17 @@ static void host_status_refresh(void) {
         .level = device.batteryLevel,
         .low_power_mode = process.isLowPowerModeEnabled ? 1 : 0,
     };
+    // "Full" means plugged in and charged, so a level at the bottom of the
+    // scale with it is not a reading of anything. An iOS app on a Mac answered
+    // Full and 0.01 while the host sat at 80%, which reached the guest as a 1%
+    // battery: waybar drew it red and flashing. Nothing here can turn that into
+    // the real figure, so it counts as no reading, which the guest already
+    // understands -- an empty /sys/class/power_supply, as on a Linux machine
+    // with no battery.
+    if (battery.state == HOST_BATTERY_FULL && battery.level >= 0 && battery.level <= 0.05f) {
+        battery.state = HOST_BATTERY_UNKNOWN;
+        battery.level = -1;
+    }
     enum host_thermal_state thermal = host_thermal_state_from(process.thermalState);
 
     // Copied out of the NSString here, on the thread that owns it, so the
@@ -98,7 +116,31 @@ static void host_status_refresh(void) {
     host_status.battery = battery;
     host_status.thermal = thermal;
     memcpy(host_status.zone_name, zone_name, sizeof(zone_name));
+    host_status_taken_at = CFAbsoluteTimeGetCurrent();
     os_unfair_lock_unlock(&host_status_lock);
+    atomic_store(&host_status_refresh_queued, false);
+}
+
+// Asks for a new reading when the one held is older than the age above. The
+// caller is a guest thread, so this only queues the work: it returns at once
+// and the reading it just took stands.
+//
+// The notifications below are not enough on their own. UIDevice answers the
+// first read after batteryMonitoringEnabled is set before it has a real value,
+// and a host that posts no battery notifications -- an iOS app on a Mac posts
+// none -- would keep that first answer for the life of the process. A reader
+// asking again is what replaces it.
+static void host_status_refresh_if_stale(void) {
+    os_unfair_lock_lock(&host_status_lock);
+    double age = CFAbsoluteTimeGetCurrent() - host_status_taken_at;
+    os_unfair_lock_unlock(&host_status_lock);
+    if (age < HOST_STATUS_MAX_AGE_SECONDS)
+        return;
+    if (atomic_exchange(&host_status_refresh_queued, true))
+        return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        host_status_refresh();
+    });
 }
 
 void ISHHostStatusStart(void) {
@@ -114,6 +156,14 @@ void ISHHostStatusStart(void) {
     started = YES;
 
     host_status_refresh();
+    // Again once the battery has had a moment to answer: the reading above is
+    // taken immediately after batteryMonitoringEnabled was set, and UIDevice
+    // has nothing real to give yet (-1 on a device). A Mac answered "Full, 1%"
+    // there while the host sat at 80%, and nothing corrected it.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        host_status_refresh();
+    });
 
     // Every one of these re-reads everything: a reading is a handful of
     // property reads, and one path is easier to get right than six. Some are
@@ -144,12 +194,14 @@ void ISHHostStatusStart(void) {
 void hostBatteryStatus(struct host_battery_status *out) {
     if (out == NULL)
         return;
+    host_status_refresh_if_stale();
     os_unfair_lock_lock(&host_status_lock);
     *out = host_status.battery;
     os_unfair_lock_unlock(&host_status_lock);
 }
 
 enum host_thermal_state hostThermalState(void) {
+    host_status_refresh_if_stale();
     os_unfair_lock_lock(&host_status_lock);
     enum host_thermal_state thermal = host_status.thermal;
     os_unfair_lock_unlock(&host_status_lock);
