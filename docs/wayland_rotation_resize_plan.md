@@ -28,14 +28,44 @@ writing this plan:
    the rc.xml `windowRule identifier="*" → Maximize`) land at the new
    geometry immediately and perfectly.
 4. **wayvnc emits ExtendedDesktopSize rects** describing the screen layout
-   (parsed one: single screen id 0). Caveat: the rect that immediately
-   answers a SetDesktopSize can still carry the PRE-resize dimensions (the
-   apply is async), and a brand-new connection's ServerInit right after a
-   resize can lag one step behind. A client must treat the LAST
-   DesktopSize/EDS rect received as authoritative and re-request a full
-   update after any size change, and must not key success off the reply's
-   status field (wayvnc 0.10.1 returned a nonstandard status=4 while
-   demonstrably applying the resize).
+   (parsed one: single screen id 0). The rect that immediately answers a
+   SetDesktopSize has reason 1 and neatvnc's nonstandard status 4,
+   "forwarded", and carries the size that was ASKED FOR: the apply is async,
+   and the real size arrives later as a server-initiated rect (reason 0,
+   status 0). A brand-new connection's ServerInit right after a resize can
+   lag one step behind.
+
+   **Corrected 2026-09-17 after a wayvnc crash on Devuan 6.** The original
+   advice here was to treat every size rect as authoritative and to send a
+   non-incremental update request after any size change. With neatvnc 0.9.1
+   (Debian 13 / Devuan 6) that kills wayvnc with SIGSEGV, on AOK and on
+   native Linux alike. neatvnc 0.9.1 encodes pending damage against the
+   current buffer without clamping it (fixed in 0.9.2, "server: Clamp damage
+   to fb size"). A non-incremental request's region, and the size neatvnc
+   re-announces after one, outlive a buffer that shrinks under them, and the
+   raw encoder reads past its end. The client now ignores forwarded replies,
+   sends only incremental requests after the one at connect, and holds each
+   SetDesktopSize until the first frame has arrived and any earlier request
+   has been answered. See `DisplayRFBClient.m`.
+
+   That removes the crash the client caused, not the bug. Screen activity
+   queued while a frame is being encoded is damage too, and when a shrink
+   lands just then 0.9.1 still reads past the new frame. With a terminal
+   printing continuously it did so in 8 of 10 resize runs under AOK's
+   emulation, and on native Linux in 8 of 8 once the client took 300 ms per
+   frame (3 of them SIGSEGV). No client sequencing avoids it, so
+   `start-wayland.sh` runs wayvnc with `--disable-resizing` when
+   `wayvnc -V` reports neatvnc older than 0.9.2. Those roots keep the
+   default desktop, scaled to fit.
+
+   A second neatvnc bug governs WHEN a SetDesktopSize may be sent, in the
+   0.9.1 and 1.0.0 source alike. The answer is written in four pieces, and a
+   frame that finishes sending in between gets the server's next message (a
+   cursor update) written into the middle of it. Recorded with wayvnc 0.10.0 after a request
+   sent mid-way through a 2560x1440 frame: the client read a 65535x65297 rect
+   and dropped the connection. The client now sends the size only after an
+   update has been read and before it is acknowledged, and never acknowledges
+   an update that is only such an answer, so no frame can be on its way.
 
 ## Design — entirely app-side
 
@@ -56,9 +86,9 @@ writing this plan:
   tracked screen layout (fallback: single screen id 0, flags 0).
 - Transition robustness: after sending a resize request, tolerate rects
   that exceed current bounds (drop/clip) instead of the current
-  fail-the-connection behavior, until the confirming size rect arrives;
-  then issue a non-incremental FramebufferUpdateRequest for a clean
-  repaint.
+  fail-the-connection behavior, until the confirming size rect arrives.
+  No non-incremental request afterwards (see the correction in 4 above):
+  neatvnc damages the whole new desktop itself when it announces a size.
 
 ### DisplayViewController.m (small)
 
@@ -71,7 +101,10 @@ writing this plan:
   even dimensions — requested on connect and after each resize settles
   (0.4 s), once per size per connection. See DisplayDesktopSizeForViewSize.
 
-### No changes: start-wayland.sh, setup-wayland.sh, guest packages, emulator core.
+### No changes: setup-wayland.sh, guest packages, emulator core.
+
+(start-wayland.sh did get one, later: `--disable-resizing` for neatvnc before
+0.9.2, see the correction in 4.)
 
 ## Fallback behavior
 
@@ -85,7 +118,9 @@ exactly today's stretch behavior. Strictly additive.
   (wrong handling = crash or garbled frame on rotate). Mitigation above.
 - JIT-slow reflow transient of already-open windows (~1–2s of stale layout
   after rotate) — cosmetic, self-resolving.
-- wayvnc's nonstandard status code — by design we never read it.
+- wayvnc's nonstandard status code. Originally never read; since the
+  Devuan 6 crash (4 above), a reply with status 4 is read as "forwarded, not
+  applied yet".
 
 ## Verification plan
 

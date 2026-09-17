@@ -90,9 +90,13 @@ NS_ASSUME_NONNULL_BEGIN
 // (see docs/wayland_rotation_resize_plan.md): the labwc output really
 // changes mode, maximized windows reflow, and the new size arrives back as
 // a DesktopSize/ExtendedDesktopSize rect, which this client applies to its
-// framebuffer. Purely advisory: a server that doesn't support it (or
-// refuses) simply never sends a size rect and nothing changes. No-op when
-// the requested size already matches, or before the connection is up.
+// framebuffer. Purely advisory: when a server doesn't support it, or
+// refuses, the framebuffer keeps its size. Not always
+// sent at once: the client holds it until the first frame has arrived, any
+// earlier request has been answered and no frame is on its way. Sooner crashes
+// the wayvnc that Debian 13 and Devuan 6 ship, or garbles the stream (seen
+// with wayvnc 0.10.0). Only the latest size asked for is kept, and after a
+// "prohibited" answer none are sent.
 - (void)requestDesktopSizeWidth:(uint16_t)width height:(uint16_t)height;
 
 @end

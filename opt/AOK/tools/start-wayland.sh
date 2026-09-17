@@ -51,7 +51,9 @@
 # applet's native RFB client (DisplayRFBClient/DisplayRFBView) connects, it asks
 # for a desktop the size of the surface showing it, and again whenever that
 # surface is resized (RFB SetDesktopSize, which wayvnc forwards to the headless
-# output). A server that refuses keeps 1280x720, scaled to fit.
+# output). A server that refuses keeps 1280x720, scaled to fit. This script
+# makes wayvnc refuse when its neatvnc is older than 0.9.2, which crashes when
+# the desktop shrinks under a connected client (see the wayvnc launch below).
 #
 # First-run only, a labwc setup gets seeded under $HOME/.config/labwc/ and
 # $HOME/.local/share/themes/ (see below): a right-click root menu (New
@@ -626,11 +628,36 @@ wayvnc_is_listening() {
         && awk -v port="$hex_port" '$2 ~ (":" port "$") && $4 == "0A" { found=1 } END { exit !found }' /proc/net/tcp 2>/dev/null
 }
 
+# Desktop resizing is switched off for neatvnc before 0.9.2, which is what
+# Debian 13 and Devuan 6 ship (0.9.1). It encodes a client's pending damage
+# against the current frame without clamping it to that frame's size (fixed
+# upstream in 0.9.2, "server: Clamp damage to fb size"). When the desktop
+# shrinks while anything on it is still changing, damage recorded against the
+# old, bigger frame gets encoded against the new one, the raw encoder reads
+# past the end of it, and wayvnc dies with SIGSEGV. No sequencing on the
+# client's side prevents that: it reproduced on native Linux with the same
+# packages. --disable-resizing makes wayvnc refuse SetDesktopSize, so the
+# applet keeps the default desktop, scaled to fit, as it did before resizing
+# existed. A version that cannot be read keeps resizing.
+neatvnc_lacks_damage_clamp() {
+    printf '%s\n' "$1" | awk -F. '
+        $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+/ { exit 1 }
+        { exit !($1 + 0 == 0 && ($2 + 0 < 9 || ($2 + 0 == 9 && $3 + 0 < 2))) }'
+}
+WAYVNC_RESIZE_ARG=""
+NEATVNC_VERSION="$(wayvnc -V 2>/dev/null | awk -F': *' '$1 == "neatvnc" { print $2; exit }')"
+if neatvnc_lacks_damage_clamp "$NEATVNC_VERSION" \
+        && wayvnc --help 2>&1 | grep -q -- '--disable-resizing'; then
+    WAYVNC_RESIZE_ARG="--disable-resizing"
+    log "neatvnc $NEATVNC_VERSION is older than 0.9.2: desktop resizing is off"
+fi
+
 hex_port=$(printf '%04X' "$WAYVNC_PORT")
 wayvnc_attempt=1
 while true; do
     log "starting wayvnc on :$WAYVNC_PORT (attempt $wayvnc_attempt)"
-    spawn_logged "wayvnc-attempt$wayvnc_attempt" wayvnc 127.0.0.1 "$WAYVNC_PORT"
+    # $WAYVNC_RESIZE_ARG is empty or one word, so it is left unquoted.
+    spawn_logged "wayvnc-attempt$wayvnc_attempt" wayvnc $WAYVNC_RESIZE_ARG 127.0.0.1 "$WAYVNC_PORT"
     WAYVNC_PID=$SPAWN_PID
 
     # Confirm wayvnc is both still alive AND actually bound/listening before
