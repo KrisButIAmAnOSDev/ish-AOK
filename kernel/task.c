@@ -387,16 +387,9 @@ uint64_t guest_uptime_ns(void) {
 }
 
 uint64_t guest_uptime_ticks(void) {
-    uint64_t ticks = guest_uptime_ns() / NSEC_PER_TICK;
-    // Whole tenths of a second, and only because of the one reader that formats
-    // this value: fs/proc/root.c prints /proc/uptime as "%lu.%lu" of ticks / 100
-    // and ticks % 100, so 12.05 s would print as "12.5" -- later than the
-    // "12.10" read after it. A tenth always has a zero in the second place
-    // ("12.10", "12.20"; "12.0" as before), so every tenth prints correctly
-    // through that format. Once it is Linux's "%lu.%02lu", drop this rounding
-    // and /proc/uptime, btime and process start times all get Linux's 100 Hz;
-    // nothing else here needs to change.
-    return ticks - ticks % 10;
+    // USER_HZ ticks, Linux's 100 Hz. (It was rounded to tenths while
+    // /proc/uptime printed its hundredths without zero-padding.)
+    return guest_uptime_ns() / NSEC_PER_TICK;
 }
 
 // ---- the guest's load average ---------------------------------------------

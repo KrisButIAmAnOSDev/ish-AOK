@@ -549,11 +549,15 @@ DirectMap1G:           0 kB
     return 0;
 }
 
+// Linux's "%lu.%02lu %lu.%02lu": uptime, then the idle time summed over every
+// CPU, which is why the second can exceed the first. Both in hundredths, from
+// ticks at USER_HZ. It printed "%lu.%lu" -- 12.05 s as "12.5", later than the
+// 12.10 read after it -- and the uptime a second time where the idle time goes.
 static int proc_show_uptime(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    struct uptime_info uptime_info = get_uptime();
-    unsigned long uptime = uptime_info.uptime_ticks;
-    
-    proc_printf(buf, "%lu.%lu %lu.%lu\n", uptime / 100, uptime % 100, uptime / 100, uptime % 100);
+    unsigned long uptime = (unsigned long) get_uptime().uptime_ticks;
+    // The same ledger as /proc/stat's "cpu" line, so the two agree.
+    unsigned long idle = (unsigned long) get_total_cpu_usage().idle_ticks;
+    proc_printf(buf, "%lu.%02lu %lu.%02lu\n", uptime / 100, uptime % 100, idle / 100, idle % 100);
     return 0;
 }
 static int proc_show_vmstat(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1047,6 +1051,16 @@ static int proc_root_pid_compare(const void *lhs, const void *rhs) {
     return (a > b) - (a < b);
 }
 
+// Whether /proc lists this task: processes only, as Linux does, which walks
+// thread-group leaders. A thread's /proc/<tid> still opens by name, and
+// /proc/<pid>/task lists every thread. Listing every task made ps, pgrep and
+// top show each thread of a program as another process (waybar: 13 rows for
+// one). A leader that exited before its other threads stays linked, so its
+// process is still listed, as on Linux.
+static bool proc_root_lists_task(struct task *task) {
+    return task != NULL && task->group != NULL && task->group->leader == task;
+}
+
 static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     if (entry->child_names != NULL) {
         free_string_array(entry->child_names);
@@ -1060,7 +1074,7 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
         // Zombies are listed too: an unreaped process still exists, still owns
         // its pid, and ps must be able to show it.
-        if (pid_entry->task == NULL)
+        if (!proc_root_lists_task(pid_entry->task))
             continue;
         used++;
     }
@@ -1083,7 +1097,7 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
         pids[filled++] = (dword_t) pid_kthread_at(k);
     complex_lockt(&pids_lock, 0);
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        if (pid_entry->task == NULL)
+        if (!proc_root_lists_task(pid_entry->task))
             continue;
         if (filled >= used)
             break;

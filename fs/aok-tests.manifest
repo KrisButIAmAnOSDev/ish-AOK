@@ -131,6 +131,7 @@ fifo_open_creat_deadlock.c
 proc_stat_monotonic.c
 proc_uptime_clock.c
 proc_loadavg_rises.c
+proc_readdir_tgid.c
 proc_field_layout.c
 sock_conn_error.c
 sock_getfd_errno.c

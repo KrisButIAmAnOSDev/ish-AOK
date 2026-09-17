@@ -16,10 +16,17 @@
  *     of the wall clock, which is what "the machine booted at btime" means;
  *   - sysinfo(2)'s uptime is whole seconds rounded UP (Linux's do_sysinfo adds
  *     one for any fraction), so it is never below /proc/uptime read just
- *     before it, and never more than a second above a reading just after.
+ *     before it, and never more than a second above a reading just after;
+ *   - the line is "%lu.%02lu %lu.%02lu": both fields have two digits of
+ *     hundredths, and the second is the idle time summed over every CPU, not
+ *     a copy of the first. AOK printed "%lu.%lu" (12.05 s as "12.5") with the
+ *     uptime twice, and rounded uptime to tenths so that format read right;
+ *   - resolution is finer than tenths: a 1.2 s poll with enough reads sees more
+ *     values than whole tenths allow (Linux: about 120).
  */
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +66,25 @@ static int read_uptime(double *up, char *raw, size_t raw_size) {
     return end == buf ? -1 : 0;
 }
 
+// "N.NN N.NN\n", Linux's exact shape.
+static int uptime_line_is_linux_shaped(const char *raw) {
+    const char *p = raw;
+    for (int field = 0; field < 2; field++) {
+        if (!isdigit((unsigned char) *p))
+            return 0;
+        while (isdigit((unsigned char) *p))
+            p++;
+        if (*p++ != '.')
+            return 0;
+        if (!isdigit((unsigned char) p[0]) || !isdigit((unsigned char) p[1]))
+            return 0;
+        p += 2;
+        if (field == 0 && *p++ != ' ')
+            return 0;
+    }
+    return *p == '\0';
+}
+
 static long read_btime(void) {
     FILE *f = fopen("/proc/stat", "r");
     if (f == NULL)
@@ -79,8 +105,8 @@ int main(int argc, char **argv) {
     test_init(argc, argv);
 
     char raw[128], prev_raw[128] = "";
-    double prev = -1;
-    int distinct = 0, reads = 0, backward = 0;
+    double prev = -1, prev_idle = -1;
+    int distinct = 0, reads = 0, backward = 0, misshapen = 0, idle_is_uptime = 0, idle_backward = 0;
     double start = now_monotonic();
     while (now_monotonic() - start < 1.2) {
         double up;
@@ -89,6 +115,21 @@ int main(int argc, char **argv) {
             break;
         }
         reads++;
+        if (!uptime_line_is_linux_shaped(raw)) {
+            misshapen++;
+            test_log_if(misshapen <= 3, "  not \"%%lu.%%02lu %%lu.%%02lu\": \"%s\"\n", raw);
+        }
+        const char *space = strchr(raw, ' ');
+        double idle = space != NULL ? strtod(space + 1, NULL) : -1;
+        if (space != NULL && strncmp(raw, space + 1, (size_t) (space - raw)) == 0 &&
+                strlen(space + 1) == (size_t) (space - raw))
+            idle_is_uptime++;
+        if (prev_idle >= 0 && idle >= 0 && idle < prev_idle) {
+            idle_backward++;
+            test_log_if(idle_backward <= 3, "  idle went backward: \"%s\" -> \"%s\"\n", prev_raw, raw);
+        }
+        if (idle >= 0)
+            prev_idle = idle;
         if (up != prev)
             distinct++;
         if (prev >= 0 && up < prev) {
@@ -106,6 +147,18 @@ int main(int argc, char **argv) {
     // Whole-second resolution gives at most 2 or 3 values in 1.2s.
     if (reads >= 20 && distinct < 5)
         failf("/proc/uptime has sub-second resolution", (uint64_t) distinct, 0, 0, 5, 0, 0);
+    // Whole tenths give at most 13 in 1.2s; hundredths give up to 120.
+    if (reads >= 120 && distinct <= 15)
+        failf("/proc/uptime resolves hundredths, not tenths", (uint64_t) distinct, 0, 0, 16, 0, 0);
+    if (misshapen != 0)
+        failf("/proc/uptime is \"%lu.%02lu %lu.%02lu\"", (uint64_t) misshapen, 0, 0, 0, 0, 0);
+    // The polling above keeps this process busy, so idle cannot track uptime
+    // exactly in every one of these reads unless it is a copy of it.
+    if (reads >= 20 && idle_is_uptime == reads)
+        failf("/proc/uptime's second field is idle time, not uptime again",
+              (uint64_t) idle_is_uptime, 0, 0, 0, 0, 0);
+    if (idle_backward != 0)
+        failf("/proc/uptime's idle time never goes backward", (uint64_t) idle_backward, 0, 0, 0, 0, 0);
 
     // btime: stable, and consistent with the wall clock minus uptime.
     long btime0 = read_btime();

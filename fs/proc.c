@@ -23,6 +23,30 @@ static void proc_prepare_child_entry(struct proc_entry *parent, unsigned long in
     child->parent = parent->meta;
 }
 
+// /proc/<n> for any live task, thread or process, as Linux's proc_pid_lookup
+// resolves it. The /proc listing names processes only (fs/proc/root.c), so a
+// thread's directory can't be found by walking it. Zombies resolve too, as
+// they are listed. Kernel threads have no task, and are left to the walk.
+static bool proc_lookup_task_dir(const char *component, struct proc_entry *next_entry) {
+    if (component[0] < '1' || component[0] > '9')
+        return false;
+    unsigned long id = 0;
+    for (const char *c = component; *c != '\0'; c++) {
+        if (*c < '0' || *c > '9' || id > MAX_PID)
+            return false;
+        id = id * 10 + (unsigned long) (*c - '0');
+    }
+    if (id > MAX_PID)
+        return false;
+    complex_lockt(&pids_lock, 0);
+    bool exists = pid_get_task_zombie((dword_t) id) != NULL;
+    unlock(&pids_lock);
+    if (!exists)
+        return false;
+    *next_entry = (struct proc_entry) {&proc_pid, .pid = (pid_t_) id};
+    return true;
+}
+
 static int proc_lookup(const char *path, struct proc_entry *entry) {
     entry->meta = &proc_root;
     char component[MAX_NAME + 1];
@@ -36,6 +60,10 @@ static int proc_lookup(const char *path, struct proc_entry *entry) {
         unsigned long index = 0;
         struct proc_entry next_entry = {0};
         char entry_name[MAX_NAME];
+        if (entry->meta == &proc_root && proc_lookup_task_dir(component, &next_entry)) {
+            proc_prepare_child_entry(entry, 0, &next_entry);
+            goto found;
+        }
         while (proc_dir_read(entry, &index, &next_entry)) {
             proc_prepare_child_entry(entry, index, &next_entry);
 
