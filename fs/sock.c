@@ -4177,6 +4177,13 @@ static uint32_t str_hash(const char *str) {
 // The abstract socket namespace is a lot simpler than it sounds: if the first
 // byte of the path is a null byte, then it gets looked up in this hashtable
 // instead of the filesystem.
+//
+// An entry belongs to the socket bound to it and to nothing else, as a name in
+// Linux's unix_socket_table does: `refcount` counts binders, which is at most
+// one (a second bind is EADDRINUSE), and the entry goes when that socket's last
+// descriptor closes (sock_close -> release_unix_names). An accepted socket
+// copies the name for getsockname() but holds no reference, and neither does a
+// connect(), sendto() or sendmsg() that merely looks the name up.
 
 struct unix_abstract {
     unsigned refcount;
@@ -4210,7 +4217,9 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
 
     if (bind_fd != NULL && sock != NULL) {
         unlock(&unix_abstract_lock);
-        return _EEXIST;
+        // Linux's unix_bind_abstract answers a name in use with EADDRINUSE.
+        // This said EEXIST, which no caller checks for.
+        return _EADDRINUSE;
     }
     if (bind_fd == NULL && sock == NULL) {
         unlock(&unix_abstract_lock);
@@ -4236,11 +4245,18 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
         list_add(bucket, &sock->links);
     }
 
-    sock->refcount++;
-    unlock(&unix_abstract_lock);
+    // Only a bind holds the name. A lookup took a reference too, and nothing
+    // ever dropped it, so the first connect() pinned the name for the life of
+    // the process: close the listener, bind the name again, EEXIST -- a
+    // session bus or compositor could never restart on its address. The id is
+    // read under the lock, since without a reference the entry may be freed
+    // the moment it is dropped.
     *socket_id = sock->socket_id;
-    if (bind_fd != NULL)
+    if (bind_fd != NULL) {
+        sock->refcount++;
         bind_fd->socket.unix_name_abstract = sock;
+    }
+    unlock(&unix_abstract_lock);
     return 0;
 }
 
@@ -4346,6 +4362,14 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
                     STRACE(" unix abstract fallback to path %s", path + 1);
                     err = unix_socket_get(path + 1, bind_fd, &socket_id);
                 }
+                // An abstract name nobody holds is refused, never missing:
+                // unix_find_abstract() is ECONNREFUSED for connect, sendto and
+                // sendmsg alike. connect() already mapped it; the sends
+                // reported ENOENT, which only went unseen while every name
+                // that had ever been used was leaked (above) and so never
+                // looked unbound.
+                if (err == _ENOENT && bind_fd == NULL)
+                    err = _ECONNREFUSED;
             }
             if (err < 0)
                 return err;
