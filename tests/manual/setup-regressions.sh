@@ -640,7 +640,13 @@ cache_init() {
 
 # Echo the cache path for a test, or nothing when caching is off.
 cache_path_for() {
-    [ -n "$cache_dir" ] || return
+    # return 0, not a bare return: the caller runs this as `cached=$(...)`,
+    # and under set -e an assignment takes the substitution's status. A bare
+    # return passed on the failed test's 1 and ended the whole run, silently,
+    # right after "+ build <first test>" -- which is every unprivileged run
+    # after a root one, since the cache a root run creates is not theirs to
+    # write.
+    [ -n "$cache_dir" ] || return 0
     _h=$(sha256sum "$2" | cut -c1-32)
     echo "$cache_dir/$1.$cache_key_base.$_h"
 }
