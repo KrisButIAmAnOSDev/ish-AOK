@@ -140,6 +140,7 @@ int main(int argc, char **argv) {
     check(setsockopt(lfd2, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2)) == 0,
           "herd SO_RCVTIMEO set");
     pid_t kids[3];
+    int forked = 0;
     for (int i = 0; i < 3; i++) {
         kids[i] = fork();
         if (kids[i] == 0) {
@@ -147,15 +148,25 @@ int main(int argc, char **argv) {
             if (k >= 0) _exit(10);
             _exit(errno == EAGAIN ? 11 : 12);
         }
+        if (kids[i] > 0) forked++;
     }
+    check(forked == 3, "herd forked 3 accepters (%d)", forked);
     usleep(500000);
     int cfd2 = connect_to("/tmp/acc_rt2.sock");
     check(cfd2 >= 0, "herd connect (%s)", strerror(errno));
     int winners = 0, losers = 0, others = 0;
     for (int i = 0; i < 3; i++) {
-        int st;
-        waitpid(kids[i], &st, 0);
-        int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (kids[i] < 0) continue;
+        // Checked, and `st` initialised: an unchecked wait that fails leaves
+        // the PREVIOUS child's status in an uninitialised `st` and reports
+        // that verdict twice -- a phantom second winner, indistinguishable
+        // from the real one this check exists to catch.
+        int st = -1;
+        pid_t r;
+        do { r = waitpid(kids[i], &st, 0); } while (r < 0 && errno == EINTR);
+        check(r == kids[i], "herd wait for child %d (ret=%d %s)",
+              i, (int) r, strerror(errno));
+        int code = (r == kids[i] && WIFEXITED(st)) ? WEXITSTATUS(st) : -1;
         if (code == 10) winners++;
         else if (code == 11) losers++;
         else others++;

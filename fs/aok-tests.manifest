@@ -240,6 +240,7 @@ oom_score_adj.c
 sysv_ipc.c
 shm_rmid_attach.c
 accept_rcvtimeo.c
+accept_herd_single_winner.c
 accept_kill.c
 socket_kill.c
 inaddr_any_iface.c
