@@ -3839,7 +3839,9 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
     // generic_mknodat's flags: the final component is not followed -- a
     // dangling symlink there is a name in use, not a place to create the
     // socket -- a name that exists is EADDRINUSE before permission is asked,
-    // and otherwise the parent must be writable and searchable. Only lookups
+    // "name/" asks for a directory and a socket is not one (N_SLASH_NOT_A_DIR,
+    // which used to be a copy of the rule right here), and otherwise the
+    // parent must be writable and searchable. Only lookups
     // were checked: bind followed the final symlink and asked nothing of the
     // parent, so an unprivileged guest bound sockets in root's directories --
     // /usr/lib, or a /tmp/.X11-unix a root session had left 0755, where a
@@ -3847,7 +3849,7 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
     // needs search on the way and write on the socket (below). Measured on
     // Linux 6.12 by tests/manual/unix_bind_dir_perms.c.
     int flags = bind_fd != NULL
-        ? N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST
+        ? N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR
         : N_SYMLINK_FOLLOW;
     int err = path_normalize(AT_PWD, path_raw, path, flags);
     if (err < 0)
@@ -3866,13 +3868,6 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
         // If the file exists, fail.
         if (err == 0) {
             err = _EADDRINUSE;
-            goto out;
-        }
-        // "name/" asks for a directory, and a socket is not one:
-        // filename_create() answers ENOENT for any other kind of node.
-        size_t raw_len = strlen(path_raw);
-        if (raw_len > 1 && path_raw[raw_len - 1] == '/') {
-            err = _ENOENT;
             goto out;
         }
         if (mount_flags & MS_READONLY_) {

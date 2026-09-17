@@ -66,6 +66,23 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
         if (n == 0)
             return _ENAMETOOLONG;
 
+        // N_SLASH_EISDIR: open(O_CREAT) on a name spelled with a trailing
+        // slash. Linux answers EISDIR from open_last_lookups() --
+        // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR)`
+        // -- which sits after the parent walk and BEFORE the final lookup, so
+        // it does not matter whether the name exists, what kind of thing it
+        // is, or whether the parent may be written. This is that spot: the
+        // components before this one have already been resolved and checked,
+        // and nothing has looked at this one yet.
+        //
+        // It has to be here rather than in the caller because the checks that
+        // would otherwise run on the final component answer first and answer
+        // differently: `open("file/", O_CREAT|O_WRONLY)` collected ENOTDIR
+        // from the block below, and `open("dir/", O_CREAT|O_RDONLY)` simply
+        // succeeded.
+        if (*p == '\0' && *(p - 1) == '/' && (flags & N_SLASH_EISDIR))
+            return _EISDIR;
+
         if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
             // this buffer is used to store the path that we're readlinking, then
             // if it turns out to point to a symlink it's reused as the buffer
@@ -188,6 +205,22 @@ int path_final_dot(const char *path) {
     return 0;
 }
 
+// Does the already-normalized path `normalized` name something that exists?
+// An lstat (fs->stat is AT_SYMLINK_NOFOLLOW), so a dangling symlink counts as
+// a name that is there -- which is what a lookup of the final component
+// answers, and Linux decides EEXIST from exactly that.
+static bool path_target_exists(const char *normalized) {
+    char copy[MAX_PATH];       // find_mount_and_trim_path mutates its argument
+    strcpy(copy, normalized);
+    struct mount *mount = find_mount_and_trim_path(copy);
+    if (mount == NULL)
+        return false;
+    struct statbuf stat;
+    int err = mount->fs->stat(mount, copy, &stat);
+    mount_release(mount);
+    return err == 0;
+}
+
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     // A genuinely-NULL dirfd (distinct from the AT_PWD sentinel (struct fd *)-2)
     // reaches here when an *at syscall is handed a bad/closed dirfd. Linux
@@ -282,6 +315,35 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     if (err < 0)
         return err;
 
+    // N_SLASH_NOT_A_DIR: the caller creates a name that is not a directory,
+    // and the caller's name was spelled with a trailing slash, which asks for
+    // one. Linux's filename_create() suppresses LOOKUP_CREATE for such a name
+    // (`if (last.name[last.len] && !want_dir) create_flags = 0`) and then, on
+    // the negative dentry that comes back, answers ENOENT -- "you had / on
+    // the end, you've been asking for (non-existent) directory".
+    //
+    // The order matters as much as the errno. This sits after
+    // __path_normalize, so every error the parent walk can raise (a missing
+    // parent's ENOENT, a non-directory parent's ENOTDIR, an unsearchable
+    // one's EACCES) still answers first, exactly as filename_parentat()'s do.
+    // And it sits before N_PARENT_DIR_WRITE below, because Linux only asks
+    // may_create() for the parent's write permission afterwards, inside
+    // vfs_mknod/vfs_symlink/vfs_link -- so an unwritable parent reports this
+    // ENOENT, not EACCES.
+    //
+    // A name that DOES exist is left alone: the lookup gives a positive
+    // dentry and filename_create() answers EEXIST before ever reaching the
+    // trailing-slash test, whatever kind of thing is there -- file,
+    // directory, or dangling symlink. The caller's own existence check
+    // reports that, the same way N_CREATE_EEXIST_FIRST relies on.
+    //
+    // Without this, mknod("d/fifo/"), mkfifo, symlink and link all created
+    // the name WITHOUT the slash and reported success, so a guest could not
+    // tell a request for a directory from a request for a fifo.
+    if ((flags & N_SLASH_NOT_A_DIR) && path[strlen(path) - 1] == '/' &&
+            !path_target_exists(out))
+        return _ENOENT;
+
     if (flags & N_PARENT_DIR_WRITE) {
         // out is fully resolved and normalized here (begins with '/' or is
         // empty, no ".", "..", or unresolved symlinks in the final
@@ -348,18 +410,9 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
                 // a `set -e` script (tests/manual/setup-regressions.sh's cache
                 // store) killed the whole run with no diagnostic.
                 //
-                // fs->stat is an lstat (AT_SYMLINK_NOFOLLOW), so a dangling
-                // symlink still counts as a name that exists and is removable.
-                bool target_exists = false;
-                char out_copy[MAX_PATH];   // find_mount_and_trim_path mutates it
-                strcpy(out_copy, out);
-                struct mount *target_mount = find_mount_and_trim_path(out_copy);
-                if (target_mount != NULL) {
-                    struct statbuf target_stat;
-                    int target_err = target_mount->fs->stat(target_mount, out_copy, &target_stat);
-                    mount_release(target_mount);
-                    target_exists = target_err == 0;
-                }
+                // path_target_exists is an lstat, so a dangling symlink still
+                // counts as a name that exists and is removable.
+                bool target_exists = path_target_exists(out);
                 if ((flags & N_CREATE_EEXIST_FIRST) && target_exists)
                     return 0;           // caller's own check reports EEXIST
                 if ((flags & N_REMOVE_ENOENT_FIRST) && !target_exists)

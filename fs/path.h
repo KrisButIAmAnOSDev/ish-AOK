@@ -47,6 +47,20 @@
 // must not use this flag and instead performs its own check gated on whether
 // it actually created a new entry. See generic_openat in fs/generic.c.
 #define N_PARENT_DIR_WRITE 4
+// A trailing slash is a request for a DIRECTORY, and these two say what the
+// caller does about that. Both are decided after the parent has been walked
+// and before the final component is looked at, which is where Linux decides
+// them; see the comments at the use sites in fs/path.c.
+//
+// N_SLASH_NOT_A_DIR: the caller creates a name that is not a directory
+// (mknod, mkfifo, symlink, link's new name, and a unix socket bind, which
+// Linux routes through vfs_mknod too). A name spelled with a trailing slash
+// that does not already exist is ENOENT. Not for mkdir, whose whole business
+// is the directory a trailing slash asks for.
+#define N_SLASH_NOT_A_DIR 128
+// N_SLASH_EISDIR: open(O_CREAT). A trailing slash is EISDIR whether or not
+// the name exists, and whatever kind of thing is there.
+#define N_SLASH_EISDIR 256
 
 // Normalizes the path specified and writes the result into the out buffer.
 //

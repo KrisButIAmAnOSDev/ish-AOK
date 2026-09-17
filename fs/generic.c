@@ -473,6 +473,15 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
     // O_NOFOLLOW: do not resolve a *final* symlink component (intermediate
     // components are still followed), so opening one fails with ELOOP below.
     int norm = ((flags & O_NOFOLLOW_) ? N_SYMLINK_NOFOLLOW : N_SYMLINK_FOLLOW) | extra_norm;
+    // O_CREAT plus a name spelled with a trailing slash is EISDIR on Linux --
+    // open() cannot create a directory -- and that answer does not depend on
+    // the name existing, so N_SLASH_EISDIR decides it inside the resolution,
+    // right after the parent walk. Doing it out here instead only covered the
+    // name-is-missing case: `open("file/", O_CREAT|O_WRONLY)` came back
+    // ENOTDIR from the resolution before this function got a say, and
+    // `open("dir/", O_CREAT|O_RDONLY)` just opened the directory.
+    if (flags & O_CREAT_)
+        norm |= N_SLASH_EISDIR;
     // N_PARENT_DIR_WRITE is deliberately NOT used here even though O_CREAT is
     // set: at this point we don't yet know whether the target already
     // exists. O_CREAT is very commonly passed defensively on an open() of an
@@ -495,9 +504,6 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
     // generic_* below that notifies.
     char guest_path[MAX_PATH];
     strcpy(guest_path, path);
-    // A trailing slash demands a directory; open() must not create through it.
-    size_t raw_len = strlen(path_raw);
-    bool trailing_slash = raw_len > 0 && path_raw[raw_len - 1] == '/';
     int mflags;
     struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
@@ -531,13 +537,6 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
     err = mount->fs->stat(mount, path, &stat);
     if (err < 0) {
         if ((flags & O_CREAT_) && err == _ENOENT) {
-            // "newname/" names a directory; open() cannot create one (EISDIR).
-            if (trailing_slash) {
-                if (!fs_blocks)
-                    unlock(&inodes_lock);
-                mount_release(mount);
-                return ERR_PTR(_EISDIR);
-            }
             // The target does not exist, so O_CREAT is really about to create
             // a new directory entry: this is the point (unlike the "target
             // already exists" branch below) where Linux requires write+exec
@@ -863,7 +862,7 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
     if (err < 0)
         return err;
     char dst[MAX_PATH];
-    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
+    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     // Pre-trim copies for inotify; see generic_openat.
@@ -1099,7 +1098,7 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     // path_final_dot().
     if (path_final_dot(link_raw))
         return _EEXIST;
-    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
+    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
@@ -1138,7 +1137,7 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
         return _EPERM;
 
     char path[MAX_PATH];
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
