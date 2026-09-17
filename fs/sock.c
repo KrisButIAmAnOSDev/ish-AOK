@@ -3834,12 +3834,28 @@ static int netlink_sockaddr_write(guest_addr_t sockaddr_addr, const void *sockad
 
 static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *socket_id) {
     char path[MAX_PATH];
-    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_FOLLOW);
+    // A bind CREATES the name, and Linux resolves it exactly as mknod does
+    // (unix_bind_bsd: kern_path_create, then vfs_mknod), so it gets
+    // generic_mknodat's flags: the final component is not followed -- a
+    // dangling symlink there is a name in use, not a place to create the
+    // socket -- a name that exists is EADDRINUSE before permission is asked,
+    // and otherwise the parent must be writable and searchable. Only lookups
+    // were checked: bind followed the final symlink and asked nothing of the
+    // parent, so an unprivileged guest bound sockets in root's directories --
+    // /usr/lib, or a /tmp/.X11-unix a root session had left 0755, where a
+    // later non-root compositor then bound X1. connect() follows symlinks and
+    // needs search on the way and write on the socket (below). Measured on
+    // Linux 6.12 by tests/manual/unix_bind_dir_perms.c.
+    int flags = bind_fd != NULL
+        ? N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST
+        : N_SYMLINK_FOLLOW;
+    int err = path_normalize(AT_PWD, path_raw, path, flags);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mount_flags = 0;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mount_flags);
     if (mount == NULL)
         return _ENOENT;
     struct statbuf stat;
@@ -3850,6 +3866,17 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
         // If the file exists, fail.
         if (err == 0) {
             err = _EADDRINUSE;
+            goto out;
+        }
+        // "name/" asks for a directory, and a socket is not one:
+        // filename_create() answers ENOENT for any other kind of node.
+        size_t raw_len = strlen(path_raw);
+        if (raw_len > 1 && path_raw[raw_len - 1] == '/') {
+            err = _ENOENT;
+            goto out;
+        }
+        if (mount_flags & MS_READONLY_) {
+            err = _EROFS;
             goto out;
         }
         // If the file can't be found, try to create it as a socket.
