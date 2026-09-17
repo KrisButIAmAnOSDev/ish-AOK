@@ -80,6 +80,13 @@ sh /AOK/tools/start-wayland.sh        # the applet runs this for you
 as a `WAYLAND_COMPOSITOR_CMD=sway` alternative. `start-wayland.sh` also honours
 `WAYVNC_PORT` and `ISH_DISPLAY_READY_FILE`.
 
+The desktop gets its own session D-Bus when `dbus-daemon` is installed, which
+`setup-wayland.sh` also does. Everything started inside it finds that bus
+through `DBUS_SESSION_BUS_ADDRESS`, so programs that need one, such as waybar
+and Qt apps, work without you starting a bus or setting `DISPLAY`. On a root set
+up before this, install it once with `sudo apt install dbus-daemon` (Devuan) or
+`sudo apk add dbus` (Alpine), then reopen the applet.
+
 Two caveats worth knowing before you start. Only **amd64/x86_64** guests have
 been bring-up-tested — the packages exist for the other architectures in Devuan
 and may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)

@@ -98,6 +98,26 @@ for bin in labwc sway wofi foot wayvnc; do
     command -v "$bin" >/dev/null 2>&1 || die "install reported success but '$bin' is not on PATH"
 done
 
+# The desktop's session bus. start-wayland.sh starts one when dbus-daemon is
+# installed, and GLib and Qt programs (waybar, Falkon) need it; the Alpine
+# packages above do not pull it in. Best-effort, like the menu apps below:
+# labwc, foot and wayvnc run without it. On Devuan it is dbus-daemon alone,
+# since the dbus package would add the system bus and its init script.
+if ! command -v dbus-daemon >/dev/null 2>&1; then
+    log "installing dbus-daemon for the desktop's session bus (best-effort)"
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dbus-daemon
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm dbus
+    elif command -v apk >/dev/null 2>&1; then
+        apk add dbus
+    fi
+    # Judged by the result, not the exit status: apk exits 1 when any package
+    # already in the root is broken, even though dbus itself installed.
+    command -v dbus-daemon >/dev/null 2>&1 \
+        || note "warning: dbus-daemon did not install -- programs that need a session bus will not find one"
+fi
+
 # Best-effort, not required: a renamed/missing package on some future
 # Debian/Alpine release shouldn't block installing the actual Wayland stack
 # above, which just finished and is already verified working.

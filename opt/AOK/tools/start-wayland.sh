@@ -179,11 +179,37 @@ fi
 WL_RUNTIME_BASE="$HOME/.cache/ish-display"
 # Sweep stale runtime dirs from prior sessions that died without cleanup()
 # (app killed, crash): they're pid-suffixed so they never collide, but they'd
-# otherwise accumulate forever now that boot doesn't clean them for us.
+# otherwise accumulate forever now that boot doesn't clean them for us. The
+# same goes for the session bus such a session started (below): it is found by
+# its socket path, which nothing else uses.
+pkill -f "dbus-daemon --session --fork --nopidfile --address=unix:path=$WL_RUNTIME_BASE/" 2>/dev/null
 rm -rf "$WL_RUNTIME_BASE" 2>/dev/null
 export XDG_RUNTIME_DIR="$WL_RUNTIME_BASE/$$"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
+
+# A session D-Bus for this desktop. Nothing else starts one on these roots,
+# which have no systemd user session, so GLib and Qt programs found no session
+# bus at all: waybar stopped with "Cannot autolaunch D-Bus without X11
+# $DISPLAY", and Qt apps such as Falkon could not connect (GH #485). Its socket
+# lives in XDG_RUNTIME_DIR with the rest of the session, and cleanup() stops
+# it. A bus the caller already has is kept, and a root without dbus-daemon
+# goes without; setup-wayland.sh installs it.
+DBUS_DAEMON_PID=""
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-daemon >/dev/null 2>&1; then
+    session_bus_address="unix:path=$XDG_RUNTIME_DIR/bus"
+    # --fork returns with the socket already in place (5 of 5 on Devuan), and
+    # the daemon moves its own stdout to /dev/null, so the substitution ends
+    # when the parent exits rather than waiting on the daemon.
+    DBUS_DAEMON_PID="$(dbus-daemon --session --fork --nopidfile \
+        --address="$session_bus_address" --print-pid)" || DBUS_DAEMON_PID=""
+    if [ -n "$DBUS_DAEMON_PID" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="$session_bus_address"
+        log "session D-Bus at $session_bus_address"
+    else
+        log "dbus-daemon did not start: programs that need a session bus will not find one"
+    fi
+fi
 
 export WLR_BACKENDS=headless
 export WLR_LIBINPUT_NO_DEVICES=1
@@ -233,6 +259,7 @@ cleanup() {
     [ -n "$FOOT_PID" ] && kill "$FOOT_PID" 2>/dev/null
     [ -n "$COMPOSITOR_PID" ] && kill "$COMPOSITOR_PID" 2>/dev/null
     wait 2>/dev/null
+    [ -n "$DBUS_DAEMON_PID" ] && kill "$DBUS_DAEMON_PID" 2>/dev/null
     rm -rf "$XDG_RUNTIME_DIR"
     exit 0
 }
