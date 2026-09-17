@@ -456,6 +456,23 @@ void checkpoint_park_if_frozen(void) {
         pthread_cond_wait(&ckpt_park_cond, &ckpt_park_lock);
     atomic_store_explicit(&current->ckpt_frozen, false, memory_order_release);
     pthread_mutex_unlock(&ckpt_park_lock);
+
+    // Leave the freeze's wake behind. task_wake_for_freeze marks
+    // wait_interrupted on every task, and ckpt_freeze_all marks it again, every
+    // 2ms, on whichever task it finds not yet parked -- including one whose
+    // wait already returned and is on its way here. Nothing consumes the mark
+    // but the next wait_for, which returns EINTR on it before looking at
+    // anything else. So the call re-executed after the thaw failed with an
+    // EINTR no signal and no freeze stood behind: of 43 tasks parked for one
+    // checkpoint, 31 still carried the mark when they left this lot, and
+    // semop, msgrcv, flock and rt_sigsuspend each failed with EINTR in one run
+    // or another, on arm64 as well as amd64.
+    //
+    // Safe to drop, because no wait is in progress here -- a task parks at
+    // the top of its loop, a native program at a syscall checkpoint -- and
+    // nothing real is lost with it: a signal sent during the freeze is still
+    // in the pending set, which every wait checks as well.
+    __atomic_store_n(&current->wait_interrupted, false, __ATOMIC_RELEASE);
 }
 
 // Set while this thread is inside a program's ckpt_dump.

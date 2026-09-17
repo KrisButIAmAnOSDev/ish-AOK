@@ -4840,8 +4840,15 @@ sqword_t syscall_dispatch_native(qword_t syscall_num, const qword_t raw_args[6])
             result = _EFAULT;
         } else {
             syscall_t syscall = arm64_syscall_dispatch.table[syscall_num];
-            result = (sqword_t) (sdword_t) syscall(args[0], args[1], args[2],
+            dword_t table_result = syscall(args[0], args[1], args[2],
                     args[3], args[4], args[5]);
+            // The freeze conversion handle_asm_generic_native_syscall's tail
+            // gives every call it handles. native_syscall_args re-issues an
+            // _ERESTART but hands a plain EINTR to the program, so without it
+            // a native flock(2) -- one of the few blocking calls that reaches
+            // this table -- would fail with EINTR across a checkpoint.
+            syscall_result_should_restart(&table_result);
+            result = (sqword_t) (sdword_t) table_result;
         }
     }
 
@@ -5113,7 +5120,22 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         // path could read it, turning every handler-cancelled ERESTARTNOHAND
         // back into a restart. That regressed all five of the poll-family
         // cases this backstop was not even meant to touch.
-        bool restart_pending =
+        //
+        // A CHECKPOINT FREEZE is a restart too, but it arrives as a plain
+        // _EINTR: the freezer wakes the wait, the wait returns EINTR, and only
+        // syscall_result_should_restart knows to turn that into _ERESTART
+        // while the freeze is on. Asking about the restart codes alone handed
+        // the EINTR to the guest from every case above that does not call it
+        // -- measured on alpine and devuan amd64 roots, a checkpoint taken
+        // while tasks were blocked gave EINTR from 18 syscalls, readv, write,
+        // recvfrom, nanosleep, waitid and F_SETLKW among them, all calls the
+        // funnel restarts for arm64. The flag below comes out false for it,
+        // as the funnel's own freeze branch leaves it: no handler may cancel
+        // a freeze's restart.
+        bool freeze_restart =
+            (sqword_t) result == (sqword_t) (sdword_t) _EINTR &&
+            checkpoint_freeze_pending();
+        bool restart_pending = freeze_restart ||
             (sqword_t) result == (sqword_t) (sdword_t) _ERESTART ||
             (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
         if (restart_pending) {

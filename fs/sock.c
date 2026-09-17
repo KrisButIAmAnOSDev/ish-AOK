@@ -5276,9 +5276,18 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
                 // the cap in fs/poll.c for what an unbounded one costs when the
                 // wake poke is lost. Free here: the loop already treats every
                 // return from this poll as "go round and try the accept
-                // again", so an expiry needs no handling of its own.
-                if (poll_timeout < 0)
-                    poll_timeout = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+                // again", so an expiry needs no handling of its own, and the
+                // deadline check above still ends the call on time.
+                //
+                // A supplied SO_RCVTIMEO is capped as well as a missing one,
+                // as socket_wait_ready's is. Only the missing one was, so an
+                // accept with a timeout held a checkpoint for whatever was left
+                // of it whenever the freezer's wake was lost -- measured with a
+                // 4s SO_RCVTIMEO, every freeze lasted until it expired, on
+                // arm64 and amd64 alike, and a long one refuses the save.
+                int cap_ms = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+                if (poll_timeout < 0 || poll_timeout > cap_ms)
+                    poll_timeout = cap_ms;
                 if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
                     fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
                     fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
@@ -6077,6 +6086,18 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
         while (1) {
             sigset_t oldmask;
             if (!socket_blocking_syscall_begin(&oldmask)) {
+                // A failed begin may be nothing but an unwound host SIGUSR1
+                // poke, with no guest signal behind it -- the case fs/real.c's
+                // two sigunwind branches retry and socket_wait_ready ignores.
+                // These two loops alone handed it to the guest as EINTR, and a
+                // checkpoint leaves just such a poke pending: the freezer's
+                // wakes land while the thread has SIGUSR1 blocked, and the call
+                // re-executed after the thaw unblocks it here. Measured:
+                // recvfrom and recvmsg on a UDP socket with SO_RCVTIMEO failed
+                // with EINTR at the thaw, on arm64 and amd64, with no signal
+                // pending and the freeze already over.
+                if (!socket_guest_signal_pending())
+                    continue;
                 res = errno_map();
                 errno = 0;
                 break;
@@ -8522,6 +8543,9 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
         while (1) {
             sigset_t oldmask;
             if (!socket_blocking_syscall_begin(&oldmask)) {
+                // A stray poke is not an interruption; see sys_recvfrom_common.
+                if (!socket_guest_signal_pending())
+                    continue;
                 res = errno_map();
                 errno = 0;
                 break;
