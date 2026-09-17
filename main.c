@@ -198,6 +198,9 @@ static noreturn void cli_halt(int status) {
         nlibc_flush_stream_if_lockable(stderr);
         nlibc_flush_all_streams();
     }
+    // _exit skips atexit, and this process's host socket directory has to go
+    // with it (fs/sock.c). Nothing it touches is a guest lock.
+    sock_host_dir_cleanup();
     if ((status & 0x7f) == 0)          // WIFEXITED
         _exit((status >> 8) & 0xff);
     _exit(128 + (status & 0x7f));      // WIFSIGNALED: shell convention 128+signo
@@ -671,6 +674,7 @@ int main(int argc, char *const argv[]) {
         const char *linger_str = getenv("ISH_TEST_GUEST_LINGER_MS");
         if (linger_str != NULL)
             usleep((useconds_t) atoi(linger_str) * 1000);
+        sock_host_dir_cleanup();
         _exit(0);
     }
 

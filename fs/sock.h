@@ -582,7 +582,12 @@ static inline int sock_level_to_real(int fake) {
     return fake;
 }
 
+// Where bound guest unix sockets live on the host, as "<prefix>.<id>". The app
+// points it into its own container's tmp. Left NULL (the CLI, the simulator),
+// each process gets a private directory instead -- see fs/sock.c -- which
+// sock_host_dir_cleanup() removes; call that on any exit that skips atexit.
 extern const char *sock_tmp_prefix;
+void sock_host_dir_cleanup(void);
 
 struct tcp_info_ {
     uint8_t state;

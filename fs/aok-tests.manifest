@@ -78,6 +78,7 @@ mountinfo_epollet.c
 tmpfs_nlink.c
 unix_dgram_cred.c
 unix_abstract_release.c
+unix_sock_host_isolation.c
 scm_rights_stress.c
 ambient_caps.c
 fs_conformance.c

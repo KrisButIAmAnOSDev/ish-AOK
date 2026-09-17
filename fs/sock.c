@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -4275,7 +4277,196 @@ static void unix_abstract_release(struct unix_abstract *name) {
     unlock(&unix_abstract_lock);
 }
 
-const char *sock_tmp_prefix = "/tmp/ishsock";
+// ---- host paths for guest unix sockets ----
+//
+// A bound guest AF_UNIX socket is a host socket bound at a host path, and a
+// connect or send to the guest name goes to that path. The path is named by an
+// id that is unique within this process (unix_socket_next_id):
+//
+//   - The app sets sock_tmp_prefix to a name in its own container's tmp
+//     (app/AppDelegate.m) and gets "<prefix>.<id>". One guest runs there.
+//   - Everything else -- the CLI, and the app in the simulator -- leaves it
+//     NULL and gets a directory of its own: "<dir>/<id>".
+//
+// That directory is new. The default prefix used to be "/tmp/ishsock", shared
+// by every ish process on the machine, while the ids restart at 1 in each and
+// bind unlinks its path before binding. So two CLI guests at once took each
+// other's sockets: the second guest's first bind deleted the first guest's
+// /tmp/ishsock.1 and bound its own server there, and the first guest's clients
+// reached the wrong server, or nothing. A session D-Bus died with ECONNREFUSED
+// that way while other runs recreated /tmp/ishsock.1 and .2, and concurrent
+// CLI tests of D-Bus, X and Wayland failed for no reason of their own.
+//
+// The directory comes from mkdtemp, so it is mode 0700 and nobody else's:
+// $TMPDIR/ishsock.XXXXXX, or /tmp/ishsock.XXXXXX when $TMPDIR is unset, not
+// absolute, not usable, or too long for "<dir>/<largest id>" to fit sun_path
+// (104 bytes on Darwin, 108 on Linux). The process holds a flock on it for its
+// whole life. sock_host_dir_cleanup() removes it at exit; a process that never
+// gets there -- killed, crashed -- leaves it unlocked, and the next ish to make
+// a directory in the same place removes it (sock_host_dir_sweep).
+const char *sock_tmp_prefix = NULL;
+
+#define SOCK_HOST_DIR_STEM "ishsock."
+#define SOCK_HOST_ID_DIGITS 10  // UINT32_MAX
+
+static lock_t sock_host_dir_lock = LOCK_INITIALIZER;
+// Written once, under the lock, before sock_host_dir_made is set; read freely
+// after that.
+static char sock_host_dir[sizeof(((struct sockaddr_un *) NULL)->sun_path)];
+static _Atomic bool sock_host_dir_made;
+static int sock_host_dir_errno;
+static pid_t sock_host_dir_pid;
+
+// Empty a socket directory, which only ever holds sockets, and remove it.
+static void sock_host_dir_remove(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+                unlinkat(dirfd(d), e->d_name, 0);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+// Remove the directories of ish processes that no longer exist. A live one
+// holds a flock on its directory, and the kernel drops that lock however the
+// process ends, SIGKILL included.
+static void sock_host_dir_sweep(const char *base) {
+    DIR *d = opendir(base);
+    if (d == NULL)
+        return;
+    uid_t uid = getuid();
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, SOCK_HOST_DIR_STEM, strlen(SOCK_HOST_DIR_STEM)) != 0)
+            continue;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", base, e->d_name) >= (int) sizeof(path))
+            continue;
+        // Directories only. /tmp/ishsock.<id> SOCKETS are the layout an older
+        // ish uses, and one may well be running.
+        struct stat st;
+        if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != uid)
+            continue;
+        int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+            sock_host_dir_remove(path);
+        close(fd);
+    }
+    closedir(d);
+}
+
+// Make this process's directory under `base`. False if it cannot be made there.
+static bool sock_host_dir_make(const char *base) {
+    static const char leaf[] = "/" SOCK_HOST_DIR_STEM "XXXXXX";
+    size_t base_len = strlen(base);
+    while (base_len > 1 && base[base_len - 1] == '/')
+        base_len--;
+    // "<base>/ishsock.XXXXXX", then "/" and the widest id, then the NUL.
+    char dir[sizeof(sock_host_dir)];
+    if (base_len + (sizeof(leaf) - 1) + 1 + SOCK_HOST_ID_DIGITS + 1 > sizeof(dir))
+        return false;
+    char trimmed[sizeof(dir)];
+    memcpy(trimmed, base, base_len);
+    trimmed[base_len] = '\0';
+
+    sock_host_dir_sweep(trimmed);
+    for (int attempt = 0; attempt < 8; attempt++) {
+        memcpy(dir, trimmed, base_len);
+        memcpy(dir + base_len, leaf, sizeof(leaf));
+        if (mkdtemp(dir) == NULL) {
+            sock_host_dir_errno = errno_map();
+            return false;
+        }
+        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            sock_host_dir_errno = errno_map();
+            rmdir(dir);
+            return false;
+        }
+        // Another process's sweep can find the directory between mkdtemp and
+        // this lock. If it did, it holds the lock (EWOULDBLOCK) or has removed
+        // the directory already, so demand the lock and the same directory
+        // still at the name; otherwise leave that one to the sweep and make
+        // another. Any other flock failure is a filesystem without locks,
+        // where no sweep can take the lock either: carry on without it.
+        struct stat by_fd, by_name;
+        bool swept = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+        if (!swept && fstat(fd, &by_fd) == 0 &&
+                stat(dir, &by_name) == 0 && by_fd.st_dev == by_name.st_dev &&
+                by_fd.st_ino == by_name.st_ino) {
+            // The descriptor stays open, unused, for the lock's sake.
+            memcpy(sock_host_dir, dir, sizeof(sock_host_dir));
+            sock_host_dir_pid = getpid();
+            return true;
+        }
+        close(fd);
+    }
+    sock_host_dir_errno = _EAGAIN;
+    return false;
+}
+
+static const char *sock_host_dir_get(void) {
+    if (sock_host_dir_made)
+        return sock_host_dir;
+    lock(&sock_host_dir_lock, 0);
+    if (!sock_host_dir_made) {
+        sock_host_dir_errno = _EACCES;
+        const char *tmpdir = getenv("TMPDIR");
+        if ((tmpdir != NULL && tmpdir[0] == '/' && sock_host_dir_make(tmpdir)) ||
+                sock_host_dir_make("/tmp")) {
+            sock_host_dir_made = true;
+            // For the exits that run atexit handlers. The CLI's usual exit is
+            // _exit from its halt hook, which calls sock_host_dir_cleanup
+            // itself (main.c).
+            atexit(sock_host_dir_cleanup);
+        }
+    }
+    unlock(&sock_host_dir_lock);
+    return sock_host_dir_made ? sock_host_dir : NULL;
+}
+
+void sock_host_dir_cleanup(void) {
+    // Lock-free on purpose: this runs on the way out of the process, from
+    // whatever thread is ending it, with guest locks still held.
+    if (!sock_host_dir_made || sock_host_dir_pid != getpid())
+        return;
+    sock_host_dir_remove(sock_host_dir);
+}
+
+// Where the guest socket `socket_id` is bound on the host.
+static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out) {
+    int n;
+    if (sock_tmp_prefix != NULL) {
+        n = snprintf(addr->sun_path, sizeof(addr->sun_path), "%s.%u", sock_tmp_prefix, socket_id);
+    } else {
+        const char *dir = sock_host_dir_get();
+        if (dir == NULL)
+            return sock_host_dir_errno;
+        n = snprintf(addr->sun_path, sizeof(addr->sun_path), "%s/%u", dir, socket_id);
+    }
+    if (n < 0 || (size_t) n >= sizeof(addr->sun_path))
+        return _ENAMETOOLONG;
+    *len_out = (size_t) n;
+    return 0;
+}
+
+// A guest name that resolves to a socket, whose host path does not exist, has
+// nothing bound to it in this process: a socket file left by an earlier run,
+// say, or one made with mknod. Linux refuses such a connection (ECONNREFUSED,
+// which daemons take to mean "stale, safe to replace"); the host call says
+// ENOENT. It used to say ECONNREFUSED only by luck, when some other process's
+// /tmp/ishsock.<id> happened to sit at the same path.
+static int unix_host_missing_is_refused(struct fd *sock, int err) {
+    if (sock->socket.domain == AF_LOCAL_ && err == _ENOENT)
+        return _ECONNREFUSED;
+    return err;
+}
 
 static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
     // Make sure we can read things without overflowing buffers
@@ -4349,9 +4540,13 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
 
             uint32_t socket_id;
             int err;
-            if (path_size == 0) {
+            if (path_size == 0)
                 return _ENOENT;
-            } else if (path[0] != '\0') {
+            // Before any name is taken, so a bind that can have no host path
+            // leaves no socket file or abstract name behind.
+            if (sock_tmp_prefix == NULL && sock_host_dir_get() == NULL)
+                return sock_host_dir_errno;
+            if (path[0] != '\0') {
                 STRACE(" unix socket %s", path);
                 err = unix_socket_get(path, bind_fd, &socket_id);
             } else {
@@ -4379,10 +4574,10 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
             }
 
             struct sockaddr_un *real_addr_un = sockaddr;
-            size_t path_len = snprintf(real_addr_un->sun_path, sizeof(real_addr_un->sun_path), "%s.%u", sock_tmp_prefix, socket_id);
-            if (path_len >= sizeof(real_addr_un->sun_path)) {
-                return _ENAMETOOLONG;
-            }
+            size_t path_len = 0;
+            err = unix_host_sun_path(socket_id, real_addr_un, &path_len);
+            if (err < 0)
+                return err;
 #ifdef __APPLE__
             real_addr_un->sun_len = offsetof(struct sockaddr_un, sun_path) + path_len;
 #endif
@@ -5041,7 +5236,7 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         sock->socket.host_nonblock = false;
     }
     if (err < 0) {
-        int mapped_err = errno_map();
+        int mapped_err = unix_host_missing_is_refused(sock, errno_map());
         if ((mapped_err == _EINPROGRESS || mapped_err == _EALREADY) &&
                 !(fd_getflags(sock) & O_NONBLOCK_)) {
             if (sock_trace_enabled()) {
@@ -5967,7 +6162,7 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             return _EAGAIN;
         }
         // MSG_NOSIGNAL: EPIPE without the guest's SIGPIPE.
-        int mapped_err = errno_map_flags(flags & MSG_NOSIGNAL_);
+        int mapped_err = unix_host_missing_is_refused(sock, errno_map_flags(flags & MSG_NOSIGNAL_));
         sock_translate_err(sock, &mapped_err);
         // Linux returns ENOTCONN for a send() on an unconnected AF_UNIX
         // datagram socket with no destination address; Darwin returns
@@ -8131,7 +8326,7 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             sock_x11_event("sendmsg-eagain", sock, -1, err, requested);
             goto out_free_scm;
         }
-        err = errno_map_flags(flags & MSG_NOSIGNAL_);   // MSG_NOSIGNAL
+        err = unix_host_missing_is_refused(sock, errno_map_flags(flags & MSG_NOSIGNAL_));
         // A /dev/log or initctl path whose socket exists but has no live reader
         // falls back to discarding rather than failing the send.
         if (sendmsg_devlog_fallback &&
