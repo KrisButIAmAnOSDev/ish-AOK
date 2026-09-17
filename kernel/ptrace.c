@@ -1265,9 +1265,15 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             // A partial resume: the tracee leaves the ptrace stop, so the
             // tracer's wait4 stops reporting it, but group->stopped is NOT
             // lifted. It goes straight back to waiting the job-control stop out
-            // in group_stop_wait's listening branch, which is the point. A
-            // SIGCONT that raced the LISTEN is caught there too: the branch
-            // finds the stop already lifted and reports it.
+            // in group_stop_wait's listening branch, which is the point.
+            //
+            // A SIGCONT landing between the group-stop report and this LISTEN
+            // therefore leaves the flag unset and the tracee simply runs, where
+            // Linux would report the lift as a PTRACE_EVENT_STOP. That window
+            // is the price of arming the flag only for a stop that is really in
+            // force; it costs a tracer one missed event-stop and never a hang,
+            // whereas a flag set with no stop to wait out would silence the
+            // report of the NEXT group-stop.
             child->ptrace.stopped = false;
             child->ptrace.signal = 0;
             child->ptrace.trap_event = 0;
