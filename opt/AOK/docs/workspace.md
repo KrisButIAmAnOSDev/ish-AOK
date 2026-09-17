@@ -72,7 +72,7 @@ on, rather than the terminal.
 It needs those programs installed in the guest first, and two scripts do that:
 
 ```sh
-sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc
+sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc, waybar
 sh /AOK/tools/start-wayland.sh        # the applet runs this for you
 ```
 
@@ -87,9 +87,26 @@ and Qt apps, work without you starting a bus or setting `DISPLAY`. On a root set
 up before this, install it once with `sudo apt install dbus-daemon` (Devuan) or
 `sudo apk add dbus` (Alpine), then reopen the applet.
 
-Two caveats worth knowing before you start. Only **amd64/x86_64** guests have
-been bring-up-tested — the packages exist for the other architectures in Devuan
-and may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)
+`waybar`, a panel along the top of the desktop, is installed too, with the Font
+Awesome font its icons use. Start it from a foot terminal:
+
+```sh
+waybar &   # taskbar, clock, CPU, memory, disk, network and battery
+```
+
+The first session after it is installed writes a config that suits labwc to
+`~/.config/waybar/config.jsonc`. It is written only when you have no waybar config
+of your own, and it is yours to edit. Debian's default in `/etc/xdg/waybar` is
+written for sway, and several of its modules switch themselves off here. Two log
+lines are expected and harmless: `basic_string::_M_create`, a waybar 0.12 bug
+that native Linux prints too, and a warning that it cannot reach the system bus,
+which it only uses to notice suspend. On a root set up before this, install it
+with `sudo apt install waybar fonts-font-awesome` (Devuan) or
+`sudo apk add waybar font-awesome` (Alpine).
+
+Two caveats worth knowing before you start. It has been run on **amd64** and
+**arm64** guests — the packages exist for the other architectures in Devuan and
+may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)
 install the same stack under the same package names, while Alpine (apk) is a
 documented follow-up rather than a supported path.
 

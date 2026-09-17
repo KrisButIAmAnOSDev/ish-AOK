@@ -235,6 +235,12 @@ export LIBGL_ALWAYS_SOFTWARE=1
 # how iSH's unix-socket layer handles the proxy's relay pattern -- tracked
 # separately; this export is the workaround until that's root-caused).
 export MOZ_DISABLE_WAYLAND_PROXY=1
+# GTK programs, waybar among them, look for the AT-SPI accessibility bus at
+# startup and warn when there is none ("AT-SPI: Error retrieving accessibility
+# bus address"). Nothing here can use it: no screen reader reaches a desktop
+# drawn over VNC. Installing at-spi2-core instead would add a bus launcher to
+# every session for nothing.
+export NO_AT_BRIDGE=1
 
 # Pixman accelerator (kernel/ish_accel_pix.c via ISH_SYS_PIXOP): loaded only
 # if setup-wayland.sh's best-effort build actually produced the shim AND the
@@ -568,6 +574,76 @@ if [ "$COMPOSITOR_CMD" = "labwc" ] && [ ! -f "$HOME/.config/labwc/rc.xml" ]; the
   </keyboard>
 </labwc_config>
 RC_XML_EOF
+fi
+
+# waybar, when it is installed: a config for labwc on the first session that
+# has none (the user's own, config or config.jsonc, always wins). Debian's
+# default in /etc/xdg/waybar is written for sway. Under labwc its five sway
+# modules find no sway socket and turn themselves off, and its pulseaudio, mpd,
+# power-profiles-daemon and media modules want servers these roots do not run.
+# This keeps Debian's formats and icons for the modules that have something to
+# show here, except two icons: Debian's font package is Font Awesome 4.7, which
+# lacks the ethernet and charging-station glyphs Debian's config uses, so those
+# are sitemap (U+F0E8) and bolt (U+F0E7), present in 4.7 and in the 7.x Alpine
+# and Arch ship. The icons need Font Awesome, which setup-wayland.sh installs
+# with waybar.
+if [ "$COMPOSITOR_CMD" = "labwc" ] && command -v waybar >/dev/null 2>&1 \
+        && [ ! -e "$HOME/.config/waybar/config.jsonc" ] && [ ! -e "$HOME/.config/waybar/config" ]; then
+    mkdir -p "$HOME/.config/waybar"
+    cat > "$HOME/.config/waybar/config.jsonc" <<'WAYBAR_CONFIG_EOF'
+// -*- mode: jsonc -*-
+// Written by /AOK/tools/start-wayland.sh on the first labwc session.
+// Edit freely: it is only written when there is no waybar config yet.
+{
+    "spacing": 4,
+    "modules-left": ["wlr/taskbar"],
+    "modules-center": ["clock"],
+    "modules-right": ["cpu", "memory", "disk", "network", "battery", "tray"],
+    "wlr/taskbar": {
+        "format": "{icon} {title:.24}",
+        "icon-size": 16,
+        "on-click": "activate",
+        "on-click-middle": "close"
+    },
+    "clock": {
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+        "format-alt": "{:%Y-%m-%d}"
+    },
+    "cpu": {
+        "format": "{usage}% ",
+        "tooltip": false
+    },
+    "memory": {
+        "format": "{}% "
+    },
+    "disk": {
+        "format": "{percentage_used}% ",
+        "path": "/"
+    },
+    "network": {
+        "format-wifi": "{essid} ({signalStrength}%) ",
+        "format-ethernet": "{ipaddr}/{cidr} ",
+        "tooltip-format": "{ifname} via {gwaddr} ",
+        "format-linked": "{ifname} (No IP) ",
+        "format-disconnected": "Disconnected ⚠",
+        "format-alt": "{ifname}: {ipaddr}/{cidr}"
+    },
+    "battery": {
+        "states": {
+            "warning": 30,
+            "critical": 15
+        },
+        "format": "{capacity}% {icon}",
+        "format-full": "{capacity}% {icon}",
+        "format-charging": "{capacity}% ",
+        "format-plugged": "{capacity}% ",
+        "format-icons": ["", "", "", "", ""]
+    },
+    "tray": {
+        "spacing": 10
+    }
+}
+WAYBAR_CONFIG_EOF
 fi
 
 # Captures the PID of the actual program, not a `cmd | tee` pipeline's last

@@ -20,7 +20,9 @@
 # see start-wayland.sh) isn't nearly empty on a fresh rootfs. That menu just
 # reflects whatever's already installed with a .desktop file; with nothing
 # beyond the required packages above it would only ever show foot's own
-# three entries.
+# three entries. And, also best-effort: dbus-daemon, for the session bus
+# start-wayland.sh gives the desktop, and waybar with the Font Awesome icons
+# its modules draw.
 #
 # Run as root:
 #       sudo sh /AOK/tools/setup-wayland.sh
@@ -117,6 +119,22 @@ if ! command -v dbus-daemon >/dev/null 2>&1; then
     command -v dbus-daemon >/dev/null 2>&1 \
         || note "warning: dbus-daemon did not install -- programs that need a session bus will not find one"
 fi
+
+# waybar, the panel, and the Font Awesome icons its modules draw with (without
+# the font every icon is an empty box). start-wayland.sh gives it a config for
+# labwc on the first session. Best-effort like the rest: the desktop runs
+# without it. The font's package name differs on each: fonts-font-awesome on
+# Devuan, font-awesome on Alpine, otf-font-awesome on Arch.
+log "installing waybar and its icon font (best-effort)"
+if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends waybar fonts-font-awesome
+elif command -v pacman >/dev/null 2>&1; then
+    pacman -S --needed --noconfirm waybar otf-font-awesome
+elif command -v apk >/dev/null 2>&1; then
+    apk add waybar font-awesome
+fi
+command -v waybar >/dev/null 2>&1 \
+    || note "warning: waybar did not install -- the desktop runs without a panel"
 
 # Best-effort, not required: a renamed/missing package on some future
 # Debian/Alpine release shouldn't block installing the actual Wayland stack
