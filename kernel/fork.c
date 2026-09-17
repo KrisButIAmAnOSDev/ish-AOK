@@ -384,6 +384,19 @@ void task_never_ran_destroy(struct task *task) {
     task->mem = NULL;
     task->cpu.mmu = NULL;
     unlock(&task->general_lock);
+    // do_exit frees a task's queued signals, and a task that never ran never
+    // gets there. One can still have some: sys_clone_common_ queues a traced
+    // child's SIGSTOP before task_start.
+    if (dead_sighand != NULL) {
+        lock(&dead_sighand->lock, 0);
+        struct sigqueue *sigqueue, *sigqueue_tmp;
+        list_for_each_entry_safe(&task->queue, sigqueue, sigqueue_tmp, queue) {
+            list_remove(&sigqueue->queue);
+            free(sigqueue);
+        }
+        task->pending = 0;
+        unlock(&dead_sighand->lock);
+    }
     sighand_release(dead_sighand);
     fs_info_release(dead_fs);
     uts_ns_release(dead_uts);
@@ -620,6 +633,17 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         unlock(&task->sighand->lock);
     }
 
+    // A child the tracer is now attached to starts life stopped: Linux queues
+    // it a SIGSTOP (ptrace_init_task) before it runs at all, so the tracer's
+    // first report of the new task is always that stop. This was sent after
+    // task_start, and a child whose first act was _exit could, rarely, be gone
+    // before it arrived. Its tracer then never heard of it -- or, waiting on
+    // the pid the event named, reaped it from under its real parent, whose own
+    // waitpid then failed. Seen once in 2000 traced vforks, and once in 15 runs
+    // of tests/manual/ptrace_eventmsg.c.
+    if (trace_child)
+        signal_queue_before_start(task, SIGSTOP_, SIGINFO_NIL);
+
     if (task_start(task) < 0) {
         // Host thread limit or memory exhaustion: the child never ran.
         // Unwind completely and give the guest a clean EAGAIN, matching
@@ -638,8 +662,6 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         }
         return _EAGAIN;
     }
-    if (trace_child)
-        send_signal(task, SIGSTOP_, SIGINFO_NIL);
     if (trace_child) {
         struct siginfo_ info = {
             .sig = SIGTRAP_,
@@ -698,6 +720,27 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // blocked on vfork->lock on its way to setting done, in which case it
         // no longer shares our stack and is a legitimately running new program.
         vfork_info_release(vfork);
+
+        // PTRACE_EVENT_VFORK_DONE: the child has exec'd or exited and let go of
+        // the memory it shared with us. gdb takes its breakpoints out of a
+        // vfork parent and puts them back only on this event, running nothing
+        // but the vforking thread until then. AOK never sent it, so under gdb
+        // a breakpoint after a vfork never fired, and a threaded program that
+        // vforked hung with its other threads held stopped.
+        //
+        // Linux reports it to any tracer that asked for it, whether or not the
+        // child was traced, with the child's pid -- and not when a fatal
+        // signal ended the wait.
+        if (!fatal && current->ptrace.traced &&
+                (current->ptrace.options & PTRACE_O_TRACEVFORKDONE_)) {
+            struct siginfo_ info = {
+                .sig = SIGTRAP_,
+                .code = SI_KERNEL_,
+                .kill.pid = current->pid,
+                .kill.uid = current->uid,
+            };
+            ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_VFORK_DONE_, pid);
+        }
     }
 
     return pid;

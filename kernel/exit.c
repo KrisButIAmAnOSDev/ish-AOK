@@ -911,14 +911,17 @@ static void halt_system_kill(struct halt_target *targets, size_t count) {
     free(targets);
 }
 
+// Only the low byte of an exit code survives, as in Linux: exit(0x1ff) leaves a
+// wait status of 0xff00, and so does the PTRACE_EVENT_EXIT message built from
+// it. Shifting the whole value handed a tracer 0x1ff00.
 dword_t sys_exit(dword_t status) {
     STRACE("exit(%d)\n", status);
-    do_exit(current, status << 8);
+    do_exit(current, (status & 0xff) << 8);
 }
 
 dword_t sys_exit_group(dword_t status) {
     STRACE("exit_group(%d)\n", status);
-    do_exit_group(status << 8);
+    do_exit_group((status & 0xff) << 8);
 }
 
 #define WNOHANG_ (1 << 0)
@@ -1007,13 +1010,35 @@ static bool notify_if_continued(struct task *task, struct siginfo_ *info_out) {
     return true;
 }
 
+// A ptrace-stop is reported to the tracer and to nobody else. Linux's
+// wait_task_stopped shows a waiter that is not the tracer only a group-stop,
+// and only for WUNTRACED. reap_if_needed asked here on behalf of any parent,
+// so a parent whose child someone else traced could take that child's stop:
+// waitpid(child, 0) came back with 0x137f while the child sat stopped, and the
+// tracer, never seeing it, never resumed it. A tracer that resumes the parent
+// at each fork event, as strace -f does, lost the first stop of 17 to 37 of 200
+// forks. A hung `strace -f sh -c '... | cat | wc -l'` had wc parked in a
+// syscall-stop that strace's wait4 never reported.
+static bool waiter_is_tracer(const struct task *task) {
+    if (!task->ptrace.traced)
+        return false;
+    const struct task *tracer = task->ptrace.tracer != NULL ? task->ptrace.tracer : task->parent;
+    return tracer != NULL && tracer->group == current->group;
+}
+
 static bool notify_if_ptrace_stopped(struct task *task, struct siginfo_ *info_out) {
     lock(&task->ptrace.lock, 0);
-    if (task->ptrace.stopped && task->ptrace.signal) {
+    if (task->ptrace.stopped && task->ptrace.signal && waiter_is_tracer(task)) {
         info_out->child.status = task->ptrace.trap_event << 16 | task->ptrace.signal << 8 | 0x7f;
         task->ptrace.signal = 0;
         task->ptrace.trap_event = 0;
-        task->ptrace.eventmsg = 0;
+        // Not ptrace.eventmsg: the message must outlive the wait that reports
+        // its stop, because waiting is how a tracer finds out there is a
+        // message to ask for. Clearing it here made PTRACE_GETEVENTMSG answer
+        // 0 at every event, so gdb took 0 as a new thread's pid, called
+        // waitpid(0, ...), got some other child back and died with "wait
+        // returned unexpected PID". Linux never clears it; the next stop
+        // overwrites it (ptrace_stop_common).
         unlock(&task->ptrace.lock);
         return true;
     }

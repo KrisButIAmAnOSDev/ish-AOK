@@ -614,19 +614,72 @@ static int ptrace_setregset(struct task *tracer, struct task *child, guest_addr_
     }
 }
 
-static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscall_stop) {
+static bool ptrace_sigkill_pending(void) {
+    lock(&current->sighand->lock, 0);
+    bool pending = sigset_has(current->pending | current->sighand->pending, SIGKILL_);
+    unlock(&current->sighand->lock);
+    return pending;
+}
+
+// `event` is the PTRACE_EVENT_* this stop reports, or 0 for a signal or syscall
+// stop. `eventmsg` is what PTRACE_GETEVENTMSG answers while the tracee sits in
+// it -- the new task's pid at a clone/fork/vfork event, 0 at a
+// signal-delivery-stop. Linux's ptrace_stop() sets the message at every stop
+// and wait never clears it, so a tracer can wait for the stop first and ask
+// for the message afterwards, which is the only order it can ask in.
+static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscall_stop,
+        int event, qword_t eventmsg) {
     struct task *tracer = NULL;
     int signal_no = 0;
+    bool interrupt_trap = info->code == SI_PTRACE_INTERRUPT_;
 
     // wait4() publishes and consumes ptrace-stop state while holding pids_lock.
     // Publish the stop and notify child_exit under the same lock so the tracer
     // can't miss the stop between its wait4 scan and sleep.
     complex_lockt(&pids_lock, 0);
     lock(&current->ptrace.lock, 0);
+    // Any stop answers a pending PTRACE_INTERRUPT: Linux's ptrace_stop clears
+    // JOBCTL_TRAP_STOP for every stop, so a tracee interrupted on its way into
+    // some other stop reports that stop and nothing more. AOK's interrupt is a
+    // queued SIGTRAP instead, and a stop reached first used to leave it behind.
+    // That stop carried the interrupt's event (a syscall-exit stop read
+    // 0x80857f), and the SIGTRAP then arrived as a second stop, reported as a
+    // plain SIGTRAP because the first stop's wait had cleared trap_event. A
+    // tracer re-injects a plain SIGTRAP, and SIGTRAP kills. strace -f killed
+    // the program it had started in 23 of 50 runs; its debug log showed
+    // exactly that pair of stops, an event-stop and then a plain SIGTRAP,
+    // before the program died.
+    //
+    // So a stop other than the interrupt's own trap takes over trap_event and
+    // discards the trap if it is queued. A trap queued after that -- the
+    // interrupt sends it only after dropping this lock -- finds trap_event no
+    // longer PTRACE_EVENT_STOP here, and is dropped without stopping.
+    if (interrupt_trap && current->ptrace.trap_event != PTRACE_EVENT_STOP_) {
+        unlock(&current->ptrace.lock);
+        unlock(&pids_lock);
+        return;
+    }
+    // A task with SIGKILL pending does not stop, as in Linux's ptrace_stop.
+    // It used to report the stop and then wait for a wakeup the kill had
+    // already spent: a tracee killed inside a syscall under PTRACE_SYSCALL
+    // reported its syscall-exit stop and then waited forever, while its tracer
+    // waited for it to die. pids_lock -> ptrace.lock -> sighand->lock is the
+    // order the wait below already uses.
+    if (ptrace_sigkill_pending()) {
+        unlock(&current->ptrace.lock);
+        unlock(&pids_lock);
+        do_exit_group(SIGKILL_);
+    }
     current->ptrace.stopped = true;
     current->ptrace.signal = sig;
     if (syscall_stop && current->ptrace.sysgood)
         current->ptrace.signal |= 0x80;
+    // Set in the same critical section as `stopped`. The event used to be
+    // recorded in a lock section of its own beforehand, so a PTRACE_INTERRUPT
+    // landing between the two could relabel an event-stop as its own.
+    if (!interrupt_trap)
+        current->ptrace.trap_event = event;
+    current->ptrace.eventmsg = eventmsg;
     current->ptrace.info = *info;
     // SI_PTRACE_INTERRUPT_ is a marker for the detach path, not a value any
     // tracer should ever read back through PTRACE_GETSIGINFO. Report what Linux
@@ -634,9 +687,12 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
     // (event << 8) | SIGTRAP, the same expression ptrace_event_stop uses. That
     // also corrects the value: this stop previously carried si_code 0, because
     // the interrupt was sent with SIGINFO_NIL.
-    if (current->ptrace.info.code == SI_PTRACE_INTERRUPT_)
+    if (interrupt_trap)
         current->ptrace.info.code = (current->ptrace.trap_event << 8) | SIGTRAP_;
     unlock(&current->ptrace.lock);
+    // pids_lock -> sighand->lock is the established order.
+    if (!interrupt_trap)
+        ptrace_discard_interrupt_traps(current);
 
     tracer = ptrace_tracer(current);
     if (tracer != NULL) {
@@ -654,34 +710,33 @@ static void ptrace_stop_common(int sig, const struct siginfo_ *info, bool syscal
 
     lock(&current->ptrace.lock, 0);
     TASK_MAY_BLOCK {
-        while (current->ptrace.stopped) {
-            wait_for_ignore_signals(&current->ptrace.cond, &current->ptrace.lock, NULL);
-            lock(&current->sighand->lock, 0);
-            bool got_sigkill = sigset_has(current->pending | current->sighand->pending, SIGKILL_);
-            unlock(&current->sighand->lock);
-            if (got_sigkill) {
+        // SIGKILL is checked before each wait as well as after each wakeup: one
+        // that arrived between publishing the stop and getting here has already
+        // had its wakeup, and one that PTRACE_KILL sends along with its resume
+        // must still end the task here rather than let it run on.
+        for (;;) {
+            if (ptrace_sigkill_pending()) {
                 STRACE("%d received a SIGKILL in ptrace stop\n", current->pid);
                 unlock(&current->ptrace.lock);
                 do_exit_group(SIGKILL_);
             }
+            if (!current->ptrace.stopped)
+                break;
+            wait_for_ignore_signals(&current->ptrace.cond, &current->ptrace.lock, NULL);
         }
     }
     unlock(&current->ptrace.lock);
 }
 
 void ptrace_signal_stop(int sig, struct siginfo_ *info) {
-    ptrace_stop_common(sig, info, false);
+    ptrace_stop_common(sig, info, false, 0, 0);
 }
 
 void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventmsg) {
-    lock(&current->ptrace.lock, 0);
-    current->ptrace.trap_event = event;
-    current->ptrace.eventmsg = eventmsg;
-    unlock(&current->ptrace.lock);
     struct siginfo_ event_info = *info;
     event_info.sig = SIGTRAP_;
     event_info.code = (event << 8) | SIGTRAP_;
-    ptrace_stop_common(sig, &event_info, false);
+    ptrace_stop_common(sig, &event_info, false, event, eventmsg);
 }
 
 void ptrace_syscall_stop(struct cpu_state *cpu) {
@@ -691,17 +746,19 @@ void ptrace_syscall_stop(struct cpu_state *cpu) {
     };
 
     lock(&current->ptrace.lock, 0);
-    if (!current->ptrace.syscall_stopped)
+    bool entry = !current->ptrace.syscall_stopped;
+    if (entry)
         current->ptrace.syscall = current->abi == GUEST_ABI_AMD64 ?
             (int) cpu->amd64_regs[amd64_rax] :
             current->abi == GUEST_ABI_ARM64 ?
             (int) cpu->arm64_regs[arm64_x8] :
             current->abi == GUEST_ABI_RISCV64 ?
             (int) cpu->riscv64_regs[riscv64_a7] : (int) cpu->eax;
-    current->ptrace.syscall_stopped = !current->ptrace.syscall_stopped;
+    current->ptrace.syscall_stopped = entry;
     unlock(&current->ptrace.lock);
 
-    ptrace_stop_common(SIGTRAP_, &info, true);
+    ptrace_stop_common(SIGTRAP_, &info, true, 0,
+            entry ? PTRACE_EVENTMSG_SYSCALL_ENTRY_ : PTRACE_EVENTMSG_SYSCALL_EXIT_);
 }
 
 // Report a job-control group-stop to the tracer and block until it resumes us.
@@ -738,8 +795,10 @@ void ptrace_group_stop(void) {
         .sig = stop_sig,
         .code = SI_KERNEL_,
     };
+    // No message, as in Linux's do_jobctl_trap. This passed the stop signal,
+    // which no tracer could see while wait4 cleared every message.
     if (current->ptrace.seized)
-        ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_STOP_, stop_sig);
+        ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_STOP_, 0);
     else
         ptrace_signal_stop(stop_sig, &info);
 }
@@ -1008,7 +1067,6 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             }
             if (!child->ptrace.stopped) {
                 child->ptrace.trap_event = PTRACE_EVENT_STOP_;
-                child->ptrace.eventmsg = 0;
                 unlock(&child->ptrace.lock);
                 // Tagged so a detach before the tracee consumes it can take it
                 // back rather than leave a fatal signal behind -- an untraced

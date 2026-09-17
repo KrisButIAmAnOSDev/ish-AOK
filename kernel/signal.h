@@ -213,6 +213,11 @@ struct sigevent_ {
 void send_signal(struct task *task, int sig, struct siginfo_ info);
 // send a signal without regard for whether the signal is blocked or ignored
 void deliver_signal(struct task *task, int sig, struct siginfo_ info);
+// Queue a signal on a task that task_start has not started yet, waking nothing.
+// send_signal's wake pokes task->thread, which until task_start is still the
+// PARENT's pthread, copied by task_create_. The task takes the signal before
+// its first instruction only if its start path looks for one (task_thread).
+void signal_queue_before_start(struct task *task, int sig, struct siginfo_ info);
 // Discard the unconsumed SIGTRAPs that PTRACE_INTERRUPT queued to this task,
 // identified by SI_PTRACE_INTERRUPT_. Called on detach: see the definition in
 // signal.c for why an interrupt trap must not outlive the tracing relationship.

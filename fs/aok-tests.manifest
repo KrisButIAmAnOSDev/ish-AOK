@@ -148,6 +148,8 @@ posix_timer_exec.c
 sock_options.c
 ptrace_attach.c
 ptrace_detach_survives.c
+ptrace_eventmsg.c
+ptrace_stop_races.c
 inet_nat_bind.c
 signal_process_target.c
 exec_de_thread.c

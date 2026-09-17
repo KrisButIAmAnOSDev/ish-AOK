@@ -40,14 +40,20 @@ struct task;
 #define PTRACE_EVENT_VFORK_ 2
 #define PTRACE_EVENT_CLONE_ 3
 #define PTRACE_EVENT_EXEC_ 4
+#define PTRACE_EVENT_VFORK_DONE_ 5
 #define PTRACE_EVENT_EXIT_ 6
 #define PTRACE_EVENT_STOP_ 128
+
+// PTRACE_GETEVENTMSG at a syscall stop: which of the pair it is (Linux 5.3+).
+#define PTRACE_EVENTMSG_SYSCALL_ENTRY_ 1
+#define PTRACE_EVENTMSG_SYSCALL_EXIT_ 2
 
 #define PTRACE_O_TRACESYSGOOD_ 1
 #define PTRACE_O_TRACEFORK_ 2
 #define PTRACE_O_TRACEVFORK_ 4
 #define PTRACE_O_TRACECLONE_ 8
 #define PTRACE_O_TRACEEXEC_ 0x10
+#define PTRACE_O_TRACEVFORKDONE_ 0x20
 #define PTRACE_O_TRACEEXIT_ 0x40
 
 struct user_regs_struct_ {

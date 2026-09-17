@@ -1832,6 +1832,11 @@ static int native_dispatch_exec(struct fd *fd, struct exec_args argv, struct exe
 }
 
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
+    // PTRACE_EVENT_EXEC's message is the pid this task had BEFORE the exec. A
+    // thread that is not the leader takes the leader's pid in exec_de_thread,
+    // and the tracer needs the old one to tell which of its tasks is gone.
+    pid_t_ old_pid = current->pid;
+
     // open_exec decides what the file IS and whether this caller may execute
     // it before opening it, which is Linux's do_open_execat order. This used
     // to open first and then ask only whether ANY execute bit was set, so a
@@ -2018,7 +2023,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
             .kill.uid = current->uid,
         };
         if (current->ptrace.options & PTRACE_O_TRACEEXEC_)
-            ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXEC_, current->pid);
+            ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXEC_, old_pid);
         else
             ptrace_signal_stop(SIGTRAP_, &info);
     }

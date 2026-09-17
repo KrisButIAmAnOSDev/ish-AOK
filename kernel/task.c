@@ -1393,6 +1393,22 @@ static void *task_thread(void *task) {
     update_thread_name();
     task_pthread_canary_register();
 
+    // A child its parent's tracer attached to at clone time is born with a
+    // SIGSTOP queued (sys_clone_common_). Linux takes it on the child's way out
+    // of ret_from_fork, before the child runs an instruction of its own; the
+    // loop in task_run_current looks for signals only after the first
+    // interrupt, by which time a child that exits at once has already exited.
+    if (current->ptrace.traced) {
+        lock(&current->sighand->lock, 0);
+        bool pending = ((current->pending | current->sighand->pending) &
+                ~current->blocked) != 0;
+        unlock(&current->sighand->lock);
+        if (pending) {
+            receive_signals();
+            group_stop_wait();
+        }
+    }
+
     task_run_current();
     die("task_thread returned"); // above function call should never return
     return NULL;

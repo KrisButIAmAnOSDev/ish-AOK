@@ -952,6 +952,23 @@ void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
     deliver_signal_with_sighand(task, sighand, sig, info);
 }
 
+void signal_queue_before_start(struct task *task, int sig, struct siginfo_ info) {
+    struct sighand *sighand = task->sighand;
+    if (sighand == NULL)
+        return;
+    lock(&sighand->lock, 0);
+    if (signal_is_realtime(sig) || !sigset_has(task->pending, sig)) {
+        struct sigqueue *sigqueue = malloc(sizeof(struct sigqueue));
+        if (sigqueue != NULL) {
+            sigset_add(&task->pending, sig);
+            sigqueue->info = info;
+            sigqueue->info.sig = sig;
+            list_add_tail(&task->queue, &sigqueue->queue);
+        }
+    }
+    unlock(&sighand->lock);
+}
+
 static bool signal_list_still_has_locked(struct list *queue, int sig) {
     struct sigqueue *sigqueue;
     list_for_each_entry(queue, sigqueue, queue) {
