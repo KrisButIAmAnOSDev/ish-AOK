@@ -66,7 +66,7 @@ static size_t args_size(struct exec_args args);
 static inline size_t args_strings_size(struct exec_args args);
 static ssize_t user_read_exec_ptr(guest_addr_t addr, qword_t *ptr_out);
 static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_addr, ssize_t *argc_out,
-        char **argv_out, char **envp_out);
+        char **argv_out, ssize_t *envc_out, char **envp_out);
 static int read_header(struct fd *fd, struct elf_info *header);
 static int read_prg_headers(struct fd *fd, struct elf_info header, struct elf_prg_info **ph_out);
 static int load_entry(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t bias, struct fd *fd);
@@ -2070,13 +2070,17 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
 // no color at all, so rewrite that single bogus value to screen-256color, matching
 // the TERM the app hands its interactive sessions (TerminalViewController.m). Returns
 // a malloc'd replacement buffer (caller frees) or NULL when no rewrite is needed,
-// keeping the common path allocation-free. envp_len counts every byte of the block
-// including the trailing terminator, matching args_size()'s view of it.
-static char *exec_fixup_term(const char *envp, size_t envp_len) {
+// keeping the common path allocation-free.
+//
+// The block is walked by envp.count. It cannot be walked by scanning for the
+// terminator: an empty string is a legal entry and looks exactly like the end
+// of the list, so a scan stopped at the first one.
+static char *exec_fixup_term(struct exec_args envp) {
     const char bogus[] = "TERM=vt102";
     const char fixed[] = "TERM=screen-256color";
     const char *match = NULL;
-    for (const char *e = envp; *e != '\0'; e += strlen(e) + 1) {
+    const char *e = envp.args;
+    for (size_t i = 0; i < envp.count; i++, e += strlen(e) + 1) {
         if (strncmp(e, "TERM=", 5) == 0) {
             // Only the first TERM entry takes effect; stop at it whatever its value.
             if (strcmp(e, bogus) == 0)
@@ -2087,34 +2091,46 @@ static char *exec_fixup_term(const char *envp, size_t envp_len) {
     if (match == NULL)
         return NULL;
 
+    // Every byte of the block, the trailing terminator included.
+    size_t envp_len = args_size(envp);
     char *buf = malloc(envp_len + (sizeof(fixed) - sizeof(bogus)));
     if (buf == NULL)
         return NULL; // out of memory: leave the env unchanged rather than fail exec
-    size_t prefix = (size_t) (match - envp);
+    size_t prefix = (size_t) (match - envp.args);
     const char *rest = match + sizeof(bogus); // next entry (sizeof includes the NUL)
-    size_t rest_len = envp_len - (size_t) (rest - envp);
+    size_t rest_len = envp_len - (size_t) (rest - envp.args);
     char *w = buf;
-    memcpy(w, envp, prefix); w += prefix;
+    memcpy(w, envp.args, prefix); w += prefix;
     memcpy(w, fixed, sizeof(fixed)); w += sizeof(fixed);
     memcpy(w, rest, rest_len);
     return buf;
 }
 
-int do_execve(const char *file, size_t argc, const char *argv_p, const char *envp_p) {
-    struct exec_args argv = {.count = argc, .args = argv_p};
-    struct exec_args envp = {.args = envp_p};
-    while (*envp_p != '\0') {
-        envp_p += strlen(envp_p) + 1;
-        envp.count++;
-    }
-    // envp_p now points at the trailing terminator; the block spans envp.args..envp_p.
-    size_t envp_len = (size_t) (envp_p - envp.args) + 1;
-    char *fixed_env = exec_fixup_term(envp.args, envp_len);
+// Every exec funnels through here with BOTH counts already known. The packed
+// block format ("s1\0s2\0...\0\0") cannot say how many strings it holds when one
+// of them is empty, so the count travels beside it -- which is why argc has
+// always been a parameter, and why envc has to be one too.
+static int do_execve_args(const char *file, struct exec_args argv, struct exec_args envp) {
+    char *fixed_env = exec_fixup_term(envp);
     if (fixed_env != NULL)
         envp.args = fixed_env;
     int err = __do_execve(file, argv, envp);
     free(fixed_env); // NULL-safe: no-op when no rewrite happened
     return err;
+}
+
+// For the host's own callers -- app/*.m, kernel/init.c, kernel/native_io.c --
+// whose blocks hold no empty string, so recounting one by scanning is safe
+// here. A guest can pass one, which is why the execve syscalls below carry
+// envc rather than coming through this. native_io.c is the one to watch: it
+// packs a char *const[] a native program handed it, so if a native program
+// ever passes an empty variable it belongs on the counted path instead --
+// native_pack_args already computes the count it would need.
+int do_execve(const char *file, size_t argc, const char *argv_p, const char *envp_p) {
+    struct exec_args envp = {.args = envp_p};
+    for (const char *e = envp_p; *e != '\0'; e += strlen(e) + 1)
+        envp.count++;
+    return do_execve_args(file, (struct exec_args) {.count = argc, .args = argv_p}, envp);
 }
 
 static ssize_t user_read_string_array(guest_addr_t addr, char *buf, size_t max) {
@@ -2172,28 +2188,26 @@ ssize_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         return path_err;
 
     ssize_t argc;
+    ssize_t envc;
     char *argv = NULL;
     char *envp = NULL;
-    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envc, &envp);
     if (err < 0)
         return err;
 
     STRACE("execve(\"%.1000s\", {", filename);
     const char *args = argv;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < argc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("}, {");
     args = envp;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < envc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("})");
 
     amd64_trace_exec_attempt(filename, argv);
-    err = do_execve(filename, argc, argv, envp);
+    err = do_execve_args(filename, (struct exec_args) {.count = (size_t) argc, .args = argv},
+            (struct exec_args) {.count = (size_t) envc, .args = envp});
 
     free(envp);
     free(argv);
@@ -2210,28 +2224,26 @@ ssize_t sys_execve_guest(guest_addr_t filename_addr, guest_addr_t argv_addr, gue
         return path_err;
 
     ssize_t argc;
+    ssize_t envc;
     char *argv = NULL;
     char *envp = NULL;
-    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envc, &envp);
     if (err < 0)
         return err;
 
     STRACE("execve(\"%.1000s\", {", filename);
     const char *args = argv;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < argc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("}, {");
     args = envp;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < envc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("})");
 
     amd64_trace_exec_attempt(filename, argv);
-    err = do_execve(filename, argc, argv, envp);
+    err = do_execve_args(filename, (struct exec_args) {.count = (size_t) argc, .args = argv},
+            (struct exec_args) {.count = (size_t) envc, .args = envp});
 
     free(envp);
     free(argv);
@@ -2257,9 +2269,10 @@ ssize_t sys_execveat(fd_t dirfd, addr_t filename_addr, addr_t argv_addr, addr_t 
     }
 
     ssize_t argc;
+    ssize_t envc;
     char *argv = NULL;
     char *envp = NULL;
-    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envc, &envp);
     if (err < 0)
         return err;
 
@@ -2293,7 +2306,8 @@ ssize_t sys_execveat(fd_t dirfd, addr_t filename_addr, addr_t argv_addr, addr_t 
 
     STRACE("execveat(%d, \"%s\", ..., %#x)", dirfd, filename, flags);
     amd64_trace_exec_attempt(resolved, argv);
-    err = do_execve(resolved, argc, argv, envp);
+    err = do_execve_args(resolved, (struct exec_args) {.count = (size_t) argc, .args = argv},
+            (struct exec_args) {.count = (size_t) envc, .args = envp});
 
 out_free_args:
     free(envp);
@@ -2320,9 +2334,10 @@ ssize_t sys_execveat_guest(fd_t dirfd, guest_addr_t filename_addr, guest_addr_t 
     }
 
     ssize_t argc;
+    ssize_t envc;
     char *argv = NULL;
     char *envp = NULL;
-    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envc, &envp);
     if (err < 0)
         return err;
 
@@ -2356,20 +2371,17 @@ ssize_t sys_execveat_guest(fd_t dirfd, guest_addr_t filename_addr, guest_addr_t 
 
     STRACE("execveat(%d, \"%.1000s\", {", dirfd, resolved);
     const char *args = argv;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < argc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("}, {");
     args = envp;
-    while (*args != '\0') {
+    for (ssize_t i = 0; i < envc; i++, args += strlen(args) + 1)
         STRACE("\"%.1000s\", ", args);
-        args += strlen(args) + 1;
-    }
     STRACE("}, %d)", flags);
 
     amd64_trace_exec_attempt(resolved, argv);
-    err = do_execve(resolved, argc, argv, envp);
+    err = do_execve_args(resolved, (struct exec_args) {.count = (size_t) argc, .args = argv},
+            (struct exec_args) {.count = (size_t) envc, .args = envp});
 
 out_free_args:
     free(envp);
@@ -2381,7 +2393,7 @@ out_free_args:
 }
 
 static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_addr, ssize_t *argc_out,
-        char **argv_out, char **envp_out) {
+        char **argv_out, ssize_t *envc_out, char **envp_out) {
     char *argv = malloc(ARGV_MAX);
     if (argv == NULL)
         return _ENOMEM;
@@ -2396,12 +2408,13 @@ static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_a
         free(argv);
         return _ENOMEM;
     }
+    ssize_t envc = 0;
     if (envp_addr != 0) {
-        ssize_t err = user_read_string_array(envp_addr, envp, ARGV_MAX);
-        if (err < 0) {
+        envc = user_read_string_array(envp_addr, envp, ARGV_MAX);
+        if (envc < 0) {
             free(envp);
             free(argv);
-            return err;
+            return envc;
         }
     } else {
         // Do not take advantage of this nonstandard and nonportable misfeature!
@@ -2411,6 +2424,7 @@ static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_a
 
     *argc_out = argc;
     *argv_out = argv;
+    *envc_out = envc;
     *envp_out = envp;
     return 0;
 }
