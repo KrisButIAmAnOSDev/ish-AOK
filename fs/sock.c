@@ -1408,6 +1408,25 @@ static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ 
             // hard failure here would make callers that treat "the kernel
             // rejected my request" as fatal (as opposed to "iSH silently
             // no-ops it") abort setup entirely.
+            //
+            // Except a GET, which Linux always answers, whether or not the
+            // request asked for an ack: with the table, or with EOPNOTSUPP
+            // from rtnetlink_rcv_msg when nothing handles the type. Answering
+            // nothing was survivable while a receive on an empty queue failed
+            // at once with EAGAIN; now that it waits, it was a hang. `ip
+            // neigh` and `ip rule` (RTM_GETNEIGH, RTM_GETRULE), busybox and
+            // iproute2 alike, and iproute2's `ip netconf` (RTM_GETNETCONF)
+            // sat for ever, where before they had spun at 100% CPU. A dump
+            // gets the empty table, which is the table AOK has; a get of one
+            // object, EOPNOTSUPP. A GET is a type whose kind bits,
+            // (type - RTM_BASE) & 3, read 2 (rtnl_msgtype_kind), and only a
+            // real request is one.
+            if ((hdr->nlmsg_flags & NLM_F_REQUEST_) && hdr->nlmsg_type >= RTM_NEWLINK_ &&
+                    ((hdr->nlmsg_type - RTM_NEWLINK_) & 3) == 2) {
+                if (hdr->nlmsg_flags & NLM_F_DUMP_)
+                    return netlink_append_done(sock, hdr->nlmsg_seq);
+                return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+            }
             if (hdr->nlmsg_flags & NLM_F_ACK_)
                 return netlink_append_error(sock, hdr->nlmsg_seq, hdr, 0);
             return 0;
@@ -2853,6 +2872,11 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
         static const char zeros[NLMSG_ALIGNTO] = {};
         err = netlink_reply_append_locked(sock, zeros, pad_len);
     }
+    // Wakes a receive blocked on the empty queue (netlink_wait_for_message_
+    // locked), whichever thread queued this: a notification from the watch
+    // thread, or a reply to a request another thread sent on this socket.
+    if (err == 0)
+        notify(&sock->socket.netlink_reply_cond);
 out:
     unlock(&sock->socket.netlink_reply_lock);
     return err;
@@ -3609,20 +3633,99 @@ static int netlink_handle_sendmsg(struct fd *sock, const struct msghdr *msg) {
         offset += NLMSG_ALIGN(hdr->nlmsg_len);
     }
     free(req);
+    // The replies are news to a thread polling this socket. The watch thread's
+    // notifications already say so (netlink_notify_deliver_link); a request's
+    // replies did not, so a poll or epoll_wait in another thread found them
+    // only at its next periodic recheck -- measured ~700ms late, where Linux
+    // wakes it at once. A receive blocked in another thread needs no help:
+    // netlink_append_nlmsg notifies it. No lock of ours is held here, which
+    // poll_wakeup requires.
+    lock(&sock->socket.netlink_reply_lock, 0);
+    bool queued = sock->socket.netlink_reply_off < sock->socket.netlink_reply_len;
+    unlock(&sock->socket.netlink_reply_lock);
+    if (queued)
+        poll_wakeup(sock, POLL_READ);
     return err < 0 ? err : (int) req_len;
 }
 
+// A blocking receive with nothing queued waits for a message, as Linux's
+// skb_recv_datagram does. It used to fail with EAGAIN at once, whatever
+// O_NONBLOCK and MSG_DONTWAIT said. Request/response never noticed, because a
+// request's replies are queued inside its own sendmsg; a program waiting for
+// multicast notifications did: iproute2's rtnl_listen() retries on EAGAIN, so
+// `ip monitor` spun at 100% CPU instead of sleeping.
+//
+// wait_for, like every in-process reader (eventfd, inotify, fifos): it wakes
+// for netlink_append_nlmsg's notify, for a signal, and for a checkpoint freeze,
+// and it waits in slices, so a lost wake costs at most a second rather than
+// the wait. Call with netlink_reply_lock held and the queue empty; returns 0
+// once something is queued, still holding the lock.
+//
+// SO_RCVTIMEO is Linux's sk_rcvtimeo: EAGAIN when it runs out, and a zero one
+// (what a negative timeval sets) never waits at all. A signal is EINTR; the
+// caller decides whether SA_RESTART may restart it, which it may not when a
+// timeout is armed (signal(7)).
+static int netlink_wait_for_message_locked(struct fd *sock) {
+    bool timed = sock->socket.netlink_rcvtimeo_set;
+    struct timespec left = sock->socket.netlink_rcvtimeo;
+    if (timed && !timespec_positive(left))
+        return _EAGAIN;
+    for (;;) {
+        int err = wait_for(&sock->socket.netlink_reply_cond,
+                &sock->socket.netlink_reply_lock, timed ? &left : NULL);
+        // A message first, whatever else ended the wait:
+        // __skb_wait_for_more_packets looks at the queue before it asks about
+        // signals, and the signal is still delivered on the way out.
+        if (sock->socket.netlink_reply_off < sock->socket.netlink_reply_len)
+            return 0;
+        if (err == _ETIMEDOUT)
+            return _EAGAIN;
+        // wait_for's _EINTR also means a bare SIGUSR1 poke landed: the
+        // address-space barrier pokes every sibling that is not io_block when
+        // another thread maps or unmaps memory, and the poke marks the wait
+        // interrupted. Measured before this check, a thread of a process whose
+        // other threads ran guest code and called mmap got EINTR ~100ms into
+        // its receive, with no signal sent. Only a signal or a freeze ends the
+        // wait; the same test wait_for itself makes, so the next call cannot
+        // come straight back with the same answer.
+        if (err < 0 && (task_wake_signal_pending() || checkpoint_freeze_pending()))
+            return err;
+    }
+}
+
 static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_flags) {
+    // Asked before the lock: sock_getflags takes none, but nothing here needs
+    // the flags under it either.
+    bool may_wait = !(fake_flags & MSG_DONTWAIT_) && !(fd_getflags(sock) & O_NONBLOCK_);
+    bool timed = false;
+    // A reference of this call's own while it waits. Nothing else holds the
+    // socket for a syscall, so a close() from another thread would free it
+    // under the sleeping reader; with this the close only drops the table's
+    // reference and the last one goes when the receive returns, as Linux's
+    // fput does.
+    struct fd *held = NULL;
     lock(&sock->socket.netlink_reply_lock, 0);
-    size_t available = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
+    size_t available = 0;
     bool peek = (fake_flags & MSG_PEEK_) != 0;
     bool want_trunc_len = (fake_flags & MSG_TRUNC_) != 0;
     size_t capacity = diag_iov_capacity(msg->msg_iov, msg->msg_iovlen);
     int ret;
     if (sock->socket.netlink_reply_off >= sock->socket.netlink_reply_len) {
-        ret = _EAGAIN;
-        goto out;
+        if (!may_wait) {
+            ret = _EAGAIN;
+            goto out;
+        }
+        held = fd_retain_if_live(sock);
+        if (held == NULL) {
+            ret = _EBADF;
+            goto out;
+        }
+        timed = sock->socket.netlink_rcvtimeo_set;
+        ret = netlink_wait_for_message_locked(sock);
+        if (ret < 0)
+            goto out;
     }
+    available = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
     // No capacity==0 early-out here: a zero-length read must still fall
     // through to the loop below, which truncate-AND-CONSUMES the first
     // message (Linux datagram semantics: a recv always eats the datagram,
@@ -3684,10 +3787,17 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
         ret = (int) copied;
 out:
     unlock(&sock->socket.netlink_reply_lock);
+    // Outside the lock: signal_should_restart_syscall takes sighand->lock.
+    if (ret == _EINTR && !timed)
+        ret = signal_restart_or_eintr(ret);
     if (getenv("ISH_NETLINK_DIAG") != NULL)
         printk("NLDIAG: recvmsg pid=%d flags=%#x cap=%zu avail=%zu ret=%d trunc=%d\n",
                current->pid, fake_flags, capacity, available, ret,
                !!(msg->msg_flags & MSG_TRUNC));
+    // Last, and nothing may touch the socket after it: if the guest closed it
+    // while this waited, this is the close.
+    if (held != NULL)
+        fd_close(held);
     return ret;
 }
 
@@ -5908,7 +6018,13 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
             .msg_iov = &iov,
             .msg_iovlen = 1,
         };
-        ssize_t netlink_res = netlink_handle_recvmsg(sock, &msg, flags);
+        // io_block, as every other socket wait sets it: /proc reports the
+        // task sleeping rather than running, and the address-space barrier
+        // leaves it unpoked (task_poke_shared_mem).
+        ssize_t netlink_res = 0;
+        TASK_MAY_BLOCK {
+            netlink_res = netlink_handle_recvmsg(sock, &msg, flags);
+        }
         if (netlink_res < 0) {
             free(buffer);
             return (int_t) netlink_res;
@@ -6138,7 +6254,65 @@ static void sock_init_emulation_defaults(struct fd *fd) {
     fd->socket.netlink_rcvbuf = 212992;
     fd->socket.netlink_sndbuf = 212992;
     lock_init(&fd->socket.netlink_reply_lock, "netlink_reply\0");
+    cond_init(&fd->socket.netlink_reply_cond);
     fd->socket.netlink_notify_registered = false;
+}
+
+// SO_RCVTIMEO/SO_SNDTIMEO on a fake netlink socket, which has no host fd to
+// hold them. They were accepted and thrown away, and read back as EBADF, so a
+// receive timeout could never end a wait. Parsed as Linux's sock_set_timeout
+// does, measured on Linux 6.12 (HZ 250), i386 and x86_64:
+//   - the _OLD options take the ABI's struct timeval (8 bytes on i386), the
+//     _NEW ones (66, 67) a 64-bit one on every ABI; a short optlen is EINVAL
+//   - a microsecond field outside [0, 1000000) is EDOM
+//   - zero is no timeout, and so is MAX_SCHEDULE_TIMEOUT / HZ - 1 seconds or
+//     more
+//   - a negative second count is a timeout of zero jiffies: the socket never
+//     waits, and the option reads back as zero
+// Linux rounds what it reads back up to whole jiffies; this does not.
+#define NETLINK_TIMEO_FOREVER_SEC (INT64_MAX / 250 - 1)
+
+static int netlink_timeo_set(struct fd *sock, dword_t option, const char *value,
+        dword_t value_len, enum guest_abi abi) {
+    bool old = option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_;
+    int64_t sec, usec;
+    if (old && abi == GUEST_ABI_I386) {
+        int32_t tv[2];
+        if (value_len < sizeof(tv))
+            return _EINVAL;
+        memcpy(tv, value, sizeof(tv));
+        sec = tv[0];
+        usec = tv[1];
+    } else {
+        int64_t tv[2];
+        if (value_len < sizeof(tv))
+            return _EINVAL;
+        memcpy(tv, value, sizeof(tv));
+        sec = tv[0];
+        usec = tv[1];
+    }
+    if (usec < 0 || usec >= 1000000)
+        return _EDOM;
+    struct timespec timeo = {0};
+    bool set = false;
+    if (sec < 0) {
+        set = true;
+    } else if ((sec != 0 || usec != 0) && sec < NETLINK_TIMEO_FOREVER_SEC) {
+        timeo.tv_sec = (time_t) sec;
+        timeo.tv_nsec = (long) usec * 1000;
+        set = true;
+    }
+    // Under the lock a receive reads them with, so it never sees half of one.
+    lock(&sock->socket.netlink_reply_lock, 0);
+    if (option == SO_RCVTIMEO_OLD_ || option == SO_RCVTIMEO_) {
+        sock->socket.netlink_rcvtimeo = timeo;
+        sock->socket.netlink_rcvtimeo_set = set;
+    } else {
+        sock->socket.netlink_sndtimeo = timeo;
+        sock->socket.netlink_sndtimeo_set = set;
+    }
+    unlock(&sock->socket.netlink_reply_lock);
+    return 0;
 }
 
 static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
@@ -6541,6 +6715,10 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
                 sock->socket.netlink_sndbuf = doubled;
             return 0;
         }
+        if (level == SOL_SOCKET_ &&
+                (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
+                 option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_))
+            return netlink_timeo_set(sock, option, value, value_len, abi);
         // A fake socket is never actually put on the wire, so REUSEADDR/PORT
         // are meaningless here -- but systemd sets SO_REUSEADDR unconditionally
         // on every listening socket it creates, including its kobject-uevent
@@ -6550,9 +6728,7 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         // descriptor"), so systemd-udevd.service (and therefore udev as a
         // whole) never started.
         if (level == SOL_SOCKET_ &&
-                (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
-                 option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_ ||
-                 option == SO_ATTACH_FILTER_ || option == SO_DETACH_FILTER_ ||
+                (option == SO_ATTACH_FILTER_ || option == SO_DETACH_FILTER_ ||
                  option == SO_REUSEADDR_ || option == SO_REUSEPORT_ ||
                  // The other half of what sd-netlink sets unconditionally
                  // on an rtnetlink manager socket (binds it to the
@@ -6773,6 +6949,25 @@ static bool sockopt_is_linux_soft_unsupported(dword_t level, dword_t option) {
     return false;
 }
 
+// The read side of netlink_timeo_set. A short buffer truncates, as it does on
+// Linux.
+static void netlink_timeo_get(struct fd *sock, dword_t option, enum guest_abi abi,
+        char *value, dword_t user_value_len, dword_t *value_len) {
+    lock(&sock->socket.netlink_reply_lock, 0);
+    struct timespec timeo = option == SO_RCVTIMEO_OLD_ || option == SO_RCVTIMEO_
+            ? sock->socket.netlink_rcvtimeo : sock->socket.netlink_sndtimeo;
+    unlock(&sock->socket.netlink_reply_lock);
+    int64_t sec = timeo.tv_sec;
+    int64_t usec = timeo.tv_nsec / 1000;
+    if ((option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_) && abi == GUEST_ABI_I386) {
+        int32_t tv[2] = {(int32_t) sec, (int32_t) usec};
+        sockopt_store_value(value, user_value_len, value_len, tv, sizeof(tv));
+    } else {
+        int64_t tv[2] = {sec, usec};
+        sockopt_store_value(value, user_value_len, value_len, tv, sizeof(tv));
+    }
+}
+
 static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
         guest_addr_t value_addr, guest_addr_t len_addr, enum guest_abi abi) {
     STRACE("getsockopt(%d, %d, %d, %#llx, %#llx)", sock_fd, level, option,
@@ -6840,6 +7035,10 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         // for these on a fake netlink socket.
         dword_t bufsize = option == SO_RCVBUF_ ? sock->socket.netlink_rcvbuf : sock->socket.netlink_sndbuf;
         sockopt_store_value(value, user_value_len, &value_len, &bufsize, sizeof(bufsize));
+    } else if (sock->socket.domain == AF_NETLINK_ && sock->real_fd < 0 && level == SOL_SOCKET_ &&
+            (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
+             option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_)) {
+        netlink_timeo_get(sock, option, abi, value, user_value_len, &value_len);
     } else if (sock->socket.domain == AF_NETLINK_ && sock->real_fd < 0 && level == SOL_NETLINK_) {
         if (option == NETLINK_CAP_ACK_ || option == NETLINK_EXT_ACK_ || option == NETLINK_GET_STRICT_CHK_) {
             dword_t enabled =
@@ -8199,7 +8398,10 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     }
 
     if (sock->socket.domain == AF_NETLINK_) {
-        ssize_t res = netlink_handle_recvmsg(sock, &msg, flags);
+        ssize_t res = 0;
+        TASK_MAY_BLOCK { // see the recvfrom path
+            res = netlink_handle_recvmsg(sock, &msg, flags);
+        }
         if (res >= 0) {
             size_t n = (size_t) res;
             for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
@@ -8945,8 +9147,15 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         return 0;
     if (fd->socket.domain == AF_NETLINK_) {
         // Mirror recvfrom()/recvmsg(): deliver the buffered netlink reply to a
-        // bare read()/readv() too. Returns _EAGAIN when no reply is queued, the
-        // same as the recvfrom() path.
+        // bare read()/readv() too, waiting for one the same way when the
+        // socket blocks.
+        //
+        // Except for a read of nothing, which Linux's sock_read_iter answers
+        // with 0 before it looks at the queue. Now that an empty queue waits,
+        // passing it on would block a zero-length read until a message came
+        // -- and then eat that message, which recvmsg does and read does not.
+        if (size == 0)
+            return 0;
         struct iovec iov = {
             .iov_base = buf,
             .iov_len = size,

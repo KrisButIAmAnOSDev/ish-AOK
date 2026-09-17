@@ -251,6 +251,18 @@ struct fd {
             // from more than one thread before that feature existed, so
             // there was previously no lock here at all.
             lock_t netlink_reply_lock;
+            // A blocking receive with nothing queued waits here, under
+            // netlink_reply_lock; netlink_append_nlmsg notifies it.
+            cond_t netlink_reply_cond;
+            // SO_RCVTIMEO/SO_SNDTIMEO: no host fd to hold them. `set` with a
+            // zero value is Linux's zero-jiffy timeout, what a NEGATIVE
+            // timeval gives: never wait. Unset is no timeout at all. Only the
+            // receive side is ever consulted -- a netlink send never waits --
+            // but both read back as set.
+            struct timespec netlink_rcvtimeo;
+            struct timespec netlink_sndtimeo;
+            bool netlink_rcvtimeo_set;
+            bool netlink_sndtimeo_set;
             // Membership in the process-wide list of netlink sockets
             // subscribed to at least one multicast group (netlink_groups
             // != 0), maintained in fs/sock.c. Only valid while
