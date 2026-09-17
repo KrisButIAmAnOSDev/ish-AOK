@@ -88,6 +88,12 @@ struct fd {
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock
             struct list unix_scm;
+            // Cookie this socket's connect() put on the wire, while it is
+            // still unconsumed. Non-zero means "connected, but no accept has
+            // linked unix_peer yet", which is when SCM_RIGHTS parcels have to
+            // wait with the cookie rather than on a peer that does not exist.
+            // Locked by unix_token_lock.
+            uint64_t unix_peer_cookie;
             struct ucred_ {
                 pid_t_ pid;
                 uid_t_ uid;

@@ -3971,13 +3971,35 @@ out:
 // concurrent sender close (which unregisters under the same lock, then
 // unlinks under peer_lock) either wins entirely -- lookup misses, no link --
 // or blocks until the link is made and then tears it down normally.
+//
+// A token also carries the SCM_RIGHTS parcels its sender posted before the
+// accept side linked the peer. Linux allows fd passing the moment connect()
+// returns -- the transport connection exists then, and accept() only hands
+// the server a descriptor for a child socket that is already connected --
+// but a stream parcel here is queued on the RECEIVING fd, which does not
+// exist until accept() creates it. So it waits with the cookie, on the
+// connection rather than on either fd, and unix_socket_finish_peer() moves
+// it onto the accepted socket's queue at link time. Parking it here rather
+// than on the sender also means a client that sends and closes immediately
+// still delivers: the entry survives as a tombstone, exactly as the cookie
+// itself does.
 struct unix_token {
     uint64_t cookie;
     struct fd *sender;
+    struct list scm;      // struct scm parcels sent before the link
     struct list tokens;
 };
 static lock_t unix_token_lock = LOCK_INITIALIZER;
 static struct list unix_tokens = LIST_INITIALIZER(unix_tokens);
+static void scm_free(struct scm *scm);
+
+static void unix_token_free_scm_locked(struct unix_token *token) {
+    struct scm *scm, *tmp;
+    list_for_each_entry_safe(&token->scm, scm, tmp, queue) {
+        list_remove(&scm->queue);
+        scm_free(scm);
+    }
+}
 
 static struct unix_token *unix_token_find_locked(uint64_t cookie) {
     struct unix_token *token;
@@ -3998,10 +4020,27 @@ static uint64_t unix_token_register(struct fd *sock) {
         arc4random_buf(&token->cookie, sizeof(token->cookie));
     } while (token->cookie == 0 || unix_token_find_locked(token->cookie) != NULL);
     token->sender = sock;
+    list_init(&token->scm);
     list_add(&unix_tokens, &token->tokens);
     uint64_t cookie = token->cookie;
+    sock->socket.unix_peer_cookie = cookie;
     unlock(&unix_token_lock);
     return cookie;
+}
+
+// Park an SCM_RIGHTS parcel with the cookie this socket's connect() put on
+// the wire, for unix_socket_finish_peer() to deliver when the accept side
+// links the peer. Caller holds unix_token_lock. Takes ownership of `scm` and
+// returns true on success; false means there is no unconsumed cookie, i.e.
+// this socket genuinely has no peer and the caller owes the guest EPIPE.
+static bool unix_token_queue_scm_locked(struct fd *sock, struct scm *scm) {
+    if (sock->socket.unix_peer_cookie == 0)
+        return false;
+    struct unix_token *token = unix_token_find_locked(sock->socket.unix_peer_cookie);
+    if (token == NULL || token->sender != sock)
+        return false;
+    list_add_tail(&token->scm, &scm->queue);
+    return true;
 }
 
 // Tombstone every token registered by `sock` (unconsumed sends). Called
@@ -4009,9 +4048,12 @@ static uint64_t unix_token_register(struct fd *sock) {
 // itself must SURVIVE as a tombstone (sender=NULL): its 8 cookie bytes are
 // already on the wire, and the acceptor must still recognize and consume
 // them -- just without linking a peer -- or the guest would read 8 bytes of
-// garbage ahead of its real data. Tombstones of connections that never get
-// accepted are capped; evicting an ancient one merely re-opens the
-// stray-8-bytes corner for a connection nobody accepted in ages.
+// garbage ahead of its real data. Any parcels it carries survive with it,
+// so an fd sent by a client that closed before the server accepted still
+// arrives, the way it does on Linux. Tombstones of connections that never
+// get accepted are capped; evicting an ancient one merely re-opens the
+// stray-8-bytes corner for a connection nobody accepted in ages (and drops
+// its parcels' fd references, which nothing can reach any more).
 #define UNIX_TOKEN_TOMBSTONE_MAX 1024
 static unsigned unix_token_tombstones = 0;
 
@@ -4024,12 +4066,14 @@ static void unix_token_unregister_sender(struct fd *sock) {
             unix_token_tombstones++;
         }
     }
+    sock->socket.unix_peer_cookie = 0;
     if (unix_token_tombstones > UNIX_TOKEN_TOMBSTONE_MAX) {
         list_for_each_entry_safe(&unix_tokens, token, tmp, tokens) {
             if (unix_token_tombstones <= UNIX_TOKEN_TOMBSTONE_MAX)
                 break;
             if (token->sender == NULL) {
                 list_remove(&token->tokens);
+                unix_token_free_scm_locked(token);
                 free(token);
                 unix_token_tombstones--;
             }
@@ -4151,6 +4195,19 @@ static int unix_socket_finish_peer(struct fd *sock) {
         if (peer == NULL)
             unix_token_tombstones--;
         list_remove(&token->tokens);
+        // Parcels the connector sent before this accept ran. They belong to
+        // THIS socket's queue -- it is the receiving fd they were addressed
+        // to, it just did not exist yet -- and they must land on it before
+        // the guest can call recvmsg, which accept4 guarantees by calling
+        // this before it returns the descriptor. Delivered even for a
+        // tombstone: the fds crossed, the sender merely closed afterwards.
+        struct list pending_scm;
+        list_init(&pending_scm);
+        struct scm *pending, *pending_tmp;
+        list_for_each_entry_safe(&token->scm, pending, pending_tmp, queue) {
+            list_remove(&pending->queue);
+            list_add_tail(&pending_scm, &pending->queue);
+        }
         free(token);
 
         // The cookie is validated and its sender is live (its close would
@@ -4174,10 +4231,29 @@ static int unix_socket_finish_peer(struct fd *sock) {
             sock->socket.unix_peer_cred_valid = true;
             peer->socket.unix_peer_cred = sock->socket.unix_cred;
             peer->socket.unix_peer_cred_valid = true;
+            peer->socket.unix_peer_cookie = 0; // consumed: later sends go
+                                               // straight to this queue
             notify(&peer->socket.unix_got_peer);
         }
         sock->socket.unix_peer_pending = false;
         unlock(&peer_lock);
+        if (!list_empty(&pending_scm)) {
+            if (got == sizeof(cookie)) {
+                lock(&sock->lock, 0);
+                list_for_each_entry_safe(&pending_scm, pending, pending_tmp, queue) {
+                    list_remove(&pending->queue);
+                    list_add_tail(&sock->socket.unix_scm, &pending->queue);
+                }
+                unlock(&sock->lock);
+            } else {
+                // The peeked bytes vanished, so the connection died under
+                // us: nothing can ever read these.
+                list_for_each_entry_safe(&pending_scm, pending, pending_tmp, queue) {
+                    list_remove(&pending->queue);
+                    scm_free(pending);
+                }
+            }
+        }
         unlock(&unix_token_lock);
         return 0;
     }
@@ -8211,22 +8287,38 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
                     goto out_free_scm;
                 }
             } else {
+            // Stream transport: the parcel is queued on the RECEIVING fd.
+            // Before the server's accept() there is no receiving fd, so it
+            // waits with the connect side's cookie instead and lands on the
+            // accepted socket when unix_socket_finish_peer() links the two.
+            // Linux allows fd passing from the moment connect() returns, and
+            // a client that connects and immediately passes an fd (Wayland,
+            // D-Bus) used to get EPIPE here.
+            // unix_token_lock nests OUTSIDE peer_lock.
+            lock(&unix_token_lock, 0);
             lock(&peer_lock, 0);
             struct fd *peer = sock->socket.unix_peer;
-            if (peer == NULL) {
+            if (peer != NULL) {
+                printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=%d real_ctrl_len=%zu\n",
+                       current ? current->pid : -1, num_fds, sock->real_fd, peer->real_fd,
+                       msg.msg_controllen);
+                lock(&peer->lock, 0);
+                list_add_tail(&peer->socket.unix_scm, &scm->queue);
+                unlock(&peer->lock);
+            } else if (unix_token_queue_scm_locked(sock, scm)) {
+                printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=pending real_ctrl_len=%zu\n",
+                       current ? current->pid : -1, num_fds, sock->real_fd,
+                       msg.msg_controllen);
+            } else {
                 printk("INFO: scm-send pid=%d EPIPE: unix_peer is NULL on sock real_fd=%d\n",
                        current ? current->pid : -1, sock->real_fd);
                 unlock(&peer_lock);
+                unlock(&unix_token_lock);
                 err = _EPIPE;
                 goto out_free_scm;
             }
-            printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=%d real_ctrl_len=%zu\n",
-                   current ? current->pid : -1, num_fds, sock->real_fd, peer->real_fd,
-                   msg.msg_controllen);
-            lock(&peer->lock, 0);
-            list_add_tail(&peer->socket.unix_scm, &scm->queue);
-            unlock(&peer->lock);
             unlock(&peer_lock);
+            unlock(&unix_token_lock);
             }
         }
     }
@@ -8390,14 +8482,20 @@ out_free_scm:
             if (unix_dgram_scm_take(dgram_scm_cookie) != NULL)
                 scm_free(scm);
         } else {
+            // The parcel is on the peer fd's queue, or still waiting with
+            // the connect cookie, or on neither because the failure came
+            // before it was queued at all. The node itself knows which, so
+            // hold both owners' locks and let list_remove_safe decide.
+            lock(&unix_token_lock, 0);
             lock(&peer_lock, 0);
             struct fd *peer = sock->socket.unix_peer;
-            if (peer != NULL) {
+            if (peer != NULL)
                 lock(&peer->lock, 0);
-                list_remove_safe(&scm->queue);
+            list_remove_safe(&scm->queue);
+            if (peer != NULL)
                 unlock(&peer->lock);
-            }
             unlock(&peer_lock);
+            unlock(&unix_token_lock);
             scm_free(scm);
         }
     }
