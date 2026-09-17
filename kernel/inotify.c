@@ -532,7 +532,7 @@ static ssize_t inotify_read(struct fd *fd, void *buf, size_t bufsize) {
             unlock(&fd->lock);
             return _EAGAIN;
         }
-        if (wait_for(&fd->cond, &fd->lock, NULL)) {
+        if (wait_for_blocked(&fd->cond, &fd->lock, NULL)) {
             unlock(&fd->lock);
             return _EINTR;
         }

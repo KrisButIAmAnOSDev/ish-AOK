@@ -1175,7 +1175,7 @@ looks free there: DisplayRFBView forwards only Cmd+= + - 0 to the guest, and
 deliberately not Cmd+letter. Confirm it does not also reach the Wayland
 session before claiming it.
 
-### A wait that trusts io_block alone can still be poked into EINTR
+### The signal waits can still be poked into EINTR
 
 **Established (2026-09-17).** The address-space barrier
 (`task_poke_shared_mem`) skips a task that is `io_block`, but it can read the
@@ -1184,21 +1184,34 @@ lands inside the wait, and `wait_for` reports it as `_EINTR` with no signal
 pending. Seen unforced once in several hundred tries: an `inotify` read on the
 Devuan arm64 root came back EINTR at 0ms with no handler run, while a sibling
 thread mapped memory. `ISH_TEST_POKE_BLOCKED_TASKS=<comm prefix>` forces the
-race (kernel/task.c). Forced, on the Alpine arm64 root, with one sibling
-spinning and one mapping: a FIFO open, an `eventfd` read, an `inotify` read, a
-pty read and `rt_sigtimedwait` all returned EINTR within 1-11ms. poll, select,
-epoll, futex, waitpid, nanosleep, a pipe read and recv already ignore a bare
-poke. So does everything on `wait_for_blocked` (util/sync.c): msgrcv, msgsnd,
-semop, semtimedop, io_getevents and FUSE requests, where the forced run is
-what proved that half of it (`tests/manual/blocked_wait_state.c`).
+race (kernel/task.c).
 
-**Next step.** Move the other `wait_for` callers that return its `_EINTR`
-unexamined onto `wait_for_blocked`. It restores `io_block` rather than
-clearing it, so it nests inside `TASK_MAY_BLOCK`. They are: fs/fifo.c,
-kernel/eventfd.c, kernel/inotify.c, fs/tty.c, the timerfd read in
-kernel/time.c, the kmsg wait in kernel/log.c, the `/dev/fuse` read in
-fs/fuse.c, and in kernel/signal.c pause, rt_sigsuspend, rt_sigtimedwait and
-the signalfd read. Prove each with the knob, before and after.
+Forced, it failed every wait that trusted `io_block` alone, and all of those
+outside kernel/signal.c are now on `wait_for_blocked` (util/sync.c), which
+treats a bare poke as a spurious wakeup: `eventfd`, `inotify` and `timerfd`
+reads, pty reads and writes, FIFO opens, reads and writes (tmpfs FIFOs in
+fs/fifo.c; a host FIFO's open retries in fs/real.c), `F_SETLKW`, `flock`, the
+kmsg wait and the `/dev/fuse` read. `tests/manual/blocked_wait_state.c` checks
+thirteen of them, and run with the knob it failed all thirteen before the
+change and passes after.
+
+**Still open: pause, rt_sigsuspend, rt_sigtimedwait and the signalfd read**, all
+in kernel/signal.c, which was being rewritten for the restart record when the
+rest landed. Forced, `rt_sigtimedwait` returned EINTR within milliseconds.
+Only signalfd can take `wait_for_blocked` as it is, because its loop re-reads
+the signals first. The other three cannot:
+- `rt_sigtimedwait` waits for signals it has BLOCKED. Their arrival shows up
+  only as the interruption mark a poke also leaves, which
+  `task_wake_signal_pending` does not count. Its loop is
+  `do wait_for(...) while (err == 0)`, with no look at the set, so a spurious
+  wakeup would wait on past the signal. It needs to check the set on every
+  pass first.
+- pause and rt_sigsuspend loop until `wait_for` says `_EINTR`, so they need the
+  same predicate inside the loop rather than a different wait.
+
+**Next step.** Once the restart-record work in kernel/signal.c has landed,
+restructure those loops as above. Then add the four calls to
+`blocked_wait_state`'s knob-driven checks.
 
 ### A task blocked OPENING a FIFO still cannot be frozen if its wake is lost
 

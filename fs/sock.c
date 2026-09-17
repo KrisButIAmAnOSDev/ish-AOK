@@ -9246,9 +9246,14 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
                 continue;
             if (host_eintr) {
                 // A guest signal cut the host call itself short.
+                //
+                // break, not a goto past the loop: this loop is the whole
+                // body of TASK_MAY_BLOCK, a for loop whose end clears
+                // io_block, and a goto out of it skips that. read(2)'s own
+                // TASK_MAY_BLOCK hid it, but nothing here should rely on that.
                 res = socket_intr_errno(fd, POLLIN, &wait);
                 errno = 0;
-                goto out_read;
+                break;
             }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
@@ -9256,14 +9261,13 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
                 if (wait_err < 0) {
                     res = wait_err;
                     errno = 0;
-                    goto out_read;
+                    break;
                 }
                 continue;
             }
             break;
         }
     }
-out_read:
     if (res <= 0) {
         // A pending socket error outranks both EOF and EAGAIN, and AOK's own
         // poll probe may already have taken it off the host. See
@@ -9383,17 +9387,18 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
             if (socket_should_retry_io_eintr(fd, 0))
                 continue;
             if (host_eintr) {
-                // A guest signal cut the host call itself short.
+                // A guest signal cut the host call itself short. break, as in
+                // sock_read: a goto out of TASK_MAY_BLOCK leaves io_block set.
                 res = sent > 0 ? (ssize_t) sent : socket_intr_errno(fd, POLLOUT, &wait);
                 errno = 0;
-                goto out_write;
+                break;
             }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
                 int wait_err = socket_wait_ready(fd, POLLOUT, &wait);
                 if (wait_err < 0) {
                     res = sent > 0 ? (ssize_t) sent : wait_err;
-                    goto out_write;
+                    break;
                 }
                 continue;
             }
@@ -9402,7 +9407,6 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
             break;
         }
     }
-out_write:
     if (res < 0) {
         if (res > -4096 && res < 0 && errno == 0)
             return res;

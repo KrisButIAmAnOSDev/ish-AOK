@@ -306,9 +306,22 @@ pending, reporting anything else as a spurious wakeup the caller re-checks. The
 flag alone leaves a race, because the barrier can read it just before it is set.
 That race is rare enough to have been seen once in some hundreds of tries, on an
 `inotify` read, so the test forces it: `ISH_TEST_POKE_BLOCKED_TASKS` makes the
-barrier poke a named task even while it is asleep. Forced, it showed which other
-waits trusted the flag alone. A FIFO open, an `eventfd`, `inotify` or terminal
-read and `rt_sigtimedwait` all returned `EINTR` within milliseconds.
+barrier poke a named task even while it is asleep. Forced, it showed which older
+waits trusted the flag alone, and it was nearly all of them. `eventfd`,
+`inotify` and `timerfd` reads, terminal reads and writes, FIFO opens, reads and
+writes, `F_SETLKW` and `flock` all returned `EINTR` within milliseconds, and
+they are on `wait_for_blocked` now too. The signal waits are the exception, and
+not only for scheduling reasons: `rt_sigtimedwait` waits for signals it has
+blocked, whose arrival looks exactly like the mark a poke leaves, so it has to
+look at its set before it can call a wakeup spurious.
+
+The sweep turned up the flag's other failure as well: set and never cleared.
+`TASK_MAY_BLOCK` is a `for` loop, and a `return` from its body skips the
+clearing at the bottom. `flock` returned from inside it on `EAGAIN`, so a
+process whose `LOCK_NB` request found the lock taken went on running with the
+flag still up: `S` in `/proc`, left out of the load average, and not poked by
+the barrier, until its next blocking call. Nothing in the macro can prevent
+that. Only the rule can: leave the body by falling off its end, or by `break`.
 
 > **The test that passed on the bug**
 >

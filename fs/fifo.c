@@ -104,10 +104,10 @@ int fifo_file_open(struct fifo_file *fifo, struct fd *fd) {
         lock(&fifo->lock, 0);
         if (reader && !writer) {
             while (fifo->writers == 0)
-                if (wait_for(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
+                if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
         } else if (writer && !reader) {
             while (fifo->readers == 0)
-                if (wait_for(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
+                if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
         }
         unlock(&fifo->lock);
     }
@@ -149,7 +149,7 @@ ssize_t fifo_file_read(struct fifo_file *fifo, struct fd *fd, void *buf, size_t 
             unlock(&fifo->lock);
             return _EAGAIN;
         }
-        if (wait_for(&fifo->cond, &fifo->lock, NULL)) {
+        if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) {
             unlock(&fifo->lock);
             return _EINTR;
         }
@@ -225,7 +225,7 @@ ssize_t fifo_file_write(struct fifo_file *fifo, struct fd *fd, const void *buf, 
             unlock(&fifo->lock);
             return written > 0 ? (ssize_t) written : _EAGAIN;
         }
-        if (wait_for(&fifo->cond, &fifo->lock, NULL)) {
+        if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) {
             unlock(&fifo->lock);
             return written > 0 ? (ssize_t) written : _EINTR;
         }

@@ -32,8 +32,13 @@
  *      11s would add ~2.5 if they were counted, so it may rise by at most 0.5.
  *   3. A thread blocked in each call, with a sibling spinning and another
  *      mapping and unmapping memory, returns EINTR only when a real signal
- *      arrives at 1s, with its handler run once. That is also the positive
- *      control: the wait still ends for a signal.
+ *      arrives at 600ms, with its handler run once. That is also the positive
+ *      control: the wait still ends for a signal. The same is checked for
+ *      thirteen waits that always had io_block: eventfd read and write,
+ *      inotify and timerfd reads, a pty read, a write held by a stopped
+ *      terminal and a master write into a full input queue, FIFO opens (a
+ *      host FIFO and a tmpfs one), tmpfs FIFO read and write, F_SETLKW and
+ *      flock.
  *   4. The same for a FUSE request (a LOOKUP the daemon answers late), where
  *      the wait is reached from stat(2), which sets no io_block of its own:
  *      'S' while it waits, and under the same siblings the stat ends with the
@@ -43,7 +48,10 @@
  *      after a failed lookup. No signal is involved there, because what a
  *      signal does to a FUSE request is a different question (Linux waits on
  *      for the daemon's answer). Needs mount(2), so it is skipped
- *      unprivileged.
+ *      unprivileged, as are the tmpfs FIFOs in 3.
+ *   5. A flock that fails -- LOCK_NB against a held lock -- leaves the task
+ *      running. flock_lock returned from inside TASK_MAY_BLOCK, which skipped
+ *      clearing io_block, so a process spinning after it read S.
  *
  * io_block keeps the barrier from poking a waiter at all, so an ordinary run
  * of 3 and 4 checks that half of the fix. The other half -- a bare poke that
@@ -57,7 +65,10 @@
  *
  * (the comm is the binary's name, cut to 15 characters). With the second half
  * taken out of wait_for_blocked, that run failed all five System V and aio
- * checks and the FUSE one, while the ordinary run still passed.
+ * checks and the FUSE one, while the ordinary run still passed. Before the
+ * thirteen older waits in 3 used wait_for_blocked (or, for a host FIFO's open,
+ * the same check in fs/real.c), every one of them failed it: EINTR about
+ * 200ms in, as the siblings started, with no handler run.
  */
 #define _GNU_SOURCE
 
@@ -73,6 +84,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -80,8 +94,10 @@
 #include <sys/sem.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -102,7 +118,7 @@
  * take two of the 5-second samples whatever the phase. */
 #define LOAD_SECONDS 11
 /* When the signal (or the FUSE daemon's answer) arrives in the poke checks. */
-#define ARRIVE_MS 1000
+#define ARRIVE_MS 600
 /* How long the thread under test waits alone before its siblings start. */
 #define SETTLE_MS 200
 
@@ -176,14 +192,38 @@ struct io_event_ {
     int64_t result, result2;
 };
 
+/* The calls under test, in three groups. The first never set io_block at
+ * all, so every check applies to them. The second always had it and trusted
+ * it alone (see the note at the top), so they are checked for interruption
+ * only: a thread in each ends its wait for the signal and nothing earlier.
+ * The controls come last. */
 enum kind {
     K_EPOLL_WAIT, K_EPOLL_PWAIT, K_EPOLL_PWAIT2, K_MSGRCV, K_MSGSND,
-    K_SEMOP, K_SEMTIMEDOP, K_IO_GETEVENTS, K_POLL, K_PIPE_READ, K_COUNT
+    K_SEMOP, K_SEMTIMEDOP, K_IO_GETEVENTS,
+    K_EVENTFD_READ, K_EVENTFD_WRITE, K_INOTIFY_READ, K_TIMERFD_READ,
+    K_PTY_READ, K_PTY_STOPPED_WRITE, K_PTY_FULL_WRITE, K_FIFO_OPEN,
+    K_TMPFS_FIFO_OPEN, K_TMPFS_FIFO_READ, K_TMPFS_FIFO_WRITE, K_SETLKW, K_FLOCK,
+    K_POLL, K_PIPE_READ, K_COUNT
 };
 static const char *const kind_names[K_COUNT] = {
     "epoll_wait", "epoll_pwait", "epoll_pwait2", "msgrcv", "msgsnd",
-    "semop", "semtimedop", "io_getevents", "poll (control)", "pipe read (control)",
+    "semop", "semtimedop", "io_getevents",
+    "eventfd read", "eventfd write (counter full)", "inotify read", "timerfd read",
+    "pty read", "pty write (output stopped)", "pty master write (input full)",
+    "FIFO open", "tmpfs FIFO open", "tmpfs FIFO read", "tmpfs FIFO write (full)",
+    "fcntl F_SETLKW", "flock",
+    "poll (control)", "pipe read (control)",
 };
+
+/* In the /proc state and load checks: the first group and the controls. */
+static int kind_in_state_check(int k) {
+    return k <= K_IO_GETEVENTS || k >= K_POLL;
+}
+
+/* A tmpfs for the FIFOs of fs/fifo.c, which a FIFO on the root filesystem
+ * does not reach (fakefs FIFOs are host FIFOs). Empty when it could not be
+ * mounted, and those kinds are then skipped. */
+static char tmpfs_dir[64];
 
 /* The System V objects are made by the parent, so that killing a child cannot
  * leak one: an empty queue, a queue already full, and a semaphore at 0. */
@@ -217,14 +257,202 @@ static void remove_ipc_objects(void) {
 struct waiter {
     int fds[3];
     unsigned long aio_ctx;
+    pid_t holder;      /* K_SETLKW: the process holding the lock */
+    char path[128];    /* a FIFO or lock file to unlink */
+    char dir[128];     /* a directory to remove */
 };
+
+static int set_nonblock(int fd, int on) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0)
+        return -1;
+    return fcntl(fd, F_SETFL, on ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+}
+
+/* One pass of writes until the descriptor would block. Returns the bytes
+ * written, or -1. */
+static long fill_pass(int fd) {
+    char chunk[4096];
+    memset(chunk, 'x', sizeof(chunk));
+    long total = 0;
+    for (size_t size = sizeof(chunk); size >= 1; size /= 4) {
+        for (;;) {
+            ssize_t n = write(fd, chunk, size);
+            if (n > 0) {
+                total += n;
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
+            return -1;
+        }
+        if (size == 1)
+            break;
+    }
+    return total;
+}
+
+/* Write until the descriptor would block, then make it blocking again. Until
+ * a pass after a pause writes nothing, too: Linux moves pty input on to the
+ * line discipline from a workqueue, so room can reappear just after a write
+ * said there was none, and a later blocking write would then not block. */
+static int fill_until_full(int fd) {
+    if (set_nonblock(fd, 1) != 0)
+        return -1;
+    for (int pass = 0; pass < 50; pass++) {
+        long n = fill_pass(fd);
+        if (n < 0)
+            return -1;
+        if (n == 0 && pass > 0)
+            break;
+        sleep_ms(20);
+    }
+    return set_nonblock(fd, 0);
+}
+
+static int open_pty(int *master, int *slave) {
+    *master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (*master < 0 || grantpt(*master) != 0 || unlockpt(*master) != 0)
+        return -1;
+    const char *name = ptsname(*master);
+    if (name == NULL)
+        return -1;
+    *slave = open(name, O_RDWR | O_NOCTTY);
+    return *slave < 0 ? -1 : 0;
+}
 
 /* Everything a call needs before it can block, made by whoever blocks.
  * Returns 0, or -1 with errno set. */
 static int waiter_prepare(enum kind k, struct waiter *w) {
     memset(w, 0, sizeof(*w));
     w->fds[0] = w->fds[1] = w->fds[2] = -1;
+    static unsigned serial;
     switch (k) {
+    case K_EVENTFD_READ:
+        w->fds[0] = eventfd(0, 0);
+        return w->fds[0] < 0 ? -1 : 0;
+    case K_EVENTFD_WRITE: {
+        /* The largest count an eventfd holds; adding one more must wait. */
+        w->fds[0] = eventfd(0, 0);
+        uint64_t most = UINT64_MAX - 1;
+        if (w->fds[0] < 0 || write(w->fds[0], &most, sizeof(most)) != sizeof(most))
+            return -1;
+        return 0;
+    }
+    case K_INOTIFY_READ:
+        /* A directory of its own, so nobody else's files can end the wait. */
+        snprintf(w->dir, sizeof(w->dir), "/tmp/blocked_wait_in_XXXXXX");
+        if (mkdtemp(w->dir) == NULL) {
+            w->dir[0] = '\0';
+            return -1;
+        }
+        w->fds[0] = inotify_init1(0);
+        if (w->fds[0] < 0 || inotify_add_watch(w->fds[0], w->dir, IN_CREATE) < 0)
+            return -1;
+        return 0;
+    case K_TIMERFD_READ:
+        /* Never armed. */
+        w->fds[0] = timerfd_create(CLOCK_MONOTONIC, 0);
+        return w->fds[0] < 0 ? -1 : 0;
+    case K_PTY_READ:
+        return open_pty(&w->fds[1], &w->fds[0]);
+    case K_PTY_STOPPED_WRITE:
+        if (open_pty(&w->fds[1], &w->fds[0]) != 0)
+            return -1;
+        return tcflow(w->fds[0], TCOOFF);
+    case K_PTY_FULL_WRITE: {
+        /* Raw, so the line discipline neither edits nor discards the bytes
+         * nobody reads, and a full input queue makes the master's writer
+         * wait. */
+        if (open_pty(&w->fds[1], &w->fds[0]) != 0)
+            return -1;
+        struct termios t;
+        if (tcgetattr(w->fds[0], &t) != 0)
+            return -1;
+        cfmakeraw(&t);
+        if (tcsetattr(w->fds[0], TCSANOW, &t) != 0)
+            return -1;
+        return fill_until_full(w->fds[1]);
+    }
+    case K_FIFO_OPEN:
+        snprintf(w->path, sizeof(w->path), "/tmp/blocked_wait_fifo_%d_%u",
+                 (int) getpid(), serial++);
+        unlink(w->path);
+        if (mkfifo(w->path, 0600) != 0) {
+            w->path[0] = '\0';
+            return -1;
+        }
+        return 0;
+    case K_TMPFS_FIFO_OPEN:
+    case K_TMPFS_FIFO_READ:
+    case K_TMPFS_FIFO_WRITE:
+        if (tmpfs_dir[0] == '\0') {
+            errno = ENOTSUP;
+            return -1;
+        }
+        snprintf(w->path, sizeof(w->path), "%s/fifo_%u", tmpfs_dir, serial++);
+        unlink(w->path);
+        if (mkfifo(w->path, 0600) != 0) {
+            w->path[0] = '\0';
+            return -1;
+        }
+        if (k == K_TMPFS_FIFO_OPEN)
+            return 0;
+        /* O_RDWR is both ends, so the open does not wait and a read finds a
+         * writer still there. */
+        w->fds[0] = open(w->path, O_RDWR);
+        if (w->fds[0] < 0)
+            return -1;
+        return k == K_TMPFS_FIFO_WRITE ? fill_until_full(w->fds[0]) : 0;
+    case K_SETLKW: {
+        snprintf(w->path, sizeof(w->path), "/tmp/blocked_wait_lock_%d_%u",
+                 (int) getpid(), serial++);
+        int fd = open(w->path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) {
+            w->path[0] = '\0';
+            return -1;
+        }
+        close(fd);
+        /* A record lock belongs to a process, so another one holds it. */
+        int ready[2];
+        if (pipe(ready) != 0)
+            return -1;
+        w->holder = fork();
+        if (w->holder == 0) {
+            close(ready[0]);
+            int hfd = open(w->path, O_RDWR);
+            struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+            if (hfd < 0 || fcntl(hfd, F_SETLK, &fl) != 0)
+                _exit(3);
+            if (write(ready[1], "r", 1) != 1)
+                _exit(3);
+            for (;;)
+                pause();
+        }
+        close(ready[1]);
+        char c;
+        ssize_t n = w->holder > 0 ? read(ready[0], &c, 1) : -1;
+        close(ready[0]);
+        if (n != 1)
+            return -1;
+        w->fds[0] = open(w->path, O_RDWR);
+        return w->fds[0] < 0 ? -1 : 0;
+    }
+    case K_FLOCK: {
+        /* flock locks belong to an open file description, so a second open
+         * in this process is enough to conflict. */
+        snprintf(w->path, sizeof(w->path), "/tmp/blocked_wait_flock_%d_%u",
+                 (int) getpid(), serial++);
+        w->fds[1] = open(w->path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (w->fds[1] < 0) {
+            w->path[0] = '\0';
+            return -1;
+        }
+        if (flock(w->fds[1], LOCK_EX) != 0)
+            return -1;
+        w->fds[0] = open(w->path, O_RDWR);
+        return w->fds[0] < 0 ? -1 : 0;
+    }
     case K_EPOLL_WAIT:
     case K_EPOLL_PWAIT:
     case K_EPOLL_PWAIT2: {
@@ -255,6 +483,14 @@ static void waiter_release(enum kind k, struct waiter *w) {
     for (int i = 0; i < 3; i++)
         if (w->fds[i] >= 0)
             close(w->fds[i]);
+    if (w->holder > 0) {
+        kill(w->holder, SIGKILL);
+        waitpid(w->holder, NULL, 0);
+    }
+    if (w->path[0] != '\0')
+        unlink(w->path);
+    if (w->dir[0] != '\0')
+        rmdir(w->dir);
 #ifdef SYS_io_destroy
     if (k == K_IO_GETEVENTS && w->aio_ctx != 0)
         syscall(SYS_io_destroy, w->aio_ctx);
@@ -300,6 +536,42 @@ static long waiter_block(enum kind k, struct waiter *w) {
         return -1;
 #endif
     }
+    case K_EVENTFD_READ:
+    case K_TIMERFD_READ: {
+        uint64_t count;
+        return read(w->fds[0], &count, sizeof(count));
+    }
+    case K_EVENTFD_WRITE: {
+        uint64_t one = 1;
+        return write(w->fds[0], &one, sizeof(one));
+    }
+    case K_INOTIFY_READ: {
+        char buf[4096];
+        return read(w->fds[0], buf, sizeof(buf));
+    }
+    case K_PTY_READ:
+    case K_TMPFS_FIFO_READ: {
+        char buf[16];
+        return read(w->fds[0], buf, sizeof(buf));
+    }
+    case K_PTY_STOPPED_WRITE:
+    case K_TMPFS_FIFO_WRITE:
+        return write(w->fds[0], "x", 1);
+    case K_PTY_FULL_WRITE:
+        return write(w->fds[1], "x", 1);
+    case K_FIFO_OPEN:
+    case K_TMPFS_FIFO_OPEN: {
+        int fd = open(w->path, O_RDONLY);
+        if (fd >= 0)
+            close(fd);
+        return fd;
+    }
+    case K_SETLKW: {
+        struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+        return fcntl(w->fds[0], F_SETLKW, &fl);
+    }
+    case K_FLOCK:
+        return flock(w->fds[0], LOCK_EX);
     case K_POLL: {
         struct pollfd pfd = {.fd = w->fds[0], .events = POLLIN};
         return poll(&pfd, 1, -1);
@@ -357,16 +629,23 @@ static void test_state_and_load(void) {
     long start = now_ms();
 
     pid_t kids[K_COUNT][LOAD_COPIES];
+    int spawned = 0;
     for (int k = 0; k < K_COUNT; k++)
         for (int c = 0; c < LOAD_COPIES; c++) {
+            kids[k][c] = -1;
+            if (!kind_in_state_check(k))
+                continue;
             kids[k][c] = spawn_blocked_child((enum kind) k);
             check(kids[k][c] > 0, "%s: a child could block in it", kind_names[k]);
+            spawned++;
         }
 
     /* Settle, then sample every child a few times: a wait that is 'S' only
      * some of the time is still wrong. */
     sleep_ms(300);
     for (int k = 0; k < K_COUNT; k++) {
+        if (!kind_in_state_check(k))
+            continue;
         int total = 0, sleeping = 0;
         char seen[8] = "";
         size_t seen_len = 0;
@@ -406,7 +685,7 @@ static void test_state_and_load(void) {
         check(l1 <= l0 + 0.5,
               "%d blocked children for %ds leave the 1-minute load average alone: "
               "before \"%s\", after \"%s\" (a rise of %.2f; counted, they would add ~2.5)",
-              K_COUNT * LOAD_COPIES, LOAD_SECONDS, raw0, raw1, l1 - l0);
+              spawned, LOAD_SECONDS, raw0, raw1, l1 - l0);
     }
 }
 
@@ -501,13 +780,18 @@ static void test_poke_does_not_interrupt(void) {
     sa.sa_handler = on_usr1; /* no SA_RESTART: the signal must end the wait */
     sigaction(SIGUSR1, &sa, NULL);
 
-    for (int k = 0; k <= K_IO_GETEVENTS; k++) {
+    for (int k = 0; k <= K_FLOCK; k++) {
         struct blocked_thread *b = calloc(1, sizeof(*b));
         if (b == NULL)
             return;
         b->k = (enum kind) k;
         if (waiter_prepare(b->k, &b->w) != 0) {
-            check(0, "%s: set up (%s)", kind_names[k], strerror(errno));
+            int err = errno;
+            if (err == ENOTSUP && tmpfs_dir[0] == '\0')
+                test_logf("note: %s skipped: no tmpfs could be mounted\n", kind_names[k]);
+            else
+                check(0, "%s: set up (%s)", kind_names[k], strerror(err));
+            waiter_release(b->k, &b->w);
             free(b);
             continue;
         }
@@ -839,6 +1123,69 @@ static void test_fuse_request(void) {
     rmdir(base);
 }
 
+/* ---- 5: a flock that fails leaves the task running ---------------------- */
+
+/* flock_lock returned from inside TASK_MAY_BLOCK when a LOCK_NB request met a
+ * held lock, skipping the macro's task_may_block_end, so the task stayed
+ * marked asleep while it went on running. The child reports through shared
+ * memory and then spins without a single syscall: any blocking call it made
+ * would clear a leaked flag and hide it. */
+static void test_failed_flock_keeps_running(void) {
+    char path[] = "/tmp/blocked_wait_nb_XXXXXX";
+    int tfd = mkstemp(path);
+    if (tfd < 0) {
+        check(0, "flock: mkstemp (%s)", strerror(errno));
+        return;
+    }
+    close(tfd);
+    /* volatile: the child stores the flag and then loops for ever without
+     * reading it, and GCC at -O2 drops a store nothing in the program reads
+     * again. The parent saw 0 until the store was made volatile. */
+    volatile int *flag = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (flag == MAP_FAILED) {
+        check(0, "flock: shared page (%s)", strerror(errno));
+        unlink(path);
+        return;
+    }
+    *flag = 0;
+    pid_t kid = fork();
+    if (kid == 0) {
+        int a = open(path, O_RDWR), b = open(path, O_RDWR);
+        if (a < 0 || b < 0 || flock(a, LOCK_EX) != 0)
+            _exit(3);
+        int r = flock(b, LOCK_EX | LOCK_NB);
+        *flag = r == -1 && errno == EWOULDBLOCK ? 1 : 2;
+        volatile unsigned long sink = 0;
+        for (;;)
+            sink++;
+    }
+    long deadline = now_ms() + slack_ms(5000);
+    while (*flag == 0 && now_ms() < deadline)
+        sleep_ms(10);
+    check(*flag == 1, "flock(LOCK_EX|LOCK_NB) against a held lock fails with "
+          "EWOULDBLOCK (child reported %d)", *flag);
+    if (*flag != 0) {
+        sleep_ms(100);
+        int running = 0, total = 0;
+        char last = '?';
+        for (int round = 0; round < 5; round++) {
+            last = proc_state(kid);
+            total++;
+            if (last == 'R')
+                running++;
+            sleep_ms(40);
+        }
+        check(running == total,
+              "a process spinning after that failed flock reads R in /proc/<pid>/stat "
+              "(%d of %d samples; last '%c')", running, total, last);
+    }
+    kill(kid, SIGKILL);
+    waitpid(kid, NULL, 0);
+    munmap((void *) flag, sizeof(int));
+    unlink(path);
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(120));
@@ -850,8 +1197,29 @@ int main(int argc, char **argv) {
         return finish_suite(TEST_NAME);
     }
     test_state_and_load();
+
+    /* A tmpfs, for the FIFOs of fs/fifo.c. Needs mount(2); without it those
+     * kinds are skipped. */
+    snprintf(tmpfs_dir, sizeof(tmpfs_dir), "/tmp/blocked_wait_tmpfs_XXXXXX");
+    int have_tmpfs = mkdtemp(tmpfs_dir) != NULL;
+    if (have_tmpfs && mount("tmpfs", tmpfs_dir, "tmpfs", 0, NULL) != 0) {
+        test_logf("note: tmpfs mount failed (%s); tmpfs FIFO kinds skipped\n", strerror(errno));
+        rmdir(tmpfs_dir);
+        have_tmpfs = 0;
+    }
+    char tmpfs_mounted[64];
+    snprintf(tmpfs_mounted, sizeof(tmpfs_mounted), "%s", have_tmpfs ? tmpfs_dir : "");
+    if (!have_tmpfs)
+        tmpfs_dir[0] = '\0';
+
     test_poke_does_not_interrupt();
+
+    if (tmpfs_mounted[0] != '\0') {
+        umount2(tmpfs_mounted, MNT_DETACH);
+        rmdir(tmpfs_mounted);
+    }
     test_fuse_request();
+    test_failed_flock_keeps_running();
     remove_ipc_objects();
     return finish_suite(TEST_NAME);
 }

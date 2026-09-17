@@ -687,7 +687,7 @@ static ssize_t fuse_dev_read(struct fd *fd, void *buf, size_t bufsize) {
             unlock(&conn->lock);
             return _EAGAIN;
         }
-        if (wait_for(&conn->cond, &conn->lock, NULL)) {
+        if (wait_for_blocked(&conn->cond, &conn->lock, NULL)) {
             unlock(&conn->lock);
             return _EINTR;
         }

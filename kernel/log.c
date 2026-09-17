@@ -144,7 +144,7 @@ int ish_log_wait_past(uint64_t pos) {
     lock(&log_lock, 0);
     int err = 0;
     while (log_total_written <= pos) {
-        err = wait_for(&log_cond, &log_lock, NULL);
+        err = wait_for_blocked(&log_cond, &log_lock, NULL);
         if (err < 0)
             break;
     }

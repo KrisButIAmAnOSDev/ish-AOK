@@ -383,7 +383,7 @@ static int tty_push_char(struct tty *tty, char ch, bool flag, int blocking) {
     while (tty->bufsize >= sizeof(tty->buf)) {
         if (!blocking)
             return _EAGAIN;
-        if (wait_for(&tty->consumed, &tty->lock, NULL))
+        if (wait_for_blocked(&tty->consumed, &tty->lock, NULL))
             return _EINTR;
     }
     tty->buf[tty->bufsize] = ch;
@@ -684,7 +684,7 @@ no_special:
                 err = _EAGAIN;
                 if (!blocking)
                     break;
-                err = wait_for(&tty->consumed, &tty->lock, NULL);
+                err = wait_for_blocked(&tty->consumed, &tty->lock, NULL);
                 if (err < 0)
                     break;
             }
@@ -884,7 +884,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             err = _EAGAIN;
             if (fd->flags & O_NONBLOCK_)
                 goto error;
-            err = wait_for(&tty->produced, &tty->lock, NULL);
+            err = wait_for_blocked(&tty->produced, &tty->lock, NULL);
             if (err < 0)
                 goto error;
         }
@@ -932,7 +932,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
                 err = _EAGAIN;
                 if (fd->flags & O_NONBLOCK_)
                     goto error;
-                err = wait_for(&tty->produced, &tty->lock, timeout_ptr);
+                err = wait_for_blocked(&tty->produced, &tty->lock, timeout_ptr);
                 if (err == _ETIMEDOUT)
                     break;
                 if (err < 0)
@@ -949,7 +949,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             if (fd->flags & O_NONBLOCK_)
                 goto error;
             // there should be no timeout for the first character read
-            err = wait_for(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
+            err = wait_for_blocked(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
             if (tty_trace_timed_raw_enabled(tty)) {
                 printk("INFO: top tty_read wait pid=%d tty=%d:%d bufsize=%zu min=%u time=%u err=%d first=%d\n",
                        current->pid,
@@ -1024,7 +1024,7 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
             unlock(&tty->lock);
             return _EAGAIN;
         }
-        int ferr = wait_for(&tty->flow_resumed, &tty->lock, NULL);
+        int ferr = wait_for_blocked(&tty->flow_resumed, &tty->lock, NULL);
         if (ferr < 0) {
             unlock(&tty->lock);
             return ferr;

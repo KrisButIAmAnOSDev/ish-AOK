@@ -533,7 +533,24 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     int real_flags = open_flags_real_from_fake(flags);
     if ((flags & O_CREAT_) && (mount->flags & MOUNT_ISH_SHARED_))
         mode |= 0666;
-    int fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
+    // A FIFO here is a host FIFO, so opening one without O_NONBLOCK waits in
+    // the host openat for the other end, and any SIGUSR1 ends that wait with
+    // EINTR -- including the address-space barrier's poke, which reaches a
+    // task in open(2) whenever it reads io_block just before TASK_MAY_BLOCK
+    // sets it. Forced with ISH_TEST_POKE_BLOCKED_TASKS, a reader opening a FIFO
+    // failed with EINTR 2ms in, with no signal sent. Only a guest signal or a
+    // checkpoint freeze may end the open, as for realfs reads and writes.
+    int fd_no;
+    for (;;) {
+        fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
+        if (fd_no >= 0 || errno != EINTR || current == NULL)
+            break;
+        // The pending test takes a lock and can clobber errno.
+        if (realfs_guest_signal_pending()) {
+            errno = EINTR;
+            break;
+        }
+    }
     if (fd_no < 0) {
         realfs_trace_path_event("open", path, -1, flags);
         return ERR_PTR(errno_map());
