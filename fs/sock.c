@@ -4610,9 +4610,32 @@ int_t sys_bind_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_l
 }
 
 static void fill_cred(struct ucred_ *cred) {
-    cred->pid = current->pid;
+    // The process id, as Linux reports it, not the id of whichever thread is
+    // sending or connecting.
+    cred->pid = current->tgid;
     cred->uid = current->euid;
     cred->gid = current->egid;
+}
+
+// Whether the caller may send `cred` as SCM_CREDENTIALS: Linux's
+// scm_check_creds. The pid has to be the sender's process id, which any of its
+// threads may send, and the uid and gid its real, effective or saved ones.
+// CAP_SYS_ADMIN lifts the pid rule, CAP_SETUID and CAP_SETGID the others. An
+// id of -1 names nobody. GLib's D-Bus client sends getpid() from its worker
+// thread; comparing with that thread's own id refused every such connection
+// ("Error sending credentials" from waybar).
+static int scm_check_creds(const struct ucred_ *cred) {
+    if (cred->uid == (uid_t_) -1 || cred->gid == (uid_t_) -1)
+        return _EINVAL;
+    if (cred->pid != current->tgid && !current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
+    if (cred->uid != current->uid && cred->uid != current->euid && cred->uid != current->suid &&
+            !current_capable(CAP_SETUID_))
+        return _EPERM;
+    if (cred->gid != current->gid && cred->gid != current->egid && cred->gid != current->sgid &&
+            !current_capable(CAP_SETGID_))
+        return _EPERM;
+    return 0;
 }
 
 // Per-datagram sender credentials for AF_LOCAL SOCK_DGRAM sockets: every
@@ -7536,8 +7559,6 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             goto out_free_iov;
         // figure out how many file descriptors we're sending
         unsigned num_fds = 0;
-        struct ucred_ sender_cred = {};
-        fill_cred(&sender_cred);
         size_t cmsg_off = 0;
         while (cmsg_off < msg_fake.msg_controllen) {
             struct guest_cmsghdr_marshaled cmsg;
@@ -7556,11 +7577,11 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             } else if (cmsg.type == SCM_CREDENTIALS_) {
                 if (data_len != sizeof(struct ucred_))
                     goto out_inval;
-                const struct ucred_ *cred = (const struct ucred_ *) cmsg_data;
-                if (cred->pid != sender_cred.pid ||
-                        cred->uid != sender_cred.uid ||
-                        cred->gid != sender_cred.gid)
-                    goto out_perm;
+                struct ucred_ cred;
+                memcpy(&cred, cmsg_data, sizeof(cred));
+                err = scm_check_creds(&cred);
+                if (err < 0)
+                    goto out_free_iov;
             } else {
                 goto out_inval;
             }
@@ -7813,9 +7834,6 @@ out_free_scm:
             scm_free(scm);
         }
     }
-    goto out_free_iov;
-out_perm:
-    err = _EPERM;
     goto out_free_iov;
 out_inval:
     err = _EINVAL;

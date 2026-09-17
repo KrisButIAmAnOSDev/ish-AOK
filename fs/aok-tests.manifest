@@ -225,6 +225,7 @@ scm_rights_pidfd.c
 siocoutq.c
 sock_ifconf_sizing.c
 signal_group_blocked_eintr.c
+scm_credentials_rules.c
 epoll_nested.c
 tmpfs_exec.c
 kcmp.c
