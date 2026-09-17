@@ -55,6 +55,9 @@
 @property (nonatomic) NSInteger activeDesktopIndex;
 @property (nonatomic) NSInteger desktopCount;
 @property (nonatomic, strong) NSMutableIndexSet *lockedDesktopIndices;
+// A name per Desktop index, "" for one without a name of its own. Shifted with the
+// Desktops like lockedDesktopIndices; trailing unnamed entries are dropped.
+@property (nonatomic, strong) NSMutableArray<NSString *> *desktopNames;
 @property (nonatomic, weak) UILabel *desktopIndicatorLabel;
 @property (nonatomic) BOOL rootMenuSaveInProgress;
 @property (nonatomic) NSInteger desktopWindowCascadeIndex;
@@ -76,6 +79,9 @@
 - (void)removeDesktopAtIndex:(NSInteger)index;
 - (BOOL)isDesktopLockedAtIndex:(NSInteger)index;
 - (void)toggleDesktopLockAtIndex:(NSInteger)index;
+- (NSString *)nameForDesktopAtIndex:(NSInteger)index;
+- (NSString *)customNameForDesktopAtIndex:(NSInteger)index;
+- (void)setName:(NSString *)name forDesktopAtIndex:(NSInteger)index;
 - (void)ensureDefaultWorkspaceUtilitiesOpen;
 - (void)ensureDefaultLLMChatWindowOpenIfNeeded;
 - (void)persistDefaultWorkspaceUtilityFrames;
@@ -4106,9 +4112,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
     // First, so the restore can size the Desktops before placing anything on
     // them.
-    [layout addObject:@{@"kind": ISHWorkspaceSavedLayoutKindDesktops,
-                        @"count": @(self.desktopCount),
-                        @"active": @(self.activeDesktopIndex)}];
+    [layout addObject:[self desktopsLayoutDescriptor]];
     for (UIView *subview in self.desktopSurfaceView.subviews) {
         if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
@@ -4206,9 +4210,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 
 - (NSArray<NSDictionary<NSString *, id> *> *)workspaceArrangementDescriptors {
     NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
-    [layout addObject:@{@"kind": ISHWorkspaceSavedLayoutKindDesktops,
-                        @"count": @(self.desktopCount),
-                        @"active": @(self.activeDesktopIndex)}];
+    [layout addObject:[self desktopsLayoutDescriptor]];
     for (UIView *subview in self.desktopSurfaceView.subviews) {
         if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
@@ -4225,6 +4227,35 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         [layout addObject:trimmed];
     }
     return layout;
+}
+
+// Drops trailing unnamed entries, so a Desktop without a name costs nothing in a
+// saved arrangement.
+static void ISHWorkspaceTrimDesktopNames(NSMutableArray<NSString *> *names) {
+    while (names.count > 0 && names.lastObject.length == 0)
+        [names removeLastObject];
+}
+
+// Names as a saved arrangement holds them. Anything that is not a string reads as
+// unnamed rather than failing the restore.
+static NSMutableArray<NSString *> *ISHWorkspaceDesktopNamesFromStored(id stored) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    if ([stored isKindOfClass:NSArray.class]) {
+        for (id name in (NSArray *) stored)
+            [names addObject:[name isKindOfClass:NSString.class] ? name : @""];
+    }
+    ISHWorkspaceTrimDesktopNames(names);
+    return names;
+}
+
+// The names' part of the saved/unsaved signature: empty when no Desktop has a
+// name, so an arrangement saved before Desktops could be named still matches.
+static NSString *ISHWorkspaceDesktopNamesSignature(NSArray<NSString *> *names) {
+    NSMutableArray<NSString *> *trimmed = [names mutableCopy] ?: [NSMutableArray array];
+    ISHWorkspaceTrimDesktopNames(trimmed);
+    if (trimmed.count == 0)
+        return @"";
+    return [@"|names:" stringByAppendingString:[trimmed componentsJoinedByString:@"\x1e"]];
 }
 
 // What the indicator compares. Structure, not pixels: how many Desktops, and
@@ -4247,8 +4278,9 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                                                     (long) windowView.workspaceDesktopIndex]];
     }
     [parts sortUsingSelector:@selector(compare:)];
-    return [NSString stringWithFormat:@"%ld|%@", (long) self.desktopCount,
-                                      [parts componentsJoinedByString:@","]];
+    return [NSString stringWithFormat:@"%ld|%@%@", (long) self.desktopCount,
+                                      [parts componentsJoinedByString:@","],
+                                      ISHWorkspaceDesktopNamesSignature(self.desktopNames)];
 }
 
 - (NSArray<NSDictionary<NSString *, id> *> *)savedWorkspaceDesktops {
@@ -4265,11 +4297,13 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (layout.count == 0)
         return nil;
     NSInteger count = 1;
+    NSArray *names = nil;
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *descriptor in layout) {
         NSString *kind = descriptor[@"kind"];
         if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDesktops]) {
             count = MAX((NSInteger) 1, [descriptor[@"count"] integerValue]);
+            names = ISHWorkspaceDesktopNamesFromStored(descriptor[@"names"]);
             continue;
         }
         NSString *name = nil;
@@ -4283,7 +4317,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                                                     (long) [descriptor[@"desktopIndex"] integerValue]]];
     }
     [parts sortUsingSelector:@selector(compare:)];
-    return [NSString stringWithFormat:@"%ld|%@", (long) count, [parts componentsJoinedByString:@","]];
+    return [NSString stringWithFormat:@"%ld|%@%@", (long) count, [parts componentsJoinedByString:@","],
+                                      ISHWorkspaceDesktopNamesSignature(names)];
 }
 
 - (BOOL)workspaceDesktopsArrangementIsSaved {
@@ -4370,6 +4405,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     }
     NSInteger savedCount = MAX((NSInteger) 1, [desktopsDescriptor[@"count"] integerValue]);
     self.desktopCount = MAX(savedCount, highestLiveIndex + 1);
+    self.desktopNames = ISHWorkspaceDesktopNamesFromStored(desktopsDescriptor[@"names"]);
 
     if (dashboardDescriptor != nil)
         [self applySavedDashboardDescriptor:dashboardDescriptor];
@@ -4496,6 +4532,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     NSInteger savedDesktopCount = [desktopsDescriptor[@"count"] integerValue];
     if (savedDesktopCount > self.desktopCount)
         self.desktopCount = savedDesktopCount;
+    self.desktopNames = ISHWorkspaceDesktopNamesFromStored(desktopsDescriptor[@"names"]);
     if (dashboardDescriptor != nil)
         [self applySavedDashboardDescriptor:dashboardDescriptor];
     if (dockDescriptor != nil)
@@ -5327,6 +5364,9 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         }];
         _lockedDesktopIndices = shifted;
     }
+    if (indexToRemove < (NSInteger) _desktopNames.count)
+        [_desktopNames removeObjectAtIndex:(NSUInteger) indexToRemove];
+    ISHWorkspaceTrimDesktopNames(_desktopNames);
     self.desktopCount -= 1;
     if (self.activeDesktopIndex >= self.desktopCount)
         self.activeDesktopIndex = self.desktopCount - 1;
@@ -5346,6 +5386,45 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (index == 0)
         return YES;  // the first Desktop is permanently protected and can't be removed
     return index >= 0 && [self.lockedDesktopIndices containsIndex:(NSUInteger)index];
+}
+
+// The names are what the Desktops applet, the switch toast and the Desktops menu
+// show. A Desktop without one is named for its position, so removing a Desktop
+// renumbers the unnamed ones after it, as it always has.
+- (NSString *)nameForDesktopAtIndex:(NSInteger)index {
+    return [self customNameForDesktopAtIndex:index]
+        ?: [NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)];
+}
+
+- (NSString *)customNameForDesktopAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger) _desktopNames.count)
+        return nil;
+    NSString *name = _desktopNames[(NSUInteger) index];
+    return name.length > 0 ? name : nil;
+}
+
+// An empty (or all-space) name gives the Desktop back its positional one.
+- (void)setName:(NSString *)name forDesktopAtIndex:(NSInteger)index {
+    if (index < 0 || index >= self.desktopCount)
+        return;
+    NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    if (_desktopNames == nil)
+        _desktopNames = [NSMutableArray array];
+    while ((NSInteger) _desktopNames.count <= index)
+        [_desktopNames addObject:@""];
+    _desktopNames[(NSUInteger) index] = trimmed;
+    ISHWorkspaceTrimDesktopNames(_desktopNames);
+    [self postDesktopsDidChange];
+}
+
+// What both arrangement writers record for the Desktops themselves.
+- (NSDictionary<NSString *, id> *)desktopsLayoutDescriptor {
+    NSMutableDictionary<NSString *, id> *descriptor = [@{@"kind": ISHWorkspaceSavedLayoutKindDesktops,
+                                                         @"count": @(self.desktopCount),
+                                                         @"active": @(self.activeDesktopIndex)} mutableCopy];
+    if (_desktopNames.count > 0)
+        descriptor[@"names"] = [_desktopNames copy];
+    return descriptor;
 }
 
 - (void)toggleDesktopLockAtIndex:(NSInteger)index {
@@ -5608,8 +5687,12 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
 // A brief "Desktop N / M" toast so the swipe-only switch stays oriented.
 - (void)showDesktopIndicator {
     [self showDesktopToastWithText:
-        [NSString stringWithFormat:@"  Desktop %ld / %ld  ",
-         (long)(self.activeDesktopIndex + 1), (long)self.desktopCount]
+        ([self customNameForDesktopAtIndex:self.activeDesktopIndex] != nil
+             ? [NSString stringWithFormat:@"  %@  %ld / %ld  ",
+                [self customNameForDesktopAtIndex:self.activeDesktopIndex],
+                (long)(self.activeDesktopIndex + 1), (long)self.desktopCount]
+             : [NSString stringWithFormat:@"  Desktop %ld / %ld  ",
+                (long)(self.activeDesktopIndex + 1), (long)self.desktopCount])
                            holdFor:0.7];
 }
 
@@ -5826,7 +5909,7 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
     for (NSInteger index = 0; index < self.desktopCount; index++) {
         if (index == self.activeDesktopIndex)
             continue;
-        NSString *title = [NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)];
+        NSString *title = [self nameForDesktopAtIndex:index];
         [sheet addActionWithTitle:title
                             style:UIAlertActionStyleDefault
                           handler:^(__unused UIAlertAction *action) {
@@ -13512,6 +13595,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UIColor *accent = theme[@"accent"] ?: UIColor.systemBlueColor;
     UIColor *muted = [(theme[@"primary"] ?: UIColor.grayColor) colorWithAlphaComponent:0.5];
     BOOL locked = [self.workspaceHostViewController isDesktopLockedAtIndex:index];
+    NSString *name = [self.workspaceHostViewController nameForDesktopAtIndex:index];
 
     UIStackView *row = [UIStackView new];
     row.axis = UILayoutConstraintAxisHorizontal;
@@ -13535,8 +13619,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     // The first Desktop is permanently protected, so its lock shows closed and isn't toggleable.
     lock.enabled = (index != 0);
     lock.accessibilityLabel = (index == 0)
-        ? @"Desktop 1 is protected"
-        : [NSString stringWithFormat:@"%@ Desktop %ld", locked ? @"Unlock" : @"Lock", (long)(index + 1)];
+        ? [NSString stringWithFormat:@"%@ is protected", name]
+        : [NSString stringWithFormat:@"%@ %@", locked ? @"Unlock" : @"Lock", name];
     [lock setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [lock.widthAnchor constraintEqualToConstant:28.0].active = YES;
     [lock addTarget:self action:@selector(toggleLockFromApplet:) forControlEvents:UIControlEventTouchUpInside];
@@ -13560,7 +13644,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     jump.layer.borderColor = (active ? accent
                                      : (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35])).CGColor;
     jump.backgroundColor = active ? activeFill : nil;
-    [jump setTitle:[NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)] forState:UIControlStateNormal];
+    [jump setTitle:name forState:UIControlStateNormal];
+    jump.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [jump setTitleColor:(active ? ISHWorkspaceThemeOnSurfaceColor(activeFill, 4.5)
                                 : (theme[@"primary"] ?: UIColor.darkTextColor))
                forState:UIControlStateNormal];
@@ -13571,6 +13656,17 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     }
     [jump.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 30.0 : 38.0].active = YES;
     [jump addTarget:self action:@selector(jumpToDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
+    // Touch and hold (click and hold on a Mac) to rename it. The press only begins
+    // the gesture; a plain tap still jumps.
+    [jump addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                                            action:@selector(renameDesktopFromApplet:)]];
+    __weak typeof(self) weakSelf = self;
+    jump.accessibilityCustomActions = @[
+        [[UIAccessibilityCustomAction alloc] initWithName:@"Rename"
+                                            actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) {
+            [weakSelf presentRenameForDesktopAtIndex:index];
+            return YES;
+        }]];
     [row addArrangedSubview:jump];
 
     // The delete x is hidden entirely while the Desktop is locked; unlock to remove it.
@@ -13587,7 +13683,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
             [remove setTitle:@"x" forState:UIControlStateNormal];
         }
         remove.tintColor = UIColor.systemRedColor;
-        remove.accessibilityLabel = [NSString stringWithFormat:@"Remove Desktop %ld", (long)(index + 1)];
+        remove.accessibilityLabel = [NSString stringWithFormat:@"Remove %@", name];
         [remove setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
         [remove.widthAnchor constraintEqualToConstant:28.0].active = YES;
         [remove addTarget:self action:@selector(removeDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
@@ -13598,6 +13694,40 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)jumpToDesktopFromApplet:(UIButton *)sender {
     [self.workspaceHostViewController switchToDesktopIndex:sender.tag];
+}
+
+- (void)renameDesktopFromApplet:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan)
+        return;
+    [self presentRenameForDesktopAtIndex:recognizer.view.tag];
+}
+
+- (void)presentRenameForDesktopAtIndex:(NSInteger)index {
+    WorkspaceViewController *host = self.workspaceHostViewController;
+    if (host == nil || index < 0 || index >= host.desktopCount)
+        return;
+    NSString *positional = [NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Rename Desktop"
+                                            message:[NSString stringWithFormat:@"Leave it empty to go back to \"%@\".", positional]
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.text = [host customNameForDesktopAtIndex:index];
+        textField.placeholder = positional;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeWords;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.returnKeyType = UIReturnKeyDone;
+    }];
+    __weak UIAlertController *weakAlert = alert;
+    UIAlertAction *save = [UIAlertAction actionWithTitle:@"Save"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(__unused UIAlertAction *action) {
+        [host setName:weakAlert.textFields.firstObject.text ?: @"" forDesktopAtIndex:index];
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:save];
+    alert.preferredAction = save;
+    [host presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)addDesktopFromApplet:(id)sender {
