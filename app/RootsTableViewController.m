@@ -398,6 +398,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [self reloadCachedRootArchives];
     [Roots.instance observe:@[@"roots", @"defaultRoot", @"initialBundledRootImportInProgress", @"initialBundledRootImportError"]
                     options:0 owner:self usingBlock:^(typeof(self) self) {
@@ -837,6 +838,11 @@ static UIColor *RootRowInUseAccentColor(void) {
 @implementation RootDetailViewController {
     CGFloat _nameFieldInset;   // the storyboard's, before any text scale
     BOOL _hasNameFieldInset;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
 }
 
 - (void)viewWillAppear:(BOOL)animated {

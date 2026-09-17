@@ -10,6 +10,7 @@
 #import "NSObject+SaneKVO.h"
 #import "Theme.h"
 #import "ThemeViewController.h"
+#import "UIViewController+Extras.h"
 #import "UserPreferences.h"
 #import "WorkspaceViewController.h"
 
@@ -28,7 +29,8 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
+
     [UserPreferences.shared observe:@[@"theme"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{

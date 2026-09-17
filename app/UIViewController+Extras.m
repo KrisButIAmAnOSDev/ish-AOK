@@ -68,6 +68,17 @@ BOOL ISHActionSheetUsesMacPresentation(void) {
     return info.isiOSAppOnMac || info.isMacCatalystApp;
 }
 
+void ISHSizeTableSectionTitlesOnMac(UITableView *tableView) {
+    // Not Mac Catalyst: its UIKit sizes titles on the storyboard path, measured
+    // with a Catalyst build of the same table.
+    if (!NSProcessInfo.processInfo.isiOSAppOnMac)
+        return;
+    tableView.sectionHeaderHeight = UITableViewAutomaticDimension;
+    tableView.sectionFooterHeight = UITableViewAutomaticDimension;
+    tableView.estimatedSectionHeaderHeight = 44;
+    tableView.estimatedSectionFooterHeight = 44;
+}
+
 CGFloat ISHWindowingControlsTopInset(UIView *view) {
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
     if (@available(iOS 26.0, *)) {

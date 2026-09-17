@@ -97,6 +97,21 @@ NS_ASSUME_NONNULL_BEGIN
 // Mac Catalyst, or ISH_FORCE_MAC_SHEETS=1.
 BOOL ISHActionSheetUsesMacPresentation(void);
 
+// Gives a storyboard table self-sizing section headers and footers when the app
+// runs on a Mac. Call it from -viewDidLoad.
+//
+// A table from a storyboard decodes with 18pt section heights and estimated
+// section heights of 0, which is UIKit's non-self-sizing path. On an iPhone or
+// iPad that path still sizes a section with a title to fit its text. Run as an
+// iOS app on a Mac it does not: measured in Filesystems, every header and footer
+// was exactly 18pt and the footer views had no textLabel, so the headers
+// vanished and the footers were cut to a strip. Self-sizing measures the header
+// and footer views themselves.
+//
+// Nothing changes anywhere else. Self-sizing there would give an untitled first
+// section a 17.5pt header it does not have today.
+void ISHSizeTableSectionTitlesOnMac(UITableView *tableView);
+
 // How far down, in `view`'s own coordinates, content has to start to stay clear
 // of the system's window controls (close, minimize, zoom).
 //

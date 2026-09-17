@@ -12,6 +12,7 @@
 #import "ThemesViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
 
 @interface AboutAppearanceViewController () <WorkspaceTextScaledPage>
@@ -63,6 +64,7 @@ char *previewString = "# cat /proc/ish/colors\r\n"
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [UserPreferences.shared observe:@[@"theme", @"fontSize", @"lineHeight", @"fontFamily", @"colorScheme", @"workspaceStyle"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{

@@ -8,6 +8,7 @@
 #import "AboutExternalKeyboardViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
 
 const int kCapsLockMappingSection = 0;
@@ -26,6 +27,7 @@ const int kCapsLockMappingSection = 0;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [UserPreferences.shared observe:@[@"capsLockMapping", @"optionMapping"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{

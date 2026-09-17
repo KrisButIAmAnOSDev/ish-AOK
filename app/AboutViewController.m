@@ -6106,6 +6106,7 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [self _updateUI];
     // Title and destination depend on which mode the window is currently in, and
     // the window isn't known until the view is in the hierarchy, so the title is
