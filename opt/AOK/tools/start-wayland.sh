@@ -241,6 +241,27 @@ export MOZ_DISABLE_WAYLAND_PROXY=1
 # drawn over VNC. Installing at-spi2-core instead would add a bus launcher to
 # every session for nothing.
 export NO_AT_BRIDGE=1
+# GTK 4 ignores NO_AT_BRIDGE and starts the accessibility bus anyway, which is
+# at-spi-bus-launcher and its registry daemon, about 20 MB, beside every GTK 4
+# program (gnome-mines, gnome-chess).
+export GTK_A11Y=none
+# SDL tries X11 before Wayland whenever DISPLAY is set, so SDL games ran behind
+# Xwayland; they run as Wayland clients instead. X11 stays second, for an SDL
+# built without Wayland. SDL 2 reads SDL_VIDEODRIVER and SDL 3 SDL_VIDEO_DRIVER;
+# both take a comma-separated list.
+export SDL_VIDEODRIVER=wayland,x11
+export SDL_VIDEO_DRIVER=wayland,x11
+# Debian and Devuan install games in /usr/games, which their /etc/profile puts
+# on PATH only for users other than root, and the app starts this script with
+# a fixed PATH without it: game entries in the Applications menu did nothing, and
+# gnome-chess found no chess engine (gnuchess is /usr/games/gnuchess).
+for games_dir in /usr/local/games /usr/games; do
+    case ":$PATH:" in
+        *":$games_dir:"*) ;;
+        *) PATH="$PATH:$games_dir" ;;
+    esac
+done
+export PATH
 
 # Pixman accelerator (kernel/ish_accel_pix.c via ISH_SYS_PIXOP): loaded only
 # if setup-wayland.sh's best-effort build actually produced the shim AND the
@@ -830,6 +851,28 @@ while true; do
     wayvnc_attempt=$((wayvnc_attempt + 1))
     sleep 0.3
 done
+
+# The X display of the compositor's Xwayland. labwc gives it to what labwc starts
+# (the menu, keybindings, autostart), but foot and the panel are started here, so
+# an X program run in the first terminal said "Can't open display". wlroots
+# claims the display while the compositor starts up, which wayvnc connecting has
+# shown is over: it binds the X sockets and writes the compositor's pid into
+# /tmp/.X<n>-lock, which is how that display is told apart from another
+# session's. Xwayland itself starts on the first X client. No lock names the
+# compositor when it has no Xwayland, and DISPLAY stays unset.
+for x_lock in /tmp/.X*-lock; do
+    [ -f "$x_lock" ] || continue
+    x_lock_pid=""
+    # The pid is right-aligned in ten columns with no newline: read strips the
+    # padding and returns nonzero at the missing newline, having set the value.
+    read -r x_lock_pid < "$x_lock" 2>/dev/null
+    [ "$x_lock_pid" = "$COMPOSITOR_PID" ] || continue
+    x_display="${x_lock#/tmp/.X}"
+    export DISPLAY=":${x_display%-lock}"
+    log "X programs use display $DISPLAY (Xwayland starts on the first one)"
+    break
+done
+
 # foot isn't load-bearing for the applet's own readiness (wayvnc is what the
 # bridge connects to), so a foot that dies here leaves a perfectly "Connected"
 # session with a silently empty desktop -- no error anywhere, since wayvnc
