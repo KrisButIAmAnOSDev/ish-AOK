@@ -1001,6 +1001,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->poll_restart_valid = false;
     task->sleep_restart_valid = false;
     task->restart_nohand_pending = false;
+    task->restart_sys_pending = false;
     task->futex_restart_futex = NULL;
     task->futex_restart_uaddr = 0;
     task->futex_restart_wake_seq = 0;

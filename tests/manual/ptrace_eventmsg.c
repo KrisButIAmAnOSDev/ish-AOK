@@ -647,17 +647,10 @@ static void seize_case(void) {
     if (c == 0) {
         close(go[1]);
         char ch;
-        // Retried on EINTR, which Linux never returns here: it restarts a read
-        // that PTRACE_INTERRUPT broke into once the tracer resumes the task.
-        // AOK hands back EINTR instead (its interrupt is a real SIGTRAP), and
-        // whether this read is the one interrupted is timing. That is a
-        // separate bug from the messages checked here, so it must not decide
-        // this case's verdict.
-        ssize_t n;
-        do
-            n = read(go[0], &ch, 1);
-        while (n < 0 && errno == EINTR);
-        if (n != 1)
+        // Not retried on EINTR. Linux restarts a read that PTRACE_INTERRUPT
+        // broke into once the tracer resumes the task, and so does AOK now; see
+        // ptrace_stop_restart.
+        if (read(go[0], &ch, 1) != 1)
             _exit(99);
         raise(SIGSTOP);
         for (;;)

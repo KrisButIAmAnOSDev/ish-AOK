@@ -499,6 +499,12 @@ struct task {
     // Xcode build does not reliably recompile it when this header changes, so a
     // field added in the middle shifts every offset under a stale object.
     dword_t native_standin_child;
+
+    // restart_nohand_pending's twin for an _ERESTART rewind: a handler about to
+    // run without SA_RESTART cancels the restart (Linux's ERESTARTSYS). Set by
+    // the dispatcher at rewind time, consumed by receive_signal, and cleared as
+    // the next syscall starts. At the end for the reason given just above.
+    bool restart_sys_pending;
 };
 
 // current will always give the process that is currently executing

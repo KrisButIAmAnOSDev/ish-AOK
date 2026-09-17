@@ -176,21 +176,38 @@ Linux answers with a small taxonomy, and AOK implements it:
   `kernel/errno.h`) — restart if the handler was installed with `SA_RESTART`,
   otherwise `EINTR`.
 - `ERESTART_NOHAND` — restart across a job-control stop, but **never** across a
-  handler. `poll`, `select` and `epoll_wait` use this: a stopped-and-continued
-  process resumes its wait, but a process that ran a handler gets `EINTR`.
+  handler. `poll` and `select` use this: a stopped-and-continued process resumes
+  its wait, but a process that ran a handler gets `EINTR`. (`epoll_wait` is
+  stricter still and never restarts at all.)
 
-The second one needs machinery, because "cancel the restart because a handler is
-about to run" is a decision made in a different place from the one that set it
-up:
+Both need machinery, because the decision is made in a different place from the
+one that set it up. The syscall only rewinds the program counter; the handler
+setup in `receive_signal` settles whether the restart stands:
 
 ```c
-if (current->restart_nohand_pending) {
-    current->restart_nohand_pending = false;
+bool cancel = current->restart_nohand_pending ||
+    (current->restart_sys_pending && !(action->flags & SA_RESTART_));
+current->restart_nohand_pending = false;
+current->restart_sys_pending = false;
+if (cancel) {
     current->poll_restart_valid = false;
     current->sleep_restart_valid = false;
     cancel_syscall_restart();
 }
 ```
+
+For a long time only the `ERESTART_NOHAND` half existed, and an interrupted
+syscall chose between `ERESTART` and `EINTR` by looking at the handler it
+expected to run. A tracer makes that guess wrong. A traced task's signal goes to
+a signal-delivery-stop first, and the tracer may resume without it — gdb does,
+for `SIGINT` — so no handler runs and Linux restarts the call. `PTRACE_INTERRUPT`'s
+`SIGTRAP` is never delivered at all. AOK had guessed `EINTR` from both, so a
+program blocked in `read` failed as soon as a debugger interrupted it and let it
+go. Now such a call is set to restart, and whichever handler really runs first
+decides (`signal_restart_decided_at_delivery`), which is where Linux's
+`handle_signal` decides too. Both flags are cleared as the next syscall starts: a
+rewound program counter is only a restart until the syscall instruction runs
+again.
 
 There is a second subtlety underneath. A restarted *timed* wait must not restart
 its timeout. A `poll` with a 5-second timeout, stopped after 4 seconds and

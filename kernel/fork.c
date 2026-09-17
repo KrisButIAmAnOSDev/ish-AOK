@@ -680,6 +680,17 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // using. Only a signal that will terminate us qualifies, and after one
         // of those we run no guest instructions at all -- handle_interrupt()
         // calls receive_signals() before the JIT is re-entered.
+        //
+        // A signal our tracer will see first is not one of those, whatever its
+        // disposition: the tracer can suppress it (signal_stops_for_tracer).
+        // Linux only turns a fatal signal into a SIGKILL for an untraced task
+        // (complete_signal), so a tracee's vfork wait ends for SIGKILL alone.
+        // PTRACE_INTERRUPT's trap is a SIGTRAP, whose disposition is
+        // terminate, and it ended the wait too. Measured with the child blocked
+        // on a pipe: after PTRACE_INTERRUPT, or a SIGINT the tracer then
+        // resumed without, the parent stopped at once, returned from vfork
+        // before the child had finished, and died of SIGSEGV on the stack they
+        // shared. Linux 6.12 reported no stop until the child had exited.
         bool fatal = false;
         lock(&vfork->lock, 0);
         while (!vfork->done) {
@@ -690,7 +701,8 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
             // every signal that can be represented in the mask.
             for (int sig = 1; sig <= 63 && !fatal; sig++) {
                 if (sigset_has(pending, sig) &&
-                        signal_action(current->sighand, sig) == SIGNAL_KILL)
+                        signal_action(current->sighand, sig) == SIGNAL_KILL &&
+                        !signal_stops_for_tracer(current, sig))
                     fatal = true;
             }
             unlock(&current->sighand->lock);

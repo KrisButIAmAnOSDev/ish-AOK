@@ -2282,22 +2282,30 @@ static bool syscall_result_should_restart(dword_t *resultp) {
     // suspend across which the guest was frozen anyway is the case where it
     // matters least.
     if (r == _EINTR && checkpoint_freeze_pending()) {
-        if (current != NULL)
+        if (current != NULL) {
             current->restart_nohand_pending = false;
+            current->restart_sys_pending = false;
+        }
         *resultp = (dword_t) _ERESTART;
         return true;
     }
     if (r != _ERESTART && r != _ERESTART_NOHAND) {
-        if (current != NULL)
+        if (current != NULL) {
             current->restart_nohand_pending = false;
+            current->restart_sys_pending = false;
+        }
         return false;
     }
-    // Remember which flavour, for the handler-setup path: an _ERESTART_NOHAND
-    // restart is cancelled by a handler running before the syscall re-executes
-    // (Linux's ERESTARTNOHAND), an _ERESTART one is not. Recorded here because
-    // this predicate is checked immediately before every PC rewind.
-    if (current != NULL)
+    // Remember which flavour, for the handler-setup path (receive_signal): an
+    // _ERESTART_NOHAND restart is cancelled by any handler running before the
+    // syscall re-executes (Linux's ERESTARTNOHAND), an _ERESTART one by a
+    // handler without SA_RESTART (ERESTARTSYS). A freeze's restart, above, by
+    // neither. Recorded here because this predicate is checked immediately
+    // before every PC rewind.
+    if (current != NULL) {
         current->restart_nohand_pending = (r == _ERESTART_NOHAND);
+        current->restart_sys_pending = (r == _ERESTART);
+    }
     return true;
 }
 
@@ -4991,6 +4999,16 @@ static void handle_amd64_syscall_interrupt(struct cpu_state *cpu) {
 }
 
 void handle_syscall_interrupt(struct cpu_state *cpu) {
+    // A pending restart ends here. Its cancellation (receive_signal) only means
+    // anything between the rewind and the syscall instruction running again,
+    // and this is that instruction -- or whatever a tracer put in its place.
+    // Left set, a handler that ran later would step a PC that no longer sits
+    // after a syscall and overwrite a register with EINTR. Nothing else clears
+    // them reliably: most of handle_amd64_native_memory_syscall's cases write
+    // their result straight to RAX and never pass syscall_result_should_restart.
+    current->restart_nohand_pending = false;
+    current->restart_sys_pending = false;
+
     const struct syscall_abi_dispatch *dispatch = syscall_dispatch_for_abi(current->abi);
     if (dispatch->table == NULL) {
         printk("ERROR: %d(%s) syscall dispatch for guest ABI %s is not implemented yet\n",
@@ -5139,9 +5157,12 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
             (sqword_t) result == (sqword_t) (sdword_t) _ERESTART ||
             (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
         if (restart_pending) {
-            if (current != NULL)
+            if (current != NULL) {
                 current->restart_nohand_pending =
                     (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
+                current->restart_sys_pending =
+                    (sqword_t) result == (sqword_t) (sdword_t) _ERESTART;
+            }
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
             if (current->ptrace.traced && current->ptrace.stop_at_syscall &&
                     current->ptrace.syscall_stopped)

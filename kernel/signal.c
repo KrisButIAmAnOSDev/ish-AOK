@@ -716,7 +716,52 @@ void task_wake_for_freeze(struct task *task) {
     }
 }
 
-static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {
+// Whether a signal that interrupted a syscall can say yet if that syscall
+// restarts. Its disposition normally does -- a handler with SA_RESTART restarts
+// it, one without gives EINTR, a stop restarts it -- but for two kinds of signal
+// the disposition is not what will happen.
+//
+// PTRACE_INTERRUPT's trap is never delivered. AOK interrupts a tracee by
+// queueing it a real SIGTRAP (Linux sets JOBCTL_TRAP_STOP, a flag), and the
+// trap is consumed by the tracee's ptrace stop, dropped by ptrace_stop_common
+// when another stop got there first, or discarded by a detach. Read by SIGTRAP's
+// disposition, terminate, it meant "no restart": a read() blocked on a pipe
+// failed with EINTR once the tracer resumed it, 10 runs out of 10, where Linux
+// 6.12 restarted it 10 out of 10 because no handler ran.
+//
+// Any signal a tracer sees first. receive_signals turns it into a
+// signal-delivery-stop, and the tracer chooses what happens next. Resumed with
+// no signal, nothing is delivered and Linux restarts the call -- that is gdb's
+// ^C and `continue` on a program waiting for input, and AOK failed the read.
+// Injected, its handler runs, and the call restarts only if that handler allows
+// it. So both say "restart" here, and receive_signal cancels the restart if a
+// handler that does not allow it runs first: Linux's rule, applied where Linux
+// applies it, in handle_signal. SIGKILL is never stopped for, and neither is a
+// signal the tracer already chose to deliver (ptrace.deliver_sig); their
+// dispositions still decide.
+//
+// Measured before this, on Linux 6.12 and an arm64 Devuan guest, with the call
+// blocked and then stopped by PTRACE_INTERRUPT or by a SIGUSR1 or SIGINT the
+// tracer resumed without: read, recv, accept, open of a FIFO, a write to a full
+// pipe, eventfd, waitpid, waitid, futex, F_SETLKW, poll, select, nanosleep and
+// clock_nanosleep all carried on under Linux and all failed with EINTR under
+// AOK. epoll_wait and sigtimedwait fail with EINTR on both, and still do here:
+// they never restart.
+//
+// Callers exclude a signal the native shim holds a handler for. receive_signals
+// never dequeues one, so no tracer ever sees it.
+static bool signal_restart_decided_at_delivery(struct task *task, int sig, int code) {
+    if (sig == SIGTRAP_ && code == SI_PTRACE_INTERRUPT_)
+        return true;
+    return signal_stops_for_tracer(task, sig);
+}
+
+bool signal_stops_for_tracer(struct task *task, int sig) {
+    return task->ptrace.traced && sig != SIGKILL_ && sig != task->ptrace.deliver_sig;
+}
+
+static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, int code,
+        bool interrupted_wait) {
     if (!interrupted_wait)
         return;
     // A job-control stop is not an interruption. Linux parks the task inside
@@ -724,6 +769,8 @@ static void signal_note_interrupted(struct task *task, struct sighand *sighand, 
     // to the guest -- and because no handler runs, that holds even for the
     // interfaces SA_RESTART cannot rescue (poll, select, epoll_wait). Only a
     // handler actually running can turn a wait into a guest-visible EINTR.
+    // Until it is delivered, the same goes for PTRACE_INTERRUPT's trap and for
+    // any signal a tracer sees first: see signal_restart_decided_at_delivery.
     //
     // sighand->action is not the truth for a signal the native shim is holding
     // a handler for -- what sits there is the SIG_DFL placeholder
@@ -733,7 +780,8 @@ static void signal_note_interrupted(struct task *task, struct sighand *sighand, 
     // handler is always what runs, so `stops` is false by construction.
     bool held = sigset_has(__atomic_load_n(&task->native_held, __ATOMIC_ACQUIRE), sig);
     int action = held ? SIGNAL_CALL_HANDLER : signal_action(sighand, sig);
-    bool stops = action == SIGNAL_STOP;
+    bool stops = !held && (action == SIGNAL_STOP ||
+        signal_restart_decided_at_delivery(task, sig, code));
     bool restart = held
         ? sigset_has(__atomic_load_n(&task->native_restart, __ATOMIC_ACQUIRE), sig)
         : (stops || (action == SIGNAL_CALL_HANDLER &&
@@ -780,7 +828,7 @@ static void deliver_signal_unlocked_locked(struct task *task, struct sighand *si
         return;
 
     bool interrupted_wait = signal_wake_task(task, sighand, sig);
-    signal_note_interrupted(task, sighand, sig, interrupted_wait);
+    signal_note_interrupted(task, sighand, sig, info.code, interrupted_wait);
 }
 
 // Deliver a process-directed signal into the thread group's shared queue
@@ -862,7 +910,7 @@ static void deliver_signal_to_group_locked(struct sighand *sighand, int sig, str
                 signal_is_blockable(sig) && !signal_is_synchronous_trap(sig))
             continue;
         bool interrupted_wait = signal_wake_task(task, sighand, sig);
-        signal_note_interrupted(task, sighand, sig, interrupted_wait);
+        signal_note_interrupted(task, sighand, sig, info.code, interrupted_wait);
     }
 }
 
@@ -1651,8 +1699,13 @@ bool signal_should_restart_syscall_nohand(void) {
     // handler running. Without this the placeholder for, say, a native
     // program's own SIGTSTP handler would read as SIGNAL_STOP and restart a
     // poll() that Linux would have interrupted.
+    //
+    // A signal whose delivery decides (signal_restart_decided_at_delivery)
+    // restarts too, like a stop; if a handler does run before the call
+    // re-executes, receive_signal cancels the restart.
     bool stops = best != NULL && !signal_native_held(best->info.sig) &&
-        signal_action(sighand, best->info.sig) == SIGNAL_STOP;
+        (signal_action(sighand, best->info.sig) == SIGNAL_STOP ||
+         signal_restart_decided_at_delivery(current, best->info.sig, best->info.code));
     unlock(&sighand->lock);
     return stops;
 }
@@ -1686,6 +1739,13 @@ bool signal_should_restart_syscall(void) {
     if (signal_native_held(sig)) {
         unlock(&sighand->lock);
         return signal_native_restarts(sig);
+    }
+    // PTRACE_INTERRUPT's trap, or a signal a tracer will see before anything
+    // is delivered: restart, and let receive_signal cancel it if a handler
+    // without SA_RESTART runs first. See signal_restart_decided_at_delivery.
+    if (signal_restart_decided_at_delivery(current, sig, best->info.code)) {
+        unlock(&sighand->lock);
+        return true;
     }
     int action = signal_action(sighand, sig);
     if (action != SIGNAL_CALL_HANDLER) {
@@ -2131,18 +2191,35 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
             do_exit_group(sig);
     }
 
-    // A handler is about to run. If the syscall it interrupted asked for an
-    // ERESTARTNOHAND restart -- poll/select/epoll_wait, which resume across a
-    // job-control stop but not across a handler -- the restart is cancelled
-    // here and the guest gets EINTR, exactly as Linux's handle_signal does.
-    if (current->restart_nohand_pending) {
-        current->restart_nohand_pending = false;
+    struct sigaction_ *action = &sighand->action[info->sig];
+
+    // A handler is about to run. If the syscall it interrupted was rewound to
+    // restart, this is where Linux's handle_signal settles whether it still
+    // does, and so does this. An ERESTARTNOHAND restart -- poll/select, which
+    // resume across a job-control stop but not across a handler -- is always
+    // cancelled, and the guest gets EINTR. An _ERESTART one is cancelled when
+    // this handler lacks SA_RESTART (ERESTARTSYS).
+    //
+    // That second half is what lets a restart be promised before anyone knows
+    // which handler will run. A signal a tracer stops for is resumed, injected
+    // or replaced as the tracer likes, so its syscall is set to restart and
+    // this decides (signal_restart_decided_at_delivery). It also settles a stop
+    // followed by a SIGCONT handler without SA_RESTART: measured on Linux 6.12,
+    // read, recv, waitpid, futex and the rest then fail with EINTR, where AOK
+    // restarted them because the stop, not the handler, had decided.
+    //
+    // Only the first handler decides. One stacked on top of it finds the
+    // syscall already settled, as it does on Linux.
+    bool cancel = current->restart_nohand_pending ||
+        (current->restart_sys_pending && !(action->flags & SA_RESTART_));
+    current->restart_nohand_pending = false;
+    current->restart_sys_pending = false;
+    if (cancel) {
         current->poll_restart_valid = false;
         current->sleep_restart_valid = false;
         cancel_syscall_restart();
     }
 
-    struct sigaction_ *action = &sighand->action[info->sig];
     bool need_siginfo = action->flags & SA_SIGINFO_;
 
     guest_addr_t sp = current_user_sp(current);

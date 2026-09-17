@@ -348,6 +348,11 @@ void sighand_release(struct sighand *sighand);
 #define SIGNAL_CALL_HANDLER 2
 #define SIGNAL_STOP 3
 int signal_action(struct sighand *sighand, int sig);
+// Whether receive_signals will stop for task's tracer before `sig` is
+// delivered, which makes signal_action's answer a guess: the tracer may deliver
+// it, suppress it, or deliver something else. PTRACE_INTERRUPT's trap is always
+// such a signal while the task is traced.
+bool signal_stops_for_tracer(struct task *task, int sig);
 void deliver_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info);
 struct tgroup;
 // Deliver a process-directed signal to a thread group: enqueues into the
