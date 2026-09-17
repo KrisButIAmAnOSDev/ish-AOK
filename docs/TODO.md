@@ -806,8 +806,10 @@ pid table on every stat. Linux reports 219 for /proc and 9 for /proc/<pid>;
 2 is the honest floor, and no longer 0, which is what a deleted inode looks
 like.
 
-**System V shared memory is unimplemented**, so /proc/sysvipc/shm is its
-header alone. Semaphores and message queues are listed for real.
+**System V shared memory segments are not listed**: /proc/sysvipc/shm is its
+header alone and shmctl has no SHM_STAT/SHM_INFO, so `ipcs -m` shows nothing
+even while segments exist (kernel/ipc.c implements them). Semaphores and
+message queues are listed for real.
 
 ### PIPE_BUF atomicity cannot be imposed on a HOST pipe
 

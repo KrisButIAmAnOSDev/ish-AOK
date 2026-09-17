@@ -37,6 +37,7 @@
 
 #define SHM_RDONLY_  010000
 #define SHM_RND_     020000
+#define SHM_DEST_    01000
 
 #include "kernel/sysvipc.h"
 
@@ -331,19 +332,44 @@ static guest_addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment
 
 static guest_addr_t shmat_internal(int id, guest_addr_t shmaddr, int shmflg) {
     lock(&shm_lock, 0);
+    // A segment marked IPC_RMID can still be attached for as long as it
+    // exists, i.e. until its last detach destroys it and takes it off the
+    // list. That is Linux's rule -- shmctl(2) documents it as Linux-specific --
+    // and MIT-SHM clients rely on it: Qt, for one, creates a segment, attaches
+    // it, marks it IPC_RMID so that a crash cannot leak it, and only then asks
+    // the X server to attach it by id. Refusing it here failed the server's
+    // shmat, which the X server reports as BadAccess on X_ShmAttach.
     struct shm_segment *segment = shm_segment_find_by_id(id);
-    unlock(&shm_lock);
-    if (segment == NULL || segment->removed)
+    if (segment == NULL) {
+        unlock(&shm_lock);
         return (guest_addr_t) _EINVAL;
+    }
     // Attaching needs read, and write too unless SHM_RDONLY was asked for.
     // Without this any uid attached to and wrote a root-owned 0600 segment.
     int want = 4;
     if (!(shmflg & SHM_RDONLY_))
         want |= 2;
     if (!ipc_access_ok(segment->uid, segment->gid, segment->cuid, segment->cgid,
-                       segment->mode, want))
+                       segment->mode, want)) {
+        unlock(&shm_lock);
         return (guest_addr_t) _EACCES;
-    return shm_region_attach(current->mm, segment, shmaddr, shmflg);
+    }
+    // Count the attach before dropping the lock, as Linux's do_shmat does.
+    // Otherwise a concurrent IPC_RMID -- or, now that a removed segment can be
+    // attached, the last shmdt of one -- could destroy the segment, closing its
+    // fd and freeing it, between here and the mapping.
+    segment->nattch++;
+    unlock(&shm_lock);
+
+    guest_addr_t addr = shm_region_attach(current->mm, segment, shmaddr, shmflg);
+
+    // A successful attach has counted itself; drop the placeholder. On failure
+    // this may be what destroys a segment removed in the meantime.
+    lock(&shm_lock, 0);
+    segment->nattch--;
+    shm_segment_maybe_destroy(segment);
+    unlock(&shm_lock);
+    return addr;
 }
 
 static int shmdt_internal(struct mm *mm, guest_addr_t addr, pid_t_ lpid, bool from_release) {
@@ -379,26 +405,29 @@ static int shmctl_ipc_set(struct shm_segment *segment, uid_t_ uid, uid_t_ gid, m
     return 0;
 }
 
+// A segment marked IPC_RMID but still attached reads back as Linux reports
+// it: its key is IPC_PRIVATE, since no shmget can find it by key any more, and
+// its mode carries SHM_DEST -- the bit ipcs shows as status "dest".
 static void shmctl_fill_ipc_perm_i386(struct ipc_perm_i386_ *perm, struct shm_segment *segment) {
     *perm = (struct ipc_perm_i386_) {
-        .key = segment->key,
+        .key = segment->removed ? IPC_PRIVATE_ : segment->key,
         .uid = segment->uid,
         .gid = segment->gid,
         .cuid = segment->cuid,
         .cgid = segment->cgid,
-        .mode = segment->mode,
+        .mode = segment->mode | (segment->removed ? SHM_DEST_ : 0),
         .seq = 0,
     };
 }
 
 static void shmctl_fill_ipc_perm_amd64(struct ipc_perm_amd64_ *perm, struct shm_segment *segment) {
     *perm = (struct ipc_perm_amd64_) {
-        .key = segment->key,
+        .key = segment->removed ? IPC_PRIVATE_ : segment->key,
         .uid = segment->uid,
         .gid = segment->gid,
         .cuid = segment->cuid,
         .cgid = segment->cgid,
-        .mode = segment->mode,
+        .mode = segment->mode | (segment->removed ? SHM_DEST_ : 0),
         .seq = 0,
     };
 }

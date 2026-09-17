@@ -837,9 +837,9 @@ static int proc_show_sysvipc_msg(struct proc_entry *UNUSED(entry), struct proc_d
     return 0;
 }
 
-// System V shared memory is not implemented here, so the file is its header
-// alone -- which is what Linux shows when no segment exists, and what `ipcs
-// -m` prints. The header is the part ipcs needs to parse the file at all.
+// Shared memory segments (kernel/ipc.c) are not listed yet, so the file is its
+// header alone -- which is what Linux shows when no segment exists, and what
+// `ipcs -m` prints. The header is the part ipcs needs to parse the file at all.
 static int proc_show_sysvipc_shm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%10s %10s %-10s %20s %5s %5s %6s %5s %5s %5s %5s %10s %10s %10s %20s %20s\n",
                 "key", "shmid", "perms", "size", "cpid", "lpid", "nattch",
