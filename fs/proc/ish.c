@@ -1819,6 +1819,16 @@ static int proc_ish_show_thermal_state(struct proc_entry *UNUSED(entry), struct 
     return 0;
 }
 
+// The host's IANA zone name, e.g. Europe/London: the name to find under
+// /usr/share/zoneinfo. An empty line when the host has none to give.
+static int proc_ish_show_timezone(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char name[128];
+    if (!hostTimeZoneName(name, sizeof(name)))
+        name[0] = '\0';
+    proc_printf(buf, "%s\n", name);
+    return 0;
+}
+
 extern char* printUIDevice(void);
 
 static int proc_ish_show_uidevice(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1957,6 +1967,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"thermal_state", .show = proc_ish_show_thermal_state},
+    {"timezone", .show = proc_ish_show_timezone},
     {"version", .show = proc_ish_show_version},
     {"wake_signals", .show = proc_ish_show_wake_signals},
 });

@@ -8,9 +8,9 @@
 #ifndef BatteryStatus_h
 #define BatteryStatus_h
 
-// What the host says about its battery and its temperature, for the guest files
-// built from them: /proc/ish/BAT0*, /sys/class/power_supply and
-// /proc/ish/thermal_state.
+// What the host says about its battery, its temperature and its clock, for the
+// guest files built from them: /proc/ish/BAT0*, /sys/class/power_supply,
+// /proc/ish/thermal_state and /proc/ish/timezone.
 //
 // Plain C, because the kernel includes it and so does the command-line build,
 // which has no UIKit.
@@ -56,6 +56,10 @@ enum host_thermal_state {
 };
 
 enum host_thermal_state hostThermalState(void);
+
+// The host's IANA time zone name, e.g. "Europe/London", copied into buf.
+// Returns false, with buf empty, when there is no name to give.
+bool hostTimeZoneName(char *buf, size_t size);
 
 // App only: start keeping the cache the functions above read. Call it on the
 // main thread before the guest boots; a second call does nothing.

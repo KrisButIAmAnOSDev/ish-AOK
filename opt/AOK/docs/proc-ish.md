@@ -13,10 +13,11 @@ cat /proc/ish/BAT0_capacity  # battery charge, 0-100
 cat /proc/ish/BAT0_status    # Charging / Discharging / Full
 cat /proc/ish/BAT0           # both of those plus low-power mode, one per line
 cat /proc/ish/thermal_state  # nominal / fair / serious / critical
+cat /proc/ish/timezone       # the device's time zone, e.g. Europe/London
 cat /proc/ish/UIDevice       # the UIDevice the app sees: model, OS, orientation
 ```
 
-## Battery and heat
+## Battery, heat and the time zone
 
 The `BAT0` files are AOK's own, older than the standard ones, and they keep
 their format: the charge has two decimals (`83.00`). With no battery to report
@@ -36,6 +37,12 @@ machine without one.
 `thermal_state` is iOS's own coarse reading of how hot the device is running:
 `nominal`, `fair`, `serious` or `critical`. iOS gives no temperature, so there
 is none here. The command-line build has nothing to ask and says `unknown`.
+
+`timezone` is the device's IANA zone name — the name to find under
+`/usr/share/zoneinfo`. The guest's clock follows it; see
+[roots.md](roots.md#the-time-zone-following-the-device). The command-line build
+reports the host's zone, read from its `/etc/localtime`, and an empty line if
+it cannot tell.
 
 ## Your settings, from the guest
 

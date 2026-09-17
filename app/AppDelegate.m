@@ -1454,6 +1454,243 @@ static int EnsureRegularFileNonEmpty(const char *path, const char *contents, mod
     return 0;
 }
 
+// ---- the guest's time zone follows the device's ---------------------------
+//
+// A root brings a zone of its own -- Devuan's /etc/localtime names Etc/UTC, an Arch
+// tarball has none -- and that file is the guest's only source: the kernel reports
+// tz 0, as Linux does (kernel/time.c). So a Devuan root on a Mac in London told the
+// time an hour behind the menu bar. Each boot now points /etc/localtime at the
+// device's zone, but only while the choice is still AOK's to make:
+//
+//   - there is no /etc/localtime;
+//   - it is the distribution's UTC, and AOK has never set a zone in this root;
+//   - it is still the zone AOK set last time, so a root follows a device that
+//     travels.
+//
+// Any other zone is somebody's choice, and stays. So does everything in a root that
+// lacks the zone's file: no tzdata (a fresh Alpine), or one too old for the name.
+//
+// What AOK set is recorded in /etc/aok-localtime -- in the root, not in the app's
+// preferences, because the question it answers is about this root's /etc/localtime.
+// It sits beside that file, travels with the root through export, import and
+// snapshots, and is where someone wondering why the link moved will look. Its mere
+// existence is what tells the distribution's UTC from a UTC chosen after AOK had set
+// a zone, so it is never removed.
+//
+// The link is absolute, /usr/share/zoneinfo/<zone>, as Debian's tzdata writes it and
+// reads it back. /etc/timezone is rewritten to match where it exists and never
+// created: Debian 13's tzdata stopped creating it and keeps it current only where it
+// is present, and a stale copy contradicts the link for anything that reads both --
+// Python's tzlocal warns when they differ.
+static const char kGuestLocaltimeMarker[] = "/etc/aok-localtime";
+
+// An IANA name that is safe to put after /usr/share/zoneinfo/: no leading or
+// trailing slash, no empty, "." or ".." component, nothing outside the characters
+// zone names use. The name comes from the host, but it becomes a path in the guest.
+static bool GuestZoneNameIsSafe(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len >= 128 || name[0] == '/' || name[len - 1] == '/')
+        return false;
+    for (const char *p = name; *p != '\0'; p++) {
+        if (!isalnum((unsigned char) *p) && strchr("/_+-.", *p) == NULL)
+            return false;
+    }
+    for (const char *component = name;;) {
+        const char *slash = strchr(component, '/');
+        size_t clen = slash != NULL ? (size_t) (slash - component) : strlen(component);
+        if (clen == 0 || (clen == 1 && component[0] == '.') ||
+                (clen == 2 && component[0] == '.' && component[1] == '.'))
+            return false;
+        if (slash == NULL)
+            return true;
+        component = slash + 1;
+    }
+}
+
+// The zone a /etc/localtime link names: whatever follows "zoneinfo/". That covers
+// /usr/share/zoneinfo/<zone> (Debian, Arch, this code), ../usr/share/zoneinfo/<zone>
+// (timedatectl) and /etc/zoneinfo/<zone> (Alpine's setup-timezone). The posix/ and
+// right/ trees name the same zones.
+static bool GuestZoneNameFromLink(const char *target, char *zone, size_t size) {
+    const char *name = NULL;
+    for (const char *at = strstr(target, "zoneinfo/"); at != NULL; at = strstr(at + 1, "zoneinfo/")) {
+        if (at == target || at[-1] == '/')
+            name = at + strlen("zoneinfo/");
+    }
+    if (name == NULL)
+        return false;
+    if (strncmp(name, "posix/", 6) == 0 || strncmp(name, "right/", 6) == 0)
+        name += 6;
+    size_t len = strlen(name);
+    if (len == 0 || len >= size)
+        return false;
+    memcpy(zone, name, len + 1);
+    return true;
+}
+
+static bool GuestZoneIsUTC(const char *zone) {
+    return strcmp(zone, "UTC") == 0 || strcmp(zone, "Etc/UTC") == 0;
+}
+
+// Up to SIZE bytes of a guest file. The length read, or a negative errno.
+static ssize_t ReadGuestFile(const char *path, char *buf, size_t size) {
+    struct fd *fd = generic_open(path, O_RDONLY_, 0);
+    if (IS_ERR(fd))
+        return (ssize_t) PTR_ERR(fd);
+    size_t total = 0;
+    while (total < size) {
+        ssize_t n = fd->ops->read(fd, buf + total, size - total);
+        if (n < 0) {
+            fd_close(fd);
+            return n;
+        }
+        if (n == 0)
+            break;
+        total += (size_t) n;
+    }
+    fd_close(fd);
+    return (ssize_t) total;
+}
+
+// Replace PATH with CONTENTS: written beside it, then renamed over it, so a boot cut
+// short leaves the old file or the new one and never a truncated one.
+static int WriteGuestFileReplacing(const char *path, const char *contents, mode_t_ mode) {
+    char temp[MAX_PATH];
+    snprintf(temp, sizeof(temp), "%s.aok-new", path);
+    generic_unlinkat(AT_PWD, temp);
+    struct fd *fd = generic_open(temp, O_WRONLY_ | O_CREAT_ | O_TRUNC_, mode & 07777);
+    if (IS_ERR(fd))
+        return (int) PTR_ERR(fd);
+    size_t len = strlen(contents);
+    ssize_t written = fd->ops->write(fd, contents, len);
+    fd_close(fd);
+    if (written < 0 || (size_t) written != len) {
+        generic_unlinkat(AT_PWD, temp);
+        return written < 0 ? (int) written : _EIO;
+    }
+    int err = generic_renameat(AT_PWD, temp, AT_PWD, path, 0);
+    if (err < 0)
+        generic_unlinkat(AT_PWD, temp);
+    return err;
+}
+
+// Whether the regular file at PATH holds exactly the zone ZONE's data. For a
+// /etc/localtime that is a copy rather than a link, which is how some images and
+// older Alpine instructions leave it.
+static bool GuestFileIsZone(const char *path, const char *zone) {
+    char zonefile[MAX_PATH];
+    snprintf(zonefile, sizeof(zonefile), "/usr/share/zoneinfo/%s", zone);
+    struct statbuf a, b;
+    if (generic_statat(AT_PWD, path, &a, 0) < 0 || generic_statat(AT_PWD, zonefile, &b, 0) < 0)
+        return false;
+    // A zone file is a few KB; anything much bigger is not one.
+    if (!S_ISREG(a.mode) || !S_ISREG(b.mode) || a.size != b.size || a.size == 0 || a.size > (1 << 20))
+        return false;
+    size_t size = (size_t) a.size;
+    char *left = malloc(size), *right = malloc(size);
+    bool same = left != NULL && right != NULL &&
+                ReadGuestFile(path, left, size) == (ssize_t) size &&
+                ReadGuestFile(zonefile, right, size) == (ssize_t) size &&
+                memcmp(left, right, size) == 0;
+    free(left);
+    free(right);
+    return same;
+}
+
+// The zone /etc/aok-localtime records, if the file exists at all. A marker that
+// exists but names nothing readable still means "AOK has set a zone here".
+static bool ReadGuestLocaltimeMarker(char *zone, size_t size) {
+    zone[0] = '\0';
+    char buf[512];
+    ssize_t n = ReadGuestFile(kGuestLocaltimeMarker, buf, sizeof(buf) - 1);
+    if (n < 0)
+        return n != _ENOENT;
+    buf[n] = '\0';
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
+        line[strcspn(line, " \t\r")] = '\0';
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+        if (strlen(line) < size)
+            strcpy(zone, line);
+        break;
+    }
+    return true;
+}
+
+static void ProvisionGuestTimeZone(void) {
+    char zone[128];
+    if (!hostTimeZoneName(zone, sizeof(zone)) || !GuestZoneNameIsSafe(zone))
+        return;
+    char zonefile[MAX_PATH];
+    snprintf(zonefile, sizeof(zonefile), "/usr/share/zoneinfo/%s", zone);
+    struct statbuf stat;
+    if (generic_statat(AT_PWD, zonefile, &stat, 0) < 0 || !S_ISREG(stat.mode))
+        return;
+
+    char applied[128];
+    bool applied_before = ReadGuestLocaltimeMarker(applied, sizeof(applied));
+
+    bool apply = false;
+    int err = generic_statat(AT_PWD, "/etc/localtime", &stat, AT_SYMLINK_NOFOLLOW_);
+    if (err == _ENOENT) {
+        apply = true;
+    } else if (err < 0) {
+        return;
+    } else if (S_ISLNK(stat.mode)) {
+        char target[MAX_PATH];
+        ssize_t len = generic_readlinkat(AT_PWD, "/etc/localtime", target, sizeof(target) - 1);
+        if (len < 0)
+            return;
+        target[len] = '\0';
+        char current[128];
+        // A link to something that is not a zone is an arrangement of somebody's own.
+        if (!GuestZoneNameFromLink(target, current, sizeof(current)))
+            return;
+        if (strcmp(current, zone) == 0)
+            return;
+        apply = applied_before ? strcmp(current, applied) == 0 : GuestZoneIsUTC(current);
+    } else if (S_ISREG(stat.mode)) {
+        if (GuestFileIsZone("/etc/localtime", zone))
+            return;
+        if (applied_before)
+            apply = applied[0] != '\0' && GuestFileIsZone("/etc/localtime", applied);
+        else
+            apply = GuestFileIsZone("/etc/localtime", "Etc/UTC") || GuestFileIsZone("/etc/localtime", "UTC");
+    }
+    if (!apply)
+        return;
+
+    // The link goes in beside the old file and is renamed over it, as tzdata does,
+    // so there is no moment without an /etc/localtime.
+    static const char temp[] = "/etc/localtime.aok-new";
+    generic_unlinkat(AT_PWD, temp);
+    if (generic_symlinkat(zonefile, AT_PWD, temp) < 0)
+        return;
+    if (generic_renameat(AT_PWD, temp, AT_PWD, "/etc/localtime", 0) < 0) {
+        generic_unlinkat(AT_PWD, temp);
+        return;
+    }
+
+    // Recorded only once the link is in place: if the boot dies between the two, the
+    // root has the right zone and merely stops following, rather than keeping UTC.
+    char marker[512];
+    // The same text the provision-ultimate-* scripts write.
+    snprintf(marker, sizeof(marker),
+             "# /etc/localtime names this zone because it is the device's. iSH-AOK\n"
+             "# moves it along with the device, at boot, for as long as it still names\n"
+             "# this zone; choose any other and it is left alone from then on. Keep this\n"
+             "# file: without it a UTC /etc/localtime looks like the distribution's own.\n"
+             "%s\n", zone);
+    WriteGuestFileReplacing(kGuestLocaltimeMarker, marker, 0644);
+
+    if (generic_statat(AT_PWD, "/etc/timezone", &stat, AT_SYMLINK_NOFOLLOW_) >= 0 && S_ISREG(stat.mode)) {
+        char line[160];
+        snprintf(line, sizeof(line), "%s\n", zone);
+        WriteGuestFileReplacing("/etc/timezone", line, stat.mode & 07777);
+    }
+}
+
 // Provision the /etc files a distro image ships empty, before init starts, on EVERY
 // boot path (real /sbin/init and the fake-init fallback) -- called from ensureBooted.
 // Docker-exported distro images ship /etc/hostname and /etc/hosts empty and the guest's
@@ -1489,6 +1726,9 @@ static void ProvisionGuestHostFiles(void) {
     // tools/build-devuan-minirootfs.sh, or provisioned by provision-ultimate-*.sh)
     // keeps exactly what it has.
     EnsureRegularFileNonEmpty("/etc/environment", "LANG=C.UTF-8\n", 0644);
+
+    // The clock's zone, which a root ships as UTC or not at all.
+    ProvisionGuestTimeZone();
 
     // Seed the kernel hostname from /etc/hostname right now instead of
     // waiting for the guest's own hostname.sh, which runs a minute or more
@@ -4096,11 +4336,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
         [defaults removeObjectForKey:kPreferenceLaunchCommandKey];
         [defaults setBool:NO forKey:@"hail mary"];
     }
-    // The battery and thermal state the kernel reports, cached on the main queue
-    // (kernel/BatteryStatus.m). First, because this is the earliest anything can
-    // boot the guest, and a guest that asks before the first reading gets none.
-    // Ahead of the recovery check too, so that no later path to ensureBooted has
-    // to know whether it ran; it costs a few property reads.
+    // The battery, thermal state and time zone the kernel reports, cached on the
+    // main queue (kernel/BatteryStatus.m). First, because this is the earliest
+    // anything can boot the guest, and the boot reads the zone to set
+    // /etc/localtime. Ahead of the recovery check too, so that no later path to
+    // ensureBooted has to know whether it ran; it costs a few property reads.
     ISHHostStatusStart();
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"recovery"])
         return YES;

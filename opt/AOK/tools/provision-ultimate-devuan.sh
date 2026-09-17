@@ -7,7 +7,7 @@
 # apt/dpkg + sysvinit instead of apk + OpenRC:
 #   * generous "ultimate terminal" CLI tool set
 #   * services enabled on boot via sysvinit (sshd, rsyslog, cron, chrony, ...)
-#   * US/Pacific timezone (configurable)
+#   * the device's timezone, kept following the device (configurable)
 #   * chrony in iSH-aware monitoring mode (the guest clock is the host clock)
 #   * shell niceties: bash login shells, colour prompt, MOTD, login summary,
 #     fzf/dircolors integration, machine-id, periodic maintenance via cron
@@ -20,7 +20,7 @@
 # When run on a terminal it PROMPTS for the timezone and the primary login
 # (creating that user if it does not exist). Pre-set any tunable via the
 # environment to skip its prompt / run non-interactively:
-#       TZ_NAME=America/Los_Angeles    # timezone (else prompted)
+#       TZ_NAME=America/Los_Angeles    # timezone (else prompted, offering the device's)
 #       TARGET_USER=mke                # primary login to set up (else prompted)
 #       NEW_HOSTNAME=                  # hostname to set (else prompted)
 #       SUDO_NOPASSWD=0                # 1 = passwordless sudo-group sudo
@@ -44,8 +44,11 @@ note() { printf '    %s\n' "$*"; }
 NEW_HOSTNAME="${NEW_HOSTNAME:-}"
 SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
 
-# Defaults offered at the prompts.
-DEF_TZ="${TZ_NAME:-America/Los_Angeles}"
+# Defaults offered at the prompts. The timezone offered is the device's own, as
+# the app reports it; a build too old to report one offers the old default.
+HOST_TZ="$(cat /proc/ish/timezone 2>/dev/null)"
+TZ_PRESET="${TZ_NAME:+1}"
+DEF_TZ="${TZ_NAME:-${HOST_TZ:-America/Los_Angeles}}"
 DEF_USER="${TARGET_USER:-${SUDO_USER:-}}"
 if [ -z "$DEF_USER" ] || [ "$DEF_USER" = root ]; then
     DEF_USER="$(awk -F: '$3>=1000 && $3<2000 {print $1; exit}' /etc/passwd)"
@@ -151,6 +154,19 @@ log "Timezone -> $TZ_NAME"
 if [ -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
     ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
     echo "$TZ_NAME" > /etc/timezone
+    # Taking the device's own zone leaves the choice with iSH-AOK, which moves
+    # /etc/localtime along with the device at each boot for as long as
+    # /etc/aok-localtime names the zone it holds (see /AOK/docs/roots.md). A
+    # zone set in TZ_NAME, or a different one typed at the prompt, stays put.
+    if [ -z "$TZ_PRESET" ] && [ "$TZ_NAME" = "$HOST_TZ" ]; then
+        printf '%s\n' \
+            "# /etc/localtime names this zone because it is the device's. iSH-AOK" \
+            "# moves it along with the device, at boot, for as long as it still names" \
+            "# this zone; choose any other and it is left alone from then on. Keep this" \
+            "# file: without it a UTC /etc/localtime looks like the distribution's own." \
+            "$TZ_NAME" > /etc/aok-localtime
+        note "following the device's zone from boot to boot (/etc/aok-localtime)"
+    fi
     dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
     note "$(date)"
 else

@@ -1,5 +1,5 @@
-// proc_ish_host_state.c — the host state /proc/ish reports: the battery files
-// and thermal_state.
+// proc_ish_host_state.c — the host state /proc/ish reports: the battery files,
+// thermal_state and timezone.
 //
 // The battery files used to come from printBatteryStatus(), which asked
 // UIDevice on the reading guest thread and returned the UTF8String of a
@@ -10,7 +10,10 @@
 // freed buffer shows up as a line that does not parse.
 //
 // thermal_state is iOS's coarse thermal state; the command-line build has no
-// source and must say "unknown" rather than pick a state.
+// source and must say "unknown" rather than pick a state. timezone is the
+// host's IANA zone name, which has to be usable as a path under
+// /usr/share/zoneinfo -- that is what the app's boot-time provisioning and the
+// provision-ultimate-* scripts do with it.
 //
 // AOK-only: skipped where there is no /proc/ish.
 #define _GNU_SOURCE
@@ -57,6 +60,12 @@ static ssize_t slurp(const char *path, char *buf, size_t bufsize) {
 static int is_cli(void) {
     char buf[64];
     return slurp("/proc/ish/UIDevice", buf, sizeof(buf)) > 0 && strncmp(buf, "standalone", 10) == 0;
+}
+
+// "host device: Darwin" from the command-line build on a Mac.
+static int host_is_darwin(void) {
+    char buf[1024];
+    return slurp("/proc/ish/host_info", buf, sizeof(buf)) > 0 && strstr(buf, "host device: Darwin") != NULL;
 }
 
 // "-100.00", "83.00": optional minus, digits, a point, exactly two digits.
@@ -198,6 +207,55 @@ static void check_thermal_state(int cli) {
         check("CLI: thermal_state is unknown -- there is no source to ask", strcmp(buf, "unknown") == 0);
 }
 
+// Usable as a path under /usr/share/zoneinfo, and nothing else.
+static int plausible_zone_name(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len >= 128 || name[0] == '/' || name[len - 1] == '/')
+        return 0;
+    for (const char *p = name; *p != '\0'; p++) {
+        if (!isalnum((unsigned char) *p) && strchr("/_+-.", *p) == NULL)
+            return 0;
+    }
+    const char *component = name;
+    for (;;) {
+        const char *slash = strchr(component, '/');
+        size_t clen = slash != NULL ? (size_t) (slash - component) : strlen(component);
+        if (clen == 0 || (clen == 1 && component[0] == '.') ||
+                (clen == 2 && component[0] == '.' && component[1] == '.'))
+            return 0;
+        if (slash == NULL)
+            return 1;
+        component = slash + 1;
+    }
+}
+
+static void check_timezone(int cli) {
+    char buf[256];
+    ssize_t n = slurp("/proc/ish/timezone", buf, sizeof(buf));
+    if (!check("/proc/ish/timezone is readable", n > 0))
+        return;
+    check("timezone is one line", buf[n - 1] == '\n' && strchr(buf, '\n') == buf + n - 1);
+    buf[n - 1] = '\0';
+    test_logf("     timezone: \"%s\"\n", buf);
+    if (buf[0] == '\0') {
+        // Allowed -- a host with no zone to name -- but not on a Mac, where
+        // /etc/localtime is always a link into the zoneinfo tree, and not in
+        // the app, where the system always has a zone.
+        check("timezone is only empty on a non-Darwin command-line host", cli && !host_is_darwin());
+        return;
+    }
+    char label[300];
+    snprintf(label, sizeof(label), "timezone is a plausible IANA name (got \"%s\")", buf);
+    check(label, plausible_zone_name(buf));
+
+    // Where the guest has the zone database, the host's name is normally in
+    // it. Informational only: a guest's tzdata can be older than the host's.
+    char path[400];
+    snprintf(path, sizeof(path), "/usr/share/zoneinfo/%s", buf);
+    if (access("/usr/share/zoneinfo", F_OK) == 0)
+        test_logf("     %s %s\n", path, access(path, F_OK) == 0 ? "exists" : "is not in this root's tzdata");
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(120));
@@ -211,5 +269,6 @@ int main(int argc, char **argv) {
 
     check_battery_files(cli);
     check_thermal_state(cli);
+    check_timezone(cli);
     return finish_suite("proc_ish_host_state");
 }

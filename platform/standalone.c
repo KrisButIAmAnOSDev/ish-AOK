@@ -192,6 +192,64 @@ enum host_thermal_state hostThermalState(void) {
     return HOST_THERMAL_UNKNOWN;
 }
 
+// The zone name from a path to a zone file: whatever follows "zoneinfo/".
+// macOS links /etc/localtime to /var/db/timezone/zoneinfo/<Name>; Linux to
+// /usr/share/zoneinfo/<Name>, or ../usr/share/zoneinfo/<Name> as timedatectl
+// writes it. The posix/ and right/ trees hold the same zones under the same
+// names, so they are looked through.
+static bool zone_name_from_path(const char *path, char *buf, size_t size) {
+    const char *name = NULL;
+    for (const char *at = strstr(path, "zoneinfo/"); at != NULL; at = strstr(at + 1, "zoneinfo/")) {
+        if (at == path || at[-1] == '/')
+            name = at + strlen("zoneinfo/");
+    }
+    if (name == NULL)
+        return false;
+    if (strncmp(name, "posix/", 6) == 0 || strncmp(name, "right/", 6) == 0)
+        name += 6;
+    size_t len = strlen(name);
+    if (len == 0 || len >= size)
+        return false;
+    memcpy(buf, name, len + 1);
+    return true;
+}
+
+// Where the host keeps its zone. The /etc/localtime link comes first because it
+// is the setting itself: it is what libc reads, what timedatectl and Debian's
+// tzdata write, and all macOS has. /etc/timezone is only a fallback, for a Linux
+// host whose /etc/localtime is a copy rather than a link -- Debian 13 stopped
+// creating that file and keeps it updated only where it already exists.
+bool hostTimeZoneName(char *buf, size_t size) {
+    if (buf == NULL || size == 0)
+        return false;
+    buf[0] = '\0';
+
+    char target[4096];
+    ssize_t n = readlink("/etc/localtime", target, sizeof(target) - 1);
+    if (n > 0) {
+        target[n] = '\0';
+        if (zone_name_from_path(target, buf, size))
+            return true;
+    }
+
+    FILE *file = fopen("/etc/timezone", "r");
+    if (file != NULL) {
+        char line[256];
+        bool ok = fgets(line, sizeof(line), file) != NULL;
+        fclose(file);
+        if (ok) {
+            line[strcspn(line, " \t\r\n")] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && len < size) {
+                memcpy(buf, line, len + 1);
+                return true;
+            }
+        }
+    }
+    buf[0] = '\0';
+    return false;
+}
+
 void jit_install_thread_exception_handler(void) {
 }
 

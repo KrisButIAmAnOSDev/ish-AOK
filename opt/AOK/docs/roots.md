@@ -194,6 +194,36 @@ mount table underneath all of them (see [00-overview.md](00-overview.md)). A
 bind is a system-wide change, not a private one, so unmount what you no longer
 need.
 
+## The time zone: following the device
+
+A root arrives with a time zone of its own. Devuan's `/etc/localtime` names
+`Etc/UTC`, and Alpine and Arch have no `/etc/localtime` at all, which also
+means UTC. So out of the box a guest's clock ran on UTC rather than on the time
+the device shows.
+
+Each time it boots a root, iSH-AOK points `/etc/localtime` at **the device's
+zone**, but only while the choice is still its to make:
+
+- there is no `/etc/localtime`;
+- it is the distribution's UTC, and iSH-AOK has never set a zone in this root;
+- it still names the zone iSH-AOK set last time, so a root follows the device
+  when you travel.
+
+**Any other zone is yours, and stays.** Set one with `dpkg-reconfigure tzdata`,
+`setup-timezone` or `ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime` and
+nothing moves it again, whatever the device does — and that includes choosing
+UTC on purpose. When the device itself changes zone, the guest catches up at
+its next boot.
+
+A root without zone data is left alone: a fresh Alpine root has no tzdata, so
+run `apk add tzdata` (the provisioning scripts below install it) and the zone
+arrives at the following boot.
+
+The zone iSH-AOK set is recorded in `/etc/aok-localtime`. Keep that file — it is
+what tells a UTC you chose from the one the distribution shipped. Where a root
+has an `/etc/timezone`, it is kept matching; it is never created, since current
+Debian no longer uses it. `cat /proc/ish/timezone` shows the device's zone.
+
 ## Provisioning scripts: turning a bare rootfs into a full terminal environment
 
 A freshly-imported root is intentionally minimal. Three scripts under
@@ -210,7 +240,9 @@ sudo sh /AOK/tools/provision-ultimate-archlinux.sh   # experimental, like the ro
 All three are idempotent (safe to re-run) and interactively prompt for a
 timezone and a target username unless you set `TZ_NAME` / `TARGET_USER`
 (and optionally `NEW_HOSTNAME`, `SUDO_NOPASSWD`) in the environment first.
-Each one:
+The timezone offered is the device's own; accept it and the root keeps
+[following the device](#the-time-zone-following-the-device), while a zone you
+type or put in `TZ_NAME` stays put. Each one:
 
 - Installs a curated set of packages for a comfortable terminal: bash,
   vim/neovim, tmux, htop/btop, fzf, ripgrep, fd, bat, eza, git, a build
