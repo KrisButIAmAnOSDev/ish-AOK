@@ -8,8 +8,9 @@
 #ifndef BatteryStatus_h
 #define BatteryStatus_h
 
-// What the host says about its battery, for the guest files built from it:
-// /proc/ish/BAT0* and /sys/class/power_supply.
+// What the host says about its battery and its temperature, for the guest files
+// built from them: /proc/ish/BAT0*, /sys/class/power_supply and
+// /proc/ish/thermal_state.
 //
 // Plain C, because the kernel includes it and so does the command-line build,
 // which has no UIKit.
@@ -43,6 +44,18 @@ struct host_battery_status {
 // A copy of the cached reading. Never calls into UIKit and never waits on the
 // main thread, so any guest thread may ask.
 void hostBatteryStatus(struct host_battery_status *out);
+
+// ProcessInfo.ThermalState. iOS offers only this coarse state, not a
+// temperature.
+enum host_thermal_state {
+    HOST_THERMAL_UNKNOWN = -1,  // a host with no source
+    HOST_THERMAL_NOMINAL = 0,
+    HOST_THERMAL_FAIR,
+    HOST_THERMAL_SERIOUS,
+    HOST_THERMAL_CRITICAL,
+};
+
+enum host_thermal_state hostThermalState(void);
 
 // App only: start keeping the cache the functions above read. Call it on the
 // main thread before the guest boots; a second call does nothing.

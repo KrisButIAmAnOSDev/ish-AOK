@@ -26,11 +26,13 @@ static os_unfair_lock host_status_lock = OS_UNFAIR_LOCK_INIT;
 
 static struct {
     struct host_battery_status battery;
+    enum host_thermal_state thermal;
 } host_status = {
     // Until the first reading: nothing known. The guest boots after that
     // reading (ISHHostStatusStart is called first), so this is only ever seen
     // by something that ran before the app finished launching.
     .battery = {.state = HOST_BATTERY_UNKNOWN, .level = -1, .low_power_mode = -1},
+    .thermal = HOST_THERMAL_UNKNOWN,
 };
 
 static enum host_battery_state host_battery_state_from(UIDeviceBatteryState state) {
@@ -47,6 +49,23 @@ static enum host_battery_state host_battery_state_from(UIDeviceBatteryState stat
     }
 }
 
+static enum host_thermal_state host_thermal_state_from(NSProcessInfoThermalState state) {
+    switch (state) {
+        case NSProcessInfoThermalStateNominal:
+            return HOST_THERMAL_NOMINAL;
+        case NSProcessInfoThermalStateFair:
+            return HOST_THERMAL_FAIR;
+        case NSProcessInfoThermalStateSerious:
+            return HOST_THERMAL_SERIOUS;
+        case NSProcessInfoThermalStateCritical:
+            return HOST_THERMAL_CRITICAL;
+        default:
+            // A state newer than this code: say so rather than guess which of
+            // the four it is closest to.
+            return HOST_THERMAL_UNKNOWN;
+    }
+}
+
 // Main thread only.
 static void host_status_refresh(void) {
     UIDevice *device = UIDevice.currentDevice;
@@ -59,9 +78,11 @@ static void host_status_refresh(void) {
         .level = device.batteryLevel,
         .low_power_mode = process.isLowPowerModeEnabled ? 1 : 0,
     };
+    enum host_thermal_state thermal = host_thermal_state_from(process.thermalState);
 
     os_unfair_lock_lock(&host_status_lock);
     host_status.battery = battery;
+    host_status.thermal = thermal;
     os_unfair_lock_unlock(&host_status_lock);
 }
 
@@ -80,7 +101,7 @@ void ISHHostStatusStart(void) {
     host_status_refresh();
 
     // Every one of these re-reads everything: a reading is a handful of
-    // property reads, and one path is easier to get right than four. Some are
+    // property reads, and one path is easier to get right than five. Some are
     // posted on whichever thread noticed the change, hence the main queue.
     // Becoming active is the catch-all for whatever changed while the app was
     // suspended.
@@ -88,6 +109,7 @@ void ISHHostStatusStart(void) {
         UIDeviceBatteryLevelDidChangeNotification,
         UIDeviceBatteryStateDidChangeNotification,
         NSProcessInfoPowerStateDidChangeNotification,
+        NSProcessInfoThermalStateDidChangeNotification,
         UIApplicationDidBecomeActiveNotification,
     ];
     for (NSNotificationName change in changes) {
@@ -106,4 +128,11 @@ void hostBatteryStatus(struct host_battery_status *out) {
     os_unfair_lock_lock(&host_status_lock);
     *out = host_status.battery;
     os_unfair_lock_unlock(&host_status_lock);
+}
+
+enum host_thermal_state hostThermalState(void) {
+    os_unfair_lock_lock(&host_status_lock);
+    enum host_thermal_state thermal = host_status.thermal;
+    os_unfair_lock_unlock(&host_status_lock);
+    return thermal;
 }

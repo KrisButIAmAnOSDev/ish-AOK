@@ -4096,7 +4096,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
         [defaults removeObjectForKey:kPreferenceLaunchCommandKey];
         [defaults setBool:NO forKey:@"hail mary"];
     }
-    // The battery the kernel reports, cached on the main queue
+    // The battery and thermal state the kernel reports, cached on the main queue
     // (kernel/BatteryStatus.m). First, because this is the earliest anything can
     // boot the guest, and a guest that asks before the first reading gets none.
     // Ahead of the recovery check too, so that no later path to ensureBooted has

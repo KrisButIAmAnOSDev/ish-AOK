@@ -173,10 +173,11 @@ char *printUIDevice(void) {
     return "standalone";
 }
 
-// The command-line twin of kernel/BatteryStatus.m; kernel/BatteryStatus.h says
-// why each needs both. There is no battery source here, so it says UNKNOWN.
-// That is the truth, and it already has a meaning a guest understands: an empty
-// /sys/class/power_supply, as on a Linux machine without a battery.
+// The command-line twins of kernel/BatteryStatus.m; kernel/BatteryStatus.h says
+// why each needs both. There is no battery or thermal source here, so both say
+// UNKNOWN. That is the truth, and it already has a meaning a guest understands:
+// an empty /sys/class/power_supply, as on a Linux machine without a battery, and
+// "unknown" in /proc/ish/thermal_state.
 void hostBatteryStatus(struct host_battery_status *out) {
     if (out == NULL)
         return;
@@ -185,6 +186,10 @@ void hostBatteryStatus(struct host_battery_status *out) {
         .level = -1,
         .low_power_mode = -1,
     };
+}
+
+enum host_thermal_state hostThermalState(void) {
+    return HOST_THERMAL_UNKNOWN;
 }
 
 void jit_install_thread_exception_handler(void) {

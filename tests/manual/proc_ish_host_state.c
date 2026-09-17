@@ -1,4 +1,5 @@
-// proc_ish_host_state.c — the host state /proc/ish reports: the battery files.
+// proc_ish_host_state.c — the host state /proc/ish reports: the battery files
+// and thermal_state.
 //
 // The battery files used to come from printBatteryStatus(), which asked
 // UIDevice on the reading guest thread and returned the UTF8String of a
@@ -7,6 +8,9 @@
 // output was meant to stay exactly what scripts already read. So this checks
 // the FORMAT, on every read of a burst from several threads at once: a torn or
 // freed buffer shows up as a line that does not parse.
+//
+// thermal_state is iOS's coarse thermal state; the command-line build has no
+// source and must say "unknown" rather than pick a state.
 //
 // AOK-only: skipped where there is no /proc/ish.
 #define _GNU_SOURCE
@@ -177,6 +181,23 @@ static void check_battery_files(int cli) {
     check(label, bad == 0);
 }
 
+static void check_thermal_state(int cli) {
+    char buf[64];
+    ssize_t n = slurp("/proc/ish/thermal_state", buf, sizeof(buf));
+    if (!check("/proc/ish/thermal_state is readable", n > 0))
+        return;
+    check("thermal_state is one line", buf[n - 1] == '\n' && strchr(buf, '\n') == buf + n - 1);
+    buf[n - 1] = '\0';
+    test_logf("     thermal_state: %s\n", buf);
+    char label[200];
+    snprintf(label, sizeof(label), "thermal_state is nominal, fair, serious, critical or unknown (got \"%s\")", buf);
+    check(label, strcmp(buf, "nominal") == 0 || strcmp(buf, "fair") == 0 ||
+                 strcmp(buf, "serious") == 0 || strcmp(buf, "critical") == 0 ||
+                 strcmp(buf, "unknown") == 0);
+    if (cli)
+        check("CLI: thermal_state is unknown -- there is no source to ask", strcmp(buf, "unknown") == 0);
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(120));
@@ -189,5 +210,6 @@ int main(int argc, char **argv) {
     test_logf("     %s build\n", cli ? "command-line" : "app");
 
     check_battery_files(cli);
+    check_thermal_state(cli);
     return finish_suite("proc_ish_host_state");
 }

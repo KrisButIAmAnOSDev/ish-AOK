@@ -12,10 +12,11 @@ cat /proc/ish/colors         # the 16 ANSI colours, drawn -- a quick theme check
 cat /proc/ish/BAT0_capacity  # battery charge, 0-100
 cat /proc/ish/BAT0_status    # Charging / Discharging / Full
 cat /proc/ish/BAT0           # both of those plus low-power mode, one per line
+cat /proc/ish/thermal_state  # nominal / fair / serious / critical
 cat /proc/ish/UIDevice       # the UIDevice the app sees: model, OS, orientation
 ```
 
-## The battery
+## Battery and heat
 
 The `BAT0` files are AOK's own, older than the standard ones, and they keep
 their format: the charge has two decimals (`83.00`). With no battery to report
@@ -31,6 +32,10 @@ current or time-left files, because iOS has no such figures, and a number made
 up to fill a file is worse than no file; htop's battery meter needs one of them
 and shows N/A. With no battery, the directory is empty, as it is on a Linux
 machine without one.
+
+`thermal_state` is iOS's own coarse reading of how hot the device is running:
+`nominal`, `fair`, `serious` or `critical`. iOS gives no temperature, so there
+is none here. The command-line build has nothing to ask and says `unknown`.
 
 ## Your settings, from the guest
 

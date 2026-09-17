@@ -1792,6 +1792,33 @@ static int proc_ish_show_battery_status(struct proc_entry *UNUSED(entry), struct
     return 0;
 }
 
+// iOS's coarse thermal state -- nominal, fair, serious, critical -- which is all
+// it offers: there is no temperature to read. "unknown" is a host with no
+// source, which is every command-line build. It is not a fifth state, and it is
+// not dressed up as nominal.
+static int proc_ish_show_thermal_state(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    const char *name;
+    switch (hostThermalState()) {
+        case HOST_THERMAL_NOMINAL:
+            name = "nominal";
+            break;
+        case HOST_THERMAL_FAIR:
+            name = "fair";
+            break;
+        case HOST_THERMAL_SERIOUS:
+            name = "serious";
+            break;
+        case HOST_THERMAL_CRITICAL:
+            name = "critical";
+            break;
+        default:
+            name = "unknown";
+            break;
+    }
+    proc_printf(buf, "%s\n", name);
+    return 0;
+}
+
 extern char* printUIDevice(void);
 
 static int proc_ish_show_uidevice(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -1929,6 +1956,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"checkpoint", S_IFREG | 0644, .show = proc_ish_show_checkpoint, .update = proc_ish_update_checkpoint},
     {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
+    {"thermal_state", .show = proc_ish_show_thermal_state},
     {"version", .show = proc_ish_show_version},
     {"wake_signals", .show = proc_ish_show_wake_signals},
 });
