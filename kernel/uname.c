@@ -310,7 +310,14 @@ static void sysinfo_specific_amd64(struct amd64_sys_info *info) {
 static_assert(sizeof(struct amd64_sys_info) == 112, "amd64 sysinfo layout mismatch");
 
 dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
-    struct uptime_info uptime = get_uptime();
+    // sysinfo(2)'s uptime is in SECONDS. It was uptime_ticks / 100 -- and
+    // before that the undivided ticks, which had busybox uptime read a
+    // 12-second-old guest as "up 20 min". Linux rounds UP: do_sysinfo reports
+    // tv_sec plus one for any fraction, so sysinfo never reads below
+    // /proc/uptime. Measured on Linux 6.12: boottime 1647044.474,
+    // sysinfo.uptime 1647045. From the nanosecond clock rather than
+    // uptime_ticks, because rounding up needs the fraction the ticks drop.
+    uint64_t uptime_s = (guest_uptime_ns() + 999999999ull) / 1000000000ull;
     uint64_t loads[3];
     get_guest_loadavg(loads);
 
@@ -318,10 +325,7 @@ dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
     // that ABI fill and write the wider layout with raw (un-truncated) values.
     if (guest_abi_is_64bit(current->abi)) { // arm64 shares the 64-bit layout
         struct amd64_sys_info info = {0};
-        // sysinfo(2)'s uptime is in SECONDS; uptime_ticks is 100 Hz. Without
-        // the divide, busybox uptime read a 12-second-old guest as "up 20
-        // min" -- and top, htop and anything else on sysinfo(2) with it.
-        info.uptime = (sqword_t)(uptime.uptime_ticks / 100);
+        info.uptime = (sqword_t) uptime_s;
         info.loads[0] = loads[0];
         info.loads[1] = loads[1];
         info.loads[2] = loads[2];
@@ -332,7 +336,7 @@ dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
     }
 
     struct sys_info info = {0};
-    info.uptime = (dword_t)(uptime.uptime_ticks / 100);   // seconds, as above
+    info.uptime = (dword_t) uptime_s;   // seconds, rounded up, as above
     info.loads[0] = (dword_t)loads[0];
     info.loads[1] = (dword_t)loads[1];
     info.loads[2] = (dword_t)loads[2];

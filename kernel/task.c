@@ -309,6 +309,96 @@ dword_t get_count_of_alive_tasks(void) {
     return res;
 }
 
+// ---- the guest's clock -----------------------------------------------------
+//
+// Uptime is the time since the GUEST booted -- kernel/init.c's
+// become_first_process, which is what sets boot_time -- measured on a
+// monotonic host clock.
+//
+// It used to be `(gettimeofday().tv_sec - boot_time) * 100`: whole seconds of
+// WALL clock. /proc/uptime only ever read N.0, it would have jumped had the
+// host clock been set, and everything derived from it inherited the
+// one-second steps. Most visibly /proc/stat's idle time, which is capacity
+// minus busy time: busy time grows continuously, so between two reads inside
+// the same second idle SHRANK. A waybar survey measured idle going backward in
+// 65 of 74 samples taken 50 ms apart; native Linux, 0 of 80.
+//
+// The host clock is the one the guest's own CLOCK_BOOTTIME reads
+// (clockid_to_real in kernel/time.c): CLOCK_BOOTTIME where the host has one,
+// which is Linux, and CLOCK_MONOTONIC on Darwin, which keeps counting through
+// sleep there. Measured on macOS, Darwin's CLOCK_MONOTONIC is gettimeofday()
+// minus kern.boottime: across 200000 paired reads REALTIME minus MONOTONIC
+// never exceeded kern.boottime and stayed within 22 microseconds of it, the
+// width of the gap between the two reads. So it is slewed along with the wall
+// clock and not stepped by it, which is the relationship Linux's CLOCK_BOOTTIME
+// has to CLOCK_REALTIME. CLOCK_MONOTONIC_RAW is NOT that clock: after 14 days
+// of host uptime it was 1.7 s behind CLOCK_MONOTONIC, and btime, which
+// fs/proc/root.c derives as "realtime minus uptime", would drift with it.
+//
+// The origin is placed so that the realtime at uptime zero is boot_time
+// exactly, a whole second. That is what keeps btime from flickering: root.c
+// computes it as floor(realtime - uptime), which comes out as boot_time for
+// every fraction of a second the uptime has run into only if the boot instant
+// has no fraction of its own.
+#ifdef CLOCK_BOOTTIME
+#define GUEST_UPTIME_HOST_CLOCK CLOCK_BOOTTIME
+#else
+#define GUEST_UPTIME_HOST_CLOCK CLOCK_MONOTONIC
+#endif
+#define NSEC_PER_SEC_U64 1000000000ull
+#define NSEC_PER_TICK 10000000ull   // USER_HZ is 100: /proc/stat's unit
+
+static pthread_mutex_t guest_clock_lock = PTHREAD_MUTEX_INITIALIZER;
+// The boot_time the origin below was placed for. boot_time changes when the
+// guest boots (run_at_boot seeds it earlier, and a guest can be booted again
+// in the same process), and the origin moves with it.
+static _Atomic time_t guest_clock_boot = (time_t) -1;
+// The host clock's reading, in ns, at which the guest's uptime was zero.
+static _Atomic int64_t guest_clock_origin_ns;
+
+static int64_t timespec_to_ns(struct timespec ts) {
+    return (int64_t) ts.tv_sec * (int64_t) NSEC_PER_SEC_U64 + ts.tv_nsec;
+}
+
+uint64_t guest_uptime_ns(void) {
+    // Written by kernel/init.c without a lock, once per boot; every reader of
+    // boot_time reads it like this.
+    time_t boot = boot_time;
+    if (atomic_load_explicit(&guest_clock_boot, memory_order_acquire) != boot) {
+        pthread_mutex_lock(&guest_clock_lock);
+        if (atomic_load_explicit(&guest_clock_boot, memory_order_acquire) != boot) {
+            // Realtime first, then the host clock: the gap between the two
+            // reads can then only make uptime smaller, so btime never comes
+            // out a second EARLY. The extra microsecond covers Darwin, which
+            // reports both clocks in whole microseconds.
+            int64_t real = timespec_to_ns(timespec_now(CLOCK_REALTIME));
+            int64_t host = timespec_to_ns(timespec_now(GUEST_UPTIME_HOST_CLOCK));
+            int64_t since_boot = real - (int64_t) boot * (int64_t) NSEC_PER_SEC_U64;
+            // Origin before boot, so a reader that sees the new boot sees it.
+            atomic_store_explicit(&guest_clock_origin_ns, host - since_boot + 1000,
+                                  memory_order_release);
+            atomic_store_explicit(&guest_clock_boot, boot, memory_order_release);
+        }
+        pthread_mutex_unlock(&guest_clock_lock);
+    }
+    int64_t up = timespec_to_ns(timespec_now(GUEST_UPTIME_HOST_CLOCK)) -
+                 atomic_load_explicit(&guest_clock_origin_ns, memory_order_acquire);
+    return up > 0 ? (uint64_t) up : 0;
+}
+
+uint64_t guest_uptime_ticks(void) {
+    uint64_t ticks = guest_uptime_ns() / NSEC_PER_TICK;
+    // Whole tenths of a second, and only because of the one reader that formats
+    // this value: fs/proc/root.c prints /proc/uptime as "%lu.%lu" of ticks / 100
+    // and ticks % 100, so 12.05 s would print as "12.5" -- later than the
+    // "12.10" read after it. A tenth always has a zero in the second place
+    // ("12.10", "12.20"; "12.0" as before), so every tenth prints correctly
+    // through that format. Once it is Linux's "%lu.%02lu", drop this rounding
+    // and /proc/uptime, btime and process start times all get Linux's 100 Hz;
+    // nothing else here needs to change.
+    return ticks - ticks % 10;
+}
+
 // Linux-style load average computed over the guest's OWN runnable tasks, so
 // /proc/loadavg reflects the guest rather than the host load that the platform
 // getloadavg returns. The EMA is advanced lazily on read, one step per elapsed
@@ -345,6 +435,107 @@ void get_guest_loadavg(uint64_t out[3]) {
     unlock(&load_lock);
 }
 
+// ---- CPU time counters that never run backward ------------------------------
+//
+// /proc/stat's user/system/idle must only ever grow, and each line's total
+// should grow with the clock. AOK measures busy time (host thread or process
+// CPU time) and has no scheduler to measure idle with, so idle is capacity
+// minus busy. Two things make that subtraction go negative, and both are
+// normal:
+//
+//  - Sampling skew. A thread's CPU time as another thread reads it advances
+//    in steps. Measured on macOS, a busy thread's CPU time grew up to 3.1 ms
+//    MORE than the wall clock over the same 50 ms interval (and up to 5.5 ms
+//    less).
+//  - More work than capacity. A slot here is pid % ncpu, not a real CPU, so
+//    two busy tasks can share one; and the aggregate line is process CPU time,
+//    which can span more host cores than the guest is told it has.
+//
+// So each line keeps a ledger. Idle only takes what capacity is left after
+// busy, and never gives any back. Busy may run ahead of the capacity left for
+// it by CPU_TIME_SLACK_NS -- the skew, which the next read repays -- and
+// anything beyond that is DISCARDED, not owed: a slot at 200% for ten seconds
+// reads 100% busy, and when it goes idle it reads idle, rather than reading
+// 100% busy for ten more seconds while idle waited out the debt.
+#define CPU_TIME_SLACK_NS (2 * NSEC_PER_TICK)
+
+struct cpu_time_ledger {
+    uint64_t capacity;                     // at the last update
+    uint64_t user, system, idle;           // reported; each only grows
+    uint64_t dropped_user, dropped_system; // busy time discarded as over capacity
+};
+
+static void cpu_time_ledger_update(struct cpu_time_ledger *l, uint64_t capacity,
+                                   uint64_t slack, uint64_t raw_user, uint64_t raw_system) {
+    // Capacity only goes backward when uptime restarted under a new boot.
+    if (capacity < l->capacity)
+        *l = (struct cpu_time_ledger) {0};
+    l->capacity = capacity;
+
+    uint64_t user = raw_user > l->dropped_user ? raw_user - l->dropped_user : 0;
+    uint64_t system = raw_system > l->dropped_system ? raw_system - l->dropped_system : 0;
+    // A sample can dip (a thread whose times the host would not report this
+    // once); what was already reported stands.
+    if (user < l->user)
+        user = l->user;
+    if (system < l->system)
+        system = l->system;
+
+    uint64_t room = (capacity > l->idle ? capacity - l->idle : 0) + slack;
+    if (user + system > room) {
+        // Only this update's growth is cut, in proportion. What was reported
+        // before always fits, because every update leaves
+        // user + system + idle <= capacity + slack.
+        uint64_t excess = user + system - room;
+        uint64_t grew_user = user - l->user, grew_system = system - l->system;
+        uint64_t grew = grew_user + grew_system;
+        uint64_t cut_user = grew == 0 ? 0 :
+            (uint64_t) ((double) excess * ((double) grew_user / (double) grew));
+        if (cut_user > grew_user)
+            cut_user = grew_user;
+        uint64_t cut_system = excess - cut_user;
+        if (cut_system > grew_system) {
+            cut_user += cut_system - grew_system;
+            cut_system = grew_system;
+            if (cut_user > grew_user)
+                cut_user = grew_user;
+        }
+        user -= cut_user;
+        system -= cut_system;
+        l->dropped_user += cut_user;
+        l->dropped_system += cut_system;
+    }
+
+    uint64_t idle = capacity > user + system ? capacity - user - system : 0;
+    if (idle < l->idle)
+        idle = l->idle;
+    l->user = user;
+    l->system = system;
+    l->idle = idle;
+}
+
+static void cpu_time_ledger_ticks(const struct cpu_time_ledger *l, struct cpu_usage *out) {
+    out->user_ticks = l->user / NSEC_PER_TICK;
+    out->system_ticks = l->system / NSEC_PER_TICK;
+    out->idle_ticks = l->idle / NSEC_PER_TICK;
+    out->nice_ticks = 0;
+}
+
+static lock_t cpu_total_lock = LOCK_INITIALIZER;
+static struct cpu_time_ledger cpu_total_ledger;   // under cpu_total_lock
+
+void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usage *out) {
+    int ncpu = get_cpu_count();
+    if (ncpu < 1)
+        ncpu = 1;
+    uint64_t capacity = (uint64_t) ncpu * guest_uptime_ns();
+    lock(&cpu_total_lock, 0);
+    cpu_time_ledger_update(&cpu_total_ledger, capacity, (uint64_t) ncpu * CPU_TIME_SLACK_NS,
+                           user_ns, system_ns);
+    cpu_time_ledger_ticks(&cpu_total_ledger, out);
+    unlock(&cpu_total_lock);
+}
+
 // ---- per-emulated-CPU time accounting (for /proc/stat's cpuN lines) --------
 //
 // iSH has no real CPU affinity: every guest task is a host pthread that the
@@ -361,8 +552,13 @@ void get_guest_loadavg(uint64_t out[3]) {
 // for what these lines are for (top/htop-style meters).
 
 #define CPU_SLOTS_MAX 64
+// Nanoseconds, like everything the ledgers above work in. They were ticks, and
+// every exiting task gave up the fraction of a tick it had run past its last
+// whole one -- up to 10 ms each, which a compile's thousands of short-lived
+// processes turn into seconds of busy time that never appeared.
 static _Atomic uint64_t cpu_slot_dead_user[CPU_SLOTS_MAX];
 static _Atomic uint64_t cpu_slot_dead_system[CPU_SLOTS_MAX];
+static struct cpu_time_ledger cpu_slot_ledger[CPU_SLOTS_MAX];   // under cpu_slots_lock
 
 // Serializes banking against the /proc/stat reader. Without this, a task
 // exiting mid-read could be counted twice in one snapshot: sampled live
@@ -383,9 +579,9 @@ static int task_cpu_slot(struct task *task, int ncpu) {
     return (int) (task->pid % (dword_t) ncpu);
 }
 
-void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned long *out_stime) {
-    *out_utime = 0;
-    *out_stime = 0;
+void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns) {
+    *user_ns = 0;
+    *system_ns = 0;
 #ifdef __APPLE__
     mach_port_t mach_thread = pthread_mach_thread_np(task->thread);
     if (mach_thread != MACH_PORT_NULL) {
@@ -393,10 +589,10 @@ void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned 
         mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
         if (thread_info(mach_thread, THREAD_BASIC_INFO,
                         (thread_info_t) &info, &count) == KERN_SUCCESS) {
-            *out_utime = (unsigned long) info.user_time.seconds * 100
-                         + (unsigned long) info.user_time.microseconds / 10000;
-            *out_stime = (unsigned long) info.system_time.seconds * 100
-                         + (unsigned long) info.system_time.microseconds / 10000;
+            *user_ns = (uint64_t) info.user_time.seconds * NSEC_PER_SEC_U64
+                       + (uint64_t) info.user_time.microseconds * 1000;
+            *system_ns = (uint64_t) info.system_time.seconds * NSEC_PER_SEC_U64
+                         + (uint64_t) info.system_time.microseconds * 1000;
         }
     }
 #else
@@ -404,20 +600,28 @@ void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned 
     if (pthread_getcpuclockid(task->thread, &clkid) == 0) {
         struct timespec ts;
         if (clock_gettime(clkid, &ts) == 0)
-            *out_utime = (unsigned long) ts.tv_sec * 100
-                         + (unsigned long) (ts.tv_nsec / 10000000);
+            *user_ns = (uint64_t) ts.tv_sec * NSEC_PER_SEC_U64 + (uint64_t) ts.tv_nsec;
     }
 #endif
+}
+
+void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned long *out_stime) {
+    uint64_t user_ns, system_ns;
+    task_thread_cpu_time_ns(task, &user_ns, &system_ns);
+    // Truncated per field, exactly as the seconds * 100 + microseconds / 10000
+    // this used to compute from the same microseconds.
+    *out_utime = (unsigned long) (user_ns / NSEC_PER_TICK);
+    *out_stime = (unsigned long) (system_ns / NSEC_PER_TICK);
 }
 
 void task_bank_cpu_time(struct task *task) {
     lock(&cpu_slots_lock, 0);
     if (!task->cpu_time_banked) {
-        unsigned long utime, stime;
-        task_thread_cpu_time(task, &utime, &stime);
+        uint64_t user_ns, system_ns;
+        task_thread_cpu_time_ns(task, &user_ns, &system_ns);
         int slot = task_cpu_slot(task, get_cpu_count());
-        atomic_fetch_add(&cpu_slot_dead_user[slot], utime);
-        atomic_fetch_add(&cpu_slot_dead_system[slot], stime);
+        atomic_fetch_add(&cpu_slot_dead_user[slot], user_ns);
+        atomic_fetch_add(&cpu_slot_dead_system[slot], system_ns);
         task->cpu_time_banked = true;
     }
     unlock(&cpu_slots_lock);
@@ -430,6 +634,7 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
     struct cpu_usage *cpus = calloc((size_t) ncpu, sizeof(*cpus));
     if (cpus == NULL)
         return _ENOMEM;
+    uint64_t busy_user[CPU_SLOTS_MAX] = {0}, busy_system[CPU_SLOTS_MAX] = {0};
 
     complex_lockt(&pids_lock, 0);
     // Hold cpu_slots_lock across BOTH the live walk and the dead-slot loads:
@@ -448,24 +653,28 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
         // retract it on the next read (backward counters).
         if (task == NULL || task->cpu_time_banked || !task->host_thread_started)
             continue;
-        unsigned long utime, stime;
-        task_thread_cpu_time(task, &utime, &stime);
+        uint64_t user_ns, system_ns;
+        task_thread_cpu_time_ns(task, &user_ns, &system_ns);
         int slot = task_cpu_slot(task, ncpu);
-        cpus[slot].user_ticks += utime;
-        cpus[slot].system_ticks += stime;
+        busy_user[slot] += user_ns;
+        busy_system[slot] += system_ns;
     }
 
-    // Each virtual CPU has uptime ticks of capacity; whatever its tasks
-    // didn't use was idle.
-    uint64_t uptime_ticks = get_uptime().uptime_ticks;
+    // Each virtual CPU has the guest's uptime of capacity; whatever its tasks
+    // did not use was idle. Read after the walk, so it covers every sample the
+    // walk took. The ledgers keep each field from ever running backward.
+    uint64_t capacity = guest_uptime_ns();
     for (int i = 0; i < ncpu; i++) {
-        if (i < CPU_SLOTS_MAX) {
-            cpus[i].user_ticks += atomic_load(&cpu_slot_dead_user[i]);
-            cpus[i].system_ticks += atomic_load(&cpu_slot_dead_system[i]);
+        if (i >= CPU_SLOTS_MAX) {
+            // task_cpu_slot never charges a task here: idle all along.
+            cpus[i].idle_ticks = capacity / NSEC_PER_TICK;
+            continue;
         }
-        uint64_t busy = cpus[i].user_ticks + cpus[i].system_ticks;
-        cpus[i].idle_ticks = uptime_ticks > busy ? uptime_ticks - busy : 0;
-        cpus[i].nice_ticks = 0;
+        busy_user[i] += atomic_load(&cpu_slot_dead_user[i]);
+        busy_system[i] += atomic_load(&cpu_slot_dead_system[i]);
+        cpu_time_ledger_update(&cpu_slot_ledger[i], capacity, CPU_TIME_SLACK_NS,
+                               busy_user[i], busy_system[i]);
+        cpu_time_ledger_ticks(&cpu_slot_ledger[i], &cpus[i]);
     }
     unlock(&cpu_slots_lock);
     unlock(&pids_lock);
@@ -522,7 +731,14 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->exit_rusage_counted = false; // ditto; do_exit sets it
     // Not inherited either: the copy above would give a child its parent's
     // age. /proc/<pid>/stat field 22, which was hardcoded 0.
-    task->start_time_ticks = get_uptime().uptime_ticks;
+    //
+    // The first process is created AT boot, and is 0 by definition. Reading
+    // the clock for it was wrong, not merely redundant: kernel/init.c creates
+    // it and only THEN sets boot_time, so this read measured from run_at_boot's
+    // earlier seed -- on a device, from the app's launch, possibly long before
+    // the session picker let the guest boot -- and pid 1 started in the future
+    // of the uptime that restarted a moment later.
+    task->start_time_ticks = parent == NULL ? 0 : get_uptime().uptime_ticks;
     atomic_fetch_add_explicit(&total_forks, 1, memory_order_relaxed);
     list_init(&task->group_links);
     list_init(&task->children);

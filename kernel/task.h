@@ -763,20 +763,38 @@ static inline bool task_take_swap_io_fault(void) {
 dword_t get_count_of_alive_tasks(void);
 void get_guest_loadavg(uint64_t out[3]);
 
-// Live user/system CPU time of one task's host thread, in jiffies (USER_HZ =
-// 100). Works cross-thread. Reports 0/0 if the thread is gone or the host
-// won't say (on non-Mach hosts the user/system split isn't available and the
-// total is reported as user time).
+// Time since the guest booted, on a monotonic host clock (the one the guest's
+// CLOCK_BOOTTIME reads), with its zero placed at the whole second boot_time
+// names. Never goes backward within a boot. The platform get_uptime()
+// implementations report this, and so should anything that wants guest
+// uptime at a finer grain than their ticks.
+uint64_t guest_uptime_ns(void);
+// The same in 100 Hz ticks, the unit struct uptime_info carries -- for now
+// rounded to whole tenths of a second, for the /proc/uptime format reason
+// given at the definition.
+uint64_t guest_uptime_ticks(void);
+// /proc/stat's aggregate "cpu" line, from this process's cumulative user and
+// system CPU time in ns: capacity is get_cpu_count() times guest uptime, and
+// every field only ever grows. For the platform get_total_cpu_usage()s.
+struct cpu_usage;
+void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usage *out);
+
+// Live user/system CPU time of one task's host thread. Works cross-thread.
+// Reports 0/0 if the thread is gone or the host won't say (on non-Mach hosts
+// the user/system split isn't available and the total is reported as user
+// time). The first is in jiffies (USER_HZ = 100); the second in nanoseconds,
+// to the host's own precision (microseconds on Darwin).
 void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned long *out_stime);
+void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns);
 // Charges the exiting task's final thread CPU time to its per-virtual-CPU
 // accounting slot; called once from do_exit while the host thread still
 // exists to be queried. Sets task->cpu_time_banked.
 void task_bank_cpu_time(struct task *task);
 // Per-emulated-CPU usage for /proc/stat's cpuN lines: each task's real thread
 // CPU time charged to slot pid % ncpu (live tasks sampled, exited tasks from
-// the banked totals). Returns 0 and a malloc'd get_cpu_count()-sized array,
-// or _ENOMEM.
-struct cpu_usage;
+// the banked totals), against the guest's uptime as each slot's capacity. No
+// field ever decreases between calls. Returns 0 and a malloc'd
+// get_cpu_count()-sized array, or _ENOMEM.
 int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage);
 
 #define MAX_PID (1 << 15) // oughta be enough

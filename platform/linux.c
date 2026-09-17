@@ -1,7 +1,8 @@
 #ifdef __linux__
 
+#include <sys/resource.h>  // getrusage() -- this process's CPU time
 #include <sys/sysinfo.h>
-#include <time.h>          // time(), time_t -- for the guest's boot_time
+#include <time.h>          // clock_gettime()
 #include <errno.h>         // EINTR -- the /proc/self/statm read below
 #include <fcntl.h>         // open() -- ditto, and see why it is not fopen()
 #include <inttypes.h>
@@ -11,27 +12,16 @@
 #include <string.h>
 #include <unistd.h>        // read(), close(), sysconf() -- ditto
 #include "kernel/errno.h"
+#include "kernel/task.h"   // guest_uptime_ticks, guest_cpu_usage_total
 #include "platform/platform.h"
 #include "debug.h"
 
-static void read_proc_line(const char *file, const char *name, char *buf) {
-    FILE *f = fopen(file, "r");
-    if (f == NULL) ERRNO_DIE(file);
-    do {
-        fgets(buf, 1234, f);
-        if (feof(f))
-            die("could not find proc line %s", name);
-    } while (!(strncmp(name, buf, strlen(name)) == 0 && buf[strlen(name)] == ' '));
-    fclose(f);
-}
-
-// read_proc_line() above die()s when the key is missing. That is tolerable for
-// the fields this build has always required, but not for one that a kernel may
-// simply not export, so this reports failure instead of taking the emulator
-// down. kB in, bytes out, since every caller here wants bytes.
+// A missing key reports failure instead of taking the emulator down, because
+// a kernel may simply not export it. kB in, bytes out, since every caller here
+// wants bytes.
 //
-// It reopens the file per key, as read_proc_line() always has, so a
-// /proc/meminfo read costs six opens rather than four. That is a dev and CI
+// It reopens the file per key, so a /proc/meminfo read costs six opens rather
+// than one. That is a dev and CI
 // build reading a procfs file, not the device path, and one open of
 // /proc/meminfo is cheaper than the page-table walk the guest-side reader does
 // on top of it.
@@ -57,10 +47,24 @@ static bool read_proc_kb(const char *file, const char *name, uint64_t *out) {
 }
 
 struct cpu_usage get_total_cpu_usage(void) {
-    struct cpu_usage usage = {};
-    char buf[1234];
-    read_proc_line("/proc/stat", "cpu", buf);
-    sscanf(buf, "cpu %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64"\n", &usage.user_ticks, &usage.system_ticks, &usage.idle_ticks, &usage.nice_ticks);
+    // This process's own CPU time, as the Darwin build reports -- not the
+    // host's /proc/stat "cpu" line, which this used to copy through. That line
+    // is the whole MACHINE since the HOST booted: every other process's work,
+    // on however many cores the host has, beside cpuN lines that count the
+    // guest's tasks since the guest booted. It was also not even the fields
+    // it claimed: the sscanf read user, nice, system, idle into user, system,
+    // idle, nice. The kernel derives idle from the guest's uptime and keeps
+    // every field from running backward (guest_cpu_usage_total).
+    uint64_t user_ns = 0, system_ns = 0;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        user_ns = (uint64_t) ru.ru_utime.tv_sec * 1000000000ull
+                + (uint64_t) ru.ru_utime.tv_usec * 1000;
+        system_ns = (uint64_t) ru.ru_stime.tv_sec * 1000000000ull
+                  + (uint64_t) ru.ru_stime.tv_usec * 1000;
+    }
+    struct cpu_usage usage = {0};
+    guest_cpu_usage_total(user_ns, system_ns, &usage);
     return usage;
 }
 
@@ -116,17 +120,13 @@ struct mem_usage get_mem_usage(void) {
 }
 
 struct uptime_info get_uptime(void) {
-    struct sysinfo info;
-    sysinfo(&info);
-    // info.uptime is the HOST's, which is a different machine from the guest
-    // and usually a much older one. Take the guest's boot the same way the
-    // Darwin build does -- set where pid 1 is created, kernel/init.c.
-    extern time_t boot_time;
+    // Since the GUEST booted, not sysinfo(2)'s uptime, which is the HOST's --
+    // a different machine and usually a much older one. On a monotonic clock
+    // rather than whole seconds of time(NULL); see guest_uptime_ns in
+    // kernel/task.c. The load averages are left 0: they were the host's, and
+    // nothing read them (get_guest_loadavg is the guest's).
     struct uptime_info uptime = {
-        .uptime_ticks = (uint64_t) (time(NULL) - boot_time) * 100,
-        .load_1m = info.loads[0],
-        .load_5m = info.loads[1],
-        .load_15m = info.loads[2],
+        .uptime_ticks = guest_uptime_ticks(),
     };
     return uptime;
 }
@@ -180,8 +180,8 @@ static uint64_t mem_budget_knob_bytes(void) {
 
 // The resident set from /proc/self/statm field 2 (pages), in bytes. Returns
 // false when it cannot be read -- this runs on the guest mmap path, so it must
-// not die() the way read_proc_line() above does, and "could not measure" must
-// not arrive downstream as the number 0.
+// not die(), and "could not measure" must not arrive downstream as the number
+// 0.
 //
 // open/read/close rather than stdio, deliberately. host_mem_headroom_low() is
 // called from sys_brk_guest() with mem_write_lock_with_pokes already held (both

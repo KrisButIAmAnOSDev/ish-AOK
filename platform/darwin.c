@@ -8,6 +8,7 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include "kernel/errno.h"
+#include "kernel/task.h"   // guest_uptime_ticks, guest_cpu_usage_total
 #include "platform/platform.h"
 #include "debug.h"
 
@@ -20,9 +21,10 @@ struct cpu_usage get_total_cpu_usage(void) {
     // workload usage, and on a device running other apps this made the guest
     // see near-100% idle even while iSH itself was pegging a core. Use this
     // process's own cumulative user/system time instead; Mach has no
-    // per-process "idle" concept, so derive it from wall-clock uptime across
-    // the configured cpu count instead.
-    struct cpu_usage usage = {0};
+    // per-process "idle" concept, so the kernel derives idle from the guest's
+    // uptime across the configured cpu count (guest_cpu_usage_total), and keeps
+    // every field from running backward while it does.
+    uint64_t user_ns = 0, system_ns = 0;
     struct task_absolutetime_info info;
     mach_msg_type_number_t count = TASK_ABSOLUTETIME_INFO_COUNT;
     kern_return_t kr = task_info(mach_task_self(), TASK_ABSOLUTETIME_INFO,
@@ -30,15 +32,15 @@ struct cpu_usage get_total_cpu_usage(void) {
     if (kr == KERN_SUCCESS) {
         mach_timebase_info_data_t timebase;
         mach_timebase_info(&timebase);
-        double ns_per_mach_tick = (double) timebase.numer / (double) timebase.denom;
-        usage.user_ticks = (uint64_t) (info.total_user * ns_per_mach_tick / 10000000.0);
-        usage.system_ticks = (uint64_t) (info.total_system * ns_per_mach_tick / 10000000.0);
+        // Integer, and exact: numer is 125 on Apple silicon, so this stays in
+        // range for ~190 years of CPU time.
+        user_ns = info.total_user * timebase.numer / timebase.denom;
+        system_ns = info.total_system * timebase.numer / timebase.denom;
     }
-
-    struct uptime_info uptime = get_uptime();
-    uint64_t elapsed_ticks = (uint64_t) get_cpu_count() * uptime.uptime_ticks;
-    uint64_t busy_ticks = usage.user_ticks + usage.system_ticks;
-    usage.idle_ticks = elapsed_ticks > busy_ticks ? elapsed_ticks - busy_ticks : 0;
+    // A refused task_info() reports nothing new rather than zero: the ledger
+    // keeps what it reported last.
+    struct cpu_usage usage = {0};
+    guest_cpu_usage_total(user_ns, system_ns, &usage);
     return usage;
 }
 
@@ -202,38 +204,20 @@ CFTimeInterval getSystemUptime(void) {
 }
 
 struct uptime_info get_uptime(void) {
-    struct timeval now;
-    if (gettimeofday(&now, NULL) != 0) {
-        printk("ERROR: in gettimeofday() call\n");
-    }
-    // The guest's boot, set where pid 1 is created (kernel/init.c). NOT the
-    // host's kern.boottime, which this used to read into a local and never
-    // use: had it been used it would have reported when the DEVICE last
-    // booted, which is further from the truth than the value it ignored.
-    extern time_t boot_time;
-
-    struct {
-        uint32_t ldavg[3];
-        long scale;
-    } vm_loadavg;
-    size_t size = sizeof(vm_loadavg);
-    if (sysctlbyname("vm.loadavg", &vm_loadavg, &size, NULL, 0) != 0) {
-        printk("ERROR: in sysctlbyname(vm.loadavg) call\n");
-    }
-
-    // Adjust the scale of load averages
-    for (int i = 0; i < 3; i++) {
-        if (FSHIFT < 16)
-            vm_loadavg.ldavg[i] <<= 16 - FSHIFT;
-        else
-            vm_loadavg.ldavg[i] >>= FSHIFT - 16;
-    }
-
+    // Since the GUEST booted (kernel/init.c sets boot_time where pid 1 is
+    // created), on a monotonic clock. NOT the host's kern.boottime, which
+    // would report when the DEVICE last booted. It was whole seconds of wall
+    // clock -- `(gettimeofday().tv_sec - boot_time) * 100` -- which is what
+    // made /proc/stat's idle time run backward; guest_uptime_ns in
+    // kernel/task.c has the measurements and the choice of clock.
+    //
+    // The load averages are left 0. They were the HOST's, from
+    // sysctlbyname("vm.loadavg") on every call -- measured at 0.8 microseconds
+    // a call, paid three times per /proc/stat read and once per task created
+    // -- and nothing read them: /proc/loadavg and sysinfo(2) report the
+    // guest's own average (get_guest_loadavg), the only one a guest should see.
     struct uptime_info uptime = {
-        .uptime_ticks = (now.tv_sec - boot_time) * 100, // Ensure this calculation is as intended
-        .load_1m = vm_loadavg.ldavg[0],
-        .load_5m = vm_loadavg.ldavg[1],
-        .load_15m = vm_loadavg.ldavg[2],
+        .uptime_ticks = guest_uptime_ticks(),
     };
     return uptime;
 }

@@ -1,5 +1,6 @@
 /*
- * proc_stat_monotonic -- /proc/stat per-CPU counters must never go backward.
+ * proc_stat_monotonic -- /proc/stat's CPU counters must never go backward,
+ * and must add up to the time that passed.
  *
  * AOK synthesizes /proc/stat's cpuN lines by bucketing each guest task into a
  * virtual-CPU slot (pid % ncpu): live tasks are sampled on every read, and
@@ -20,11 +21,21 @@
  * chroot churn (many short-lived exits). Fixed by cpu_slots_lock in
  * kernel/task.c (plus defensive clamps in ktop itself).
  *
- * This test churns short-lived CPU-burning children (so every exit banks a
- * nonzero tick count) while hammering /proc/stat reads, and fails on any
- * decrease in a cpuN line's user or system field. idle is deliberately NOT
- * checked: AOK's synthetic per-slot idle (uptime - slot busy) can legitimately
- * dip when a slot holds more than one busy task.
+ * IDLE is checked too, on every cpuN line and on the aggregate "cpu" line.
+ * It used to be exempt, because AOK derived it as "uptime minus busy" and
+ * uptime was whole seconds of wall clock: busy time grows continuously, so
+ * between two reads in the same second idle SHRANK. A waybar survey measured
+ * idle going backward in 65 of 74 samples taken 50 ms apart (native Linux: 0
+ * of 80), and waybar's cpu module takes its first reading from two samples
+ * 100 ms apart, so that reading was garbage. The same subtraction also let
+ * idle fall whenever a slot's busy time outran the clock -- several busy tasks
+ * in one slot, or the process using more cores than it reports -- which is
+ * why the second phase below runs more spinners than there are CPUs.
+ *
+ * And the fields have to ADD UP: over a phase, each line's total should grow
+ * by about the elapsed time (times ncpu for the aggregate line). Holding idle
+ * flat while busy runs ahead would keep every field monotonic and still
+ * report a CPU that did two seconds of work per second.
  *
  * Also passes on real Linux (counters there are monotonic by construction).
  */
@@ -42,41 +53,71 @@
 #include "test_common.h"
 
 #define MAX_CPUS 64
+#define AGG MAX_CPUS            // slot for the aggregate "cpu" line
+#define NFIELDS 8               // user nice system idle iowait irq softirq steal
+#define CHECKED_FIELDS 4        // iowait may legitimately fall on Linux; see proc(5)
 #define CHURNERS 6
-#define TEST_SECONDS 10
+#define CHURN_SECONDS 10
+#define SPIN_SECONDS 6
 #define SPIN_MS 20
+#define MAX_REPORTS 10
+
+static const char *field_names[NFIELDS] = {
+    "user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal",
+};
 
 struct cpu_line {
     int present;
-    unsigned long long user, nice, system, idle;
+    unsigned long long f[NFIELDS];
 };
 
 static int read_cpu_lines(struct cpu_line *cpus) {
     FILE *f = fopen("/proc/stat", "r");
     if (f == NULL)
         return -1;
-    for (int i = 0; i < MAX_CPUS; i++)
+    for (int i = 0; i <= AGG; i++)
         cpus[i].present = 0;
     int found = 0;
     char line[512];
     while (fgets(line, sizeof(line), f) != NULL) {
-        if (strncmp(line, "cpu", 3) != 0 || !isdigit((unsigned char) line[3]))
+        if (strncmp(line, "cpu", 3) != 0)
             continue;
         int idx;
-        unsigned long long user, nice, system, idle;
-        if (sscanf(line, "cpu%d %llu %llu %llu %llu",
-                   &idx, &user, &nice, &system, &idle) == 5
-                && idx >= 0 && idx < MAX_CPUS) {
-            cpus[idx].present = 1;
-            cpus[idx].user = user;
-            cpus[idx].nice = nice;
-            cpus[idx].system = system;
-            cpus[idx].idle = idle;
-            found++;
+        char *p = line + 3;
+        if (*p == ' ') {
+            idx = AGG;
+        } else if (isdigit((unsigned char) *p)) {
+            idx = (int) strtol(p, &p, 10);
+            if (idx < 0 || idx >= MAX_CPUS)
+                continue;
+        } else {
+            continue;
         }
+        unsigned long long v[NFIELDS] = {0};
+        int n = sscanf(p, " %llu %llu %llu %llu %llu %llu %llu %llu",
+                       &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+        if (n < CHECKED_FIELDS)
+            continue;
+        cpus[idx].present = 1;
+        memcpy(cpus[idx].f, v, sizeof(v));
+        if (idx != AGG)
+            found++;
     }
     fclose(f);
     return found;
+}
+
+static unsigned long long line_total(const struct cpu_line *l) {
+    unsigned long long sum = 0;
+    for (int j = 0; j < NFIELDS; j++)
+        sum += l->f[j];
+    return sum;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
 }
 
 // Burn roughly ms of CPU time (not wall time) so the exiting task has a
@@ -112,17 +153,113 @@ static void churner_loop(void) {
     }
 }
 
+static void spinner_loop(void) {
+    volatile unsigned long sink = 0;
+    for (;;)
+        sink++;
+}
+
+static void stop_children(pid_t *kids, int n) {
+    for (int i = 0; i < n; i++)
+        if (kids[i] > 0)
+            kill(kids[i], SIGKILL);
+    for (int i = 0; i < n; i++)
+        if (kids[i] > 0)
+            waitpid(kids[i], NULL, 0);
+}
+
+static const char *line_name(int idx, char *buf, size_t size) {
+    if (idx == AGG)
+        snprintf(buf, size, "cpu");
+    else
+        snprintf(buf, size, "cpu%d", idx);
+    return buf;
+}
+
+// Read /proc/stat as fast as it will go for `seconds`, failing on any backward
+// step in the checked fields, then check each line's total against the time
+// that passed.
+static void watch_counters(const char *phase, int seconds, int ncpu) {
+    static struct cpu_line first[AGG + 1], prev[AGG + 1], cur[AGG + 1];
+    if (read_cpu_lines(first) <= 0) {
+        failf("read /proc/stat", 0, 0, 0, 1, 0, 0);
+        return;
+    }
+    double start = now_seconds();
+    memcpy(prev, first, sizeof(prev));
+
+    unsigned long reads = 0, regressions = 0;
+    char name[16];
+    while (now_seconds() - start < seconds) {
+        if (read_cpu_lines(cur) <= 0) {
+            failf("read /proc/stat", 0, 0, 0, 1, 0, 0);
+            break;
+        }
+        reads++;
+        for (int i = 0; i <= AGG; i++) {
+            if (!prev[i].present || !cur[i].present)
+                continue;
+            for (int j = 0; j < CHECKED_FIELDS; j++) {
+                if (cur[i].f[j] >= prev[i].f[j])
+                    continue;
+                regressions++;
+                test_log_if(regressions <= MAX_REPORTS,
+                            "  %s: %s %s went backward: %llu -> %llu (read %lu)\n",
+                            phase, line_name(i, name, sizeof(name)), field_names[j],
+                            prev[i].f[j], cur[i].f[j], reads);
+            }
+        }
+        memcpy(prev, cur, sizeof(prev));
+    }
+    double elapsed = now_seconds() - start;
+
+    test_logf("%s: %lu reads over %.1fs, %lu backward steps\n",
+              phase, reads, elapsed, regressions);
+    if (regressions != 0) {
+        char label[96];
+        snprintf(label, sizeof(label), "%s: CPU counters went backward", phase);
+        failf(label, regressions, 0, 0, 0, 0, 0);
+    }
+
+    // The totals. USER_HZ is 100 on every Linux ABI; sysconf says so here.
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0)
+        hz = 100;
+    double expect_per_cpu = elapsed * (double) hz;
+    for (int i = 0; i <= AGG; i++) {
+        if (!first[i].present || !prev[i].present)
+            continue;
+        unsigned long long a = line_total(&first[i]), b = line_total(&prev[i]);
+        double grew = b >= a ? (double) (b - a) : -(double) (a - b);
+        double expect = i == AGG ? expect_per_cpu * ncpu : expect_per_cpu;
+        double ratio = grew / expect;
+        test_logf("  %s: %s total grew %.0f ticks, expected ~%.0f (x%.2f)\n",
+                  phase, line_name(i, name, sizeof(name)), grew, expect, ratio);
+        // Loose on purpose: this is not a precision check, it catches a line
+        // whose idle stopped absorbing the clock (ratio far below 1) or whose
+        // busy time outran it (far above).
+        if (ratio < 0.5 || ratio > 1.5) {
+            char label[96];
+            snprintf(label, sizeof(label), "%s: %s total does not track elapsed time (x100)",
+                     phase, name);
+            failf(label, (uint64_t) (ratio * 100), 0, 0, 100, 0, 0);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
 
-    static struct cpu_line prev[MAX_CPUS], cur[MAX_CPUS];
-    if (read_cpu_lines(prev) <= 0) {
+    static struct cpu_line probe[AGG + 1];
+    int ncpu = read_cpu_lines(probe);
+    if (ncpu <= 0) {
         // No cpuN lines at all (single-cpu kernels can omit them): nothing to
         // test, treat as pass rather than error out of the suite.
         printf("proc_stat_monotonic: PASS (no cpuN lines)\n");
         return 0;
     }
 
+    // Phase 1: fork churn, which is what the banking race needs.
     pid_t churners[CHURNERS];
     for (int i = 0; i < CHURNERS; i++) {
         churners[i] = fork();
@@ -130,59 +267,32 @@ int main(int argc, char **argv) {
             churner_loop(); // never returns
         if (churners[i] < 0) {
             perror("fork churner");
+            stop_children(churners, i);
             return 2;
         }
     }
+    watch_counters("churn", CHURN_SECONDS, ncpu);
+    stop_children(churners, CHURNERS);
 
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += TEST_SECONDS;
-
-    unsigned long reads = 0, regressions = 0;
-    for (;;) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-                (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
-            break;
-
-        if (read_cpu_lines(cur) <= 0) {
-            failf("read /proc/stat", 0, 0, 0, 1, 0, 0);
-            break;
+    // Phase 2: more busy loops than CPUs. At least one slot must then hold two
+    // of them, and the whole set can use more cores than the kernel reports --
+    // busy time outrunning the clock, which is where a derived idle falls.
+    int spinners = ncpu + 2;
+    if (spinners > MAX_CPUS)
+        spinners = MAX_CPUS;
+    pid_t spin[MAX_CPUS];
+    for (int i = 0; i < spinners; i++) {
+        spin[i] = fork();
+        if (spin[i] == 0)
+            spinner_loop(); // never returns
+        if (spin[i] < 0) {
+            perror("fork spinner");
+            stop_children(spin, i);
+            return 2;
         }
-        reads++;
-        for (int i = 0; i < MAX_CPUS; i++) {
-            if (!prev[i].present || !cur[i].present)
-                continue;
-            if (cur[i].user < prev[i].user) {
-                regressions++;
-                test_log_if(1, "cpu%d user went backward: %llu -> %llu (read %lu)\n",
-                            i, prev[i].user, cur[i].user, reads);
-            }
-            if (cur[i].system < prev[i].system) {
-                regressions++;
-                test_log_if(1, "cpu%d system went backward: %llu -> %llu (read %lu)\n",
-                            i, prev[i].system, cur[i].system, reads);
-            }
-            if (cur[i].nice < prev[i].nice) {
-                regressions++;
-                test_log_if(1, "cpu%d nice went backward: %llu -> %llu (read %lu)\n",
-                            i, prev[i].nice, cur[i].nice, reads);
-            }
-        }
-        memcpy(prev, cur, sizeof(prev));
     }
+    watch_counters("saturate", SPIN_SECONDS, ncpu);
+    stop_children(spin, spinners);
 
-    for (int i = 0; i < CHURNERS; i++)
-        if (churners[i] > 0)
-            kill(churners[i], SIGKILL);
-    for (int i = 0; i < CHURNERS; i++)
-        if (churners[i] > 0)
-            waitpid(churners[i], NULL, 0);
-
-    test_logf("%lu reads over %ds, %lu backward steps\n",
-              reads, TEST_SECONDS, regressions);
-    if (regressions != 0)
-        failf("cpuN counters went backward", regressions, 0, 0, 0, 0, 0);
     return finish_suite("proc_stat_monotonic");
 }
