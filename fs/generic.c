@@ -884,9 +884,9 @@ int generic_accessat(struct fd *dirfd, const char *path_raw, int mode) {
     return access_check(&stat, mode);
 }
 
-int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw) {
+int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw, int src_norm) {
     char src[MAX_PATH];
-    int err = path_normalize(src_at, src_raw, src, N_SYMLINK_NOFOLLOW);
+    int err = path_normalize(src_at, src_raw, src, src_norm);
     if (err < 0)
         return err;
     // Only the destination: link("dir/.", new) is a different error entirely.

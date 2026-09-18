@@ -47,6 +47,7 @@ struct attr {
 
 #define AT_EMPTY_PATH_ 0x1000
 #define AT_SYMLINK_NOFOLLOW_ 0x100
+#define AT_SYMLINK_FOLLOW_ 0x400
 #define AT_NO_AUTOMOUNT_ 0x800
 
 // renameat2 flags
@@ -65,7 +66,12 @@ struct fd *generic_open_realroot(const char *path, int flags, int mode);
 int generic_getpath(struct fd *fd, char *buf);
 int fs_rebase_path_to_root(struct fs_info *fs, char *path);
 int fs_rebase_readlink_path(struct fs_info *fs, char *path);
-int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw);
+// src_norm are the fs/path.h N_* flags the SOURCE is resolved with: which of
+// N_SYMLINK_FOLLOW/N_SYMLINK_NOFOLLOW linkat's AT_SYMLINK_FOLLOW asked for,
+// plus N_REALROOT when the source is a stored path rather than a guest one
+// (the AT_EMPTY_PATH case, whose source is generic_getpath's answer). The
+// DESTINATION's resolution is fixed and not the caller's business.
+int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw, int src_norm);
 int generic_unlinkat(struct fd *at, const char *path);
 int generic_rmdirat(struct fd *at, const char *path);
 int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at, const char *dst, int flags);

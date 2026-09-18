@@ -27,6 +27,28 @@ struct fd {
     // F_SETOWN/F_GETOWN are valid on any fd type on Linux, not just sockets.
     pid_t_ owner;
 
+    // Who opened this description, as much of Linux's f_cred as AOK has
+    // anything to compare. One caller asks: linkat(fd, "", ..., AT_EMPTY_PATH)
+    // names an inode with no path for it, and Linux allows that only to a
+    // caller holding CAP_DAC_READ_SEARCH or still running on the very cred
+    // object the open ran on -- so that handing somebody a descriptor does not
+    // also hand them the right to give its inode a name they can reach
+    // afterwards. Linux compares that object by pointer, which AOK has no
+    // equivalent of; a fork gets a fresh one, CLONE_THREAD shares one, and any
+    // credential change replaces one. The thread group plus the credential
+    // values reproduce all three -- measured on Linux 6.12: a sibling thread
+    // is allowed, a forked child is ENOENT, a setresuid that changes nothing
+    // stays allowed. An execve is the fourth, and the one that moves no value
+    // at all: a process that opens a descriptor and then execs ITSELF keeps
+    // its pid, its thread group and every uid, and Linux still answers ENOENT.
+    // task->exec_gen is carried here for exactly that case.
+    struct {
+        bool known; // false for a descriptor created with no task running
+        pid_t_ tgid;
+        unsigned exec_gen;
+        uid_t_ uid, gid, euid, egid, suid, sgid, fsuid, fsgid;
+    } open_creds;
+
     // fd data
     union {
         // tty
@@ -375,6 +397,9 @@ typedef sdword_t fd_t;
 #define AT_FDCWD_ -100
 
 struct fd *fd_create(const struct fd_ops *ops);
+// Is the caller still running on the credentials this descriptor was opened
+// with? See open_creds above; linkat(AT_EMPTY_PATH) is the only caller.
+bool fd_open_creds_match(struct fd *fd);
 struct fd *fd_retain(struct fd *fd);
 // Like fd_retain, but for promoting a non-owning pointer found via a
 // secondary lookup structure (e.g. a global registry keyed off fd->data)

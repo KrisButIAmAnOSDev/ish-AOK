@@ -778,7 +778,57 @@ dword_t sys_readlinkat(fd_t at_f, addr_t path_addr, addr_t buf_addr, dword_t buf
     return sys_readlinkat_common(at_f, path_addr, buf_addr, bufsize);
 }
 
-static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
+// Linux's do_linkat() takes these two and rejects every other bit.
+#define LINKAT_ALLOWED_FLAGS_ (AT_SYMLINK_FOLLOW_ | AT_EMPTY_PATH_)
+
+// linkat(fd, "", dst_at, dst, AT_EMPTY_PATH): give a second name to the object
+// a descriptor already names, without a path for it. The canonical caller is
+// O_TMPFILE materialisation, which AOK refuses at the open (see
+// tests/manual/open_tmpfile.c), but the idiom stands on its own -- it is how a
+// caller links what it holds open without racing a rename of the path it came
+// from.
+static dword_t sys_linkat_empty_path(fd_t src_at_f, struct fd *src_at, struct fd *dst_at, const char *dst, int_t flags) {
+    // getname_uflags(): the flag is what makes an empty name legal at all, and
+    // without it the name is rejected before do_linkat sees it.
+    if (!(flags & AT_EMPTY_PATH_))
+        return _ENOENT;
+    // AT_FDCWD is not a descriptor, so there are no open-time credentials to
+    // compare and Linux applies no rule: the empty name is simply the current
+    // directory, and a hard link to a directory is EPERM.
+    if (src_at_f == AT_FDCWD_)
+        return generic_linkat(AT_PWD, ".", dst_at, dst, N_SYMLINK_FOLLOW);
+    // LOOKUP_LINKAT_EMPTY's gate. See struct fd's open_creds for what AOK can
+    // and cannot see of Linux's cred-object comparison.
+    if (!current_capable(CAP_DAC_READ_SEARCH_) && !fd_open_creds_match(src_at))
+        return _ENOENT;
+    char src[MAX_PATH];
+    int err = generic_getpath(src_at, src);
+    if (err < 0)
+        return err;
+    // A descriptor that names no filesystem object at all -- a pipe, a socket,
+    // an eventfd, which adhoc_getpath renders as "pipe:[N]" and friends. Its
+    // inode lives on pipefs/sockfs/anon_inodefs, never on the filesystem the
+    // new name would go on, so Linux answers what it answers for any other
+    // cross-filesystem link; measured EXDEV for all three on Linux 6.12.
+    if (!path_is_normalized(src))
+        return _EXDEV;
+    // generic_getpath's answer already carries any chroot prefix, so it has to
+    // be re-anchored at the REAL root -- see generic_open_realroot. NOFOLLOW
+    // because the descriptor already IS the object it names: an
+    // O_PATH|O_NOFOLLOW descriptor on a symlink links the symlink itself.
+    return generic_linkat(AT_PWD, src, dst_at, dst, N_SYMLINK_NOFOLLOW | N_REALROOT);
+}
+
+static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
+    // do_linkat() decides the flags before it looks at either name it was
+    // handed, so an unknown bit is EINVAL even when the source does not exist,
+    // the destination already does, the dirfd is not a descriptor, a name is
+    // empty, or a name's pointer is unreadable -- all six measured EINVAL on
+    // Linux 6.12. AOK carried no flags parameter at all: AT_SYMLINK_FOLLOW was
+    // dropped on the floor, and AT_SYMLINK_NOFOLLOW -- which linkat has never
+    // had -- was accepted as though it meant something.
+    if (flags & ~LINKAT_ALLOWED_FLAGS_)
+        return _EINVAL;
     char src[MAX_PATH];
     int path_err = user_read_path(src_addr, src, sizeof(src));
     if (path_err)
@@ -787,27 +837,36 @@ static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_
     path_err = user_read_path(dst_addr, dst, sizeof(dst));
     if (path_err)
         return path_err;
-    STRACE("linkat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
+    STRACE("linkat(%d, \"%s\", %d, \"%s\", %#x)", src_at_f, src, dst_at_f, dst, flags);
     struct fd *src_at = at_fd_for_path(src_at_f, src);
     if (src_at == NULL)
         return _EBADF;
     struct fd *dst_at = at_fd_for_path(dst_at_f, dst);
     if (dst_at == NULL)
         return _EBADF;
-    return generic_linkat(src_at, src, dst_at, dst);
+    if (src[0] == '\0')
+        return sys_linkat_empty_path(src_at_f, src_at, dst_at, dst, flags);
+    // AT_SYMLINK_FOLLOW: link what the source POINTS AT rather than the link.
+    // link() is the one member of the family that stops at a final symlink,
+    // and that stays the default -- link("l2f", new) makes a second symlink --
+    // but the flag is how a caller asks for the other thing, and dropping it
+    // meant `linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`, the way a
+    // caller links an inode it holds open, linked the magic symlink instead.
+    int src_norm = flags & AT_SYMLINK_FOLLOW_ ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW;
+    return generic_linkat(src_at, src, dst_at, dst, src_norm);
 }
 
-dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
-    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
+dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
 }
 dword_t sys_link(addr_t src_addr, addr_t dst_addr) {
-    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
 }
 dword_t sys_link_guest(guest_addr_t src_addr, guest_addr_t dst_addr) {
-    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
 }
-dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
-    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
+dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
 }
 
 #define AT_REMOVEDIR_ 0x200

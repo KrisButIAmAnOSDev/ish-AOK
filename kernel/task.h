@@ -262,6 +262,12 @@ struct task {
     uid_t_ *groups;
     char comm[16] __strncpy_safe; // locked by general_lock
     bool did_exec; // for that one annoying setsid edge case
+    // Bumped by every execve. Linux replaces the whole cred object there
+    // (prepare_exec_creds), so a descriptor opened before an exec is no longer
+    // one the caller opened "under the credentials it still holds" even though
+    // every uid and gid is unchanged -- and that is the only thing separating
+    // the two. Recorded on each descriptor; see struct fd's open_creds.
+    unsigned exec_gen;
 
     struct task_io_counters io;
 
@@ -938,6 +944,7 @@ extern void (*halt_hook)(int status);
 
 // Linux capability numbers, for the gates below. Only the ones something
 // actually checks are listed; add as needed rather than transcribing all 40.
+#define CAP_DAC_READ_SEARCH_ 2
 #define CAP_FSETID_      4
 #define CAP_SETGID_      6
 #define CAP_SETUID_      7

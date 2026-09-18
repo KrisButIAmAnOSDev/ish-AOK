@@ -2666,7 +2666,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 29: result = sys_ioctl_guest((fd_t) raw_args[0], (dword_t) raw_args[1], raw_args[2]); break;
     case 34: result = sys_mkdirat_guest((fd_t) raw_args[0], raw_args[1], (mode_t_) raw_args[2]); break;
     case 35: result = sys_unlinkat_guest((fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2]); break;
-    case 37: result = sys_linkat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]); break;
+    case 37: result = sys_linkat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3], (int_t) raw_args[4]); break;
     case 38: result = sys_renameat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]); break;
     case 43: result = sys_statfs_amd64_guest(raw_args[0], raw_args[1]); break;
     case 44: result = sys_fstatfs_amd64_guest((fd_t) raw_args[0], raw_args[1]); break;
@@ -3542,7 +3542,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         return true;
     case 265:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_linkat_guest(
-                (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]));
+                (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3], (int_t) raw_args[4]));
         return true;
     case 266:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_symlinkat_guest(

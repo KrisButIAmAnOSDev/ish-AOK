@@ -1771,6 +1771,7 @@ static void exec_apply_native_process_state(struct mm *new_mm) {
     unlock(&current->group->lock);
 
     current->did_exec = true;
+    current->exec_gen++;
     current->keepcaps = false;
     // A vfork parent is released by its child's exec, not by its exit. Without
     // this it stayed blocked for the native program's whole run -- which is
@@ -2039,6 +2040,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     unlock(&current->group->lock);
 
     current->did_exec = true;
+    current->exec_gen++;
     current->keepcaps = false;
     vfork_notify(current);
 
