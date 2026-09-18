@@ -181,6 +181,7 @@ mmap_shared_integrity.c
 fs_permission_rules.c
 fs_remove_enoent_order.c
 fs_create_trailing_slash.c
+fs_open_creat_isdir.c
 fs_at_validation.c
 sock_conformance_opts.c
 poll_rdhup_bounds.c

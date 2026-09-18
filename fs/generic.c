@@ -480,7 +480,10 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
     // name-is-missing case: `open("file/", O_CREAT|O_WRONLY)` came back
     // ENOTDIR from the resolution before this function got a say, and
     // `open("dir/", O_CREAT|O_RDONLY)` just opened the directory.
-    if (flags & O_CREAT_)
+    // O_PATH is exempt: it ignores O_CREAT altogether, so neither this nor
+    // the existing-directory rule below applies to it (measured:
+    // open("dir/", O_CREAT|O_PATH) succeeds on Linux).
+    if ((flags & (O_CREAT_ | O_PATH_)) == O_CREAT_)
         norm |= N_SLASH_EISDIR;
     // N_PARENT_DIR_WRITE is deliberately NOT used here even though O_CREAT is
     // set: at this point we don't yet know whether the target already
@@ -589,6 +592,34 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
                 unlock(&inodes_lock);
             mount_release(mount);
             return ERR_PTR(_EEXIST);
+        }
+        // ...and if it is a DIRECTORY, O_CREAT is EISDIR: open() cannot
+        // create one, so asking it to is a request that can never be granted.
+        // Linux's do_open() says so in one line --
+        // `if (open_flag & O_CREAT) { ... if (d_is_dir(nd->path.dentry)) return -EISDIR; }`
+        // -- with no regard for the access mode, which is why AOK refused only
+        // the write-mode form (from the S_ISDIR check after the open, below)
+        // and let `open("dir", O_CREAT|O_RDONLY)` hand back an fd on the
+        // directory. It is also why this sits HERE: EEXIST above answers
+        // first, and everything below answers later, including the target's
+        // own access check -- measured, `open(dir-with-no-read-permission,
+        // O_CREAT|O_RDONLY)` is EISDIR where the same open without O_CREAT is
+        // EACCES.
+        //
+        // O_PATH is exempt because it ignores O_CREAT entirely (Linux keeps
+        // only O_CLOEXEC/O_DIRECTORY/O_NOFOLLOW with it): measured,
+        // open("dir", O_CREAT|O_PATH) succeeds.
+        //
+        // Distinct from N_SLASH_EISDIR, which is about the SPELLING: a
+        // trailing slash is EISDIR whatever the name holds and even if it
+        // holds nothing, and is decided inside path_normalize before any of
+        // this. The two overlap only on a directory named with a trailing
+        // slash, where both say EISDIR.
+        if ((flags & (O_CREAT_ | O_PATH_)) == O_CREAT_ && S_ISDIR(stat.mode)) {
+            if (!fs_blocks)
+                unlock(&inodes_lock);
+            mount_release(mount);
+            return ERR_PTR(_EISDIR);
         }
         // O_NOFOLLOW: a final symlink we deliberately did not resolve is an
         // error -- unless O_PATH is also set, in which case Linux opens the
