@@ -164,7 +164,23 @@ pid_t_ task_setsid(struct task *task) {
     }
 
     task_leave_session(task);
-    struct pid *pid = pid_get(task->pid);
+    // The leader's pid, matching new_sid, NOT pid_get(task->pid).
+    //
+    // group->sid and group->pgid are both set to new_sid, which comes from
+    // group->leader. Membership has to hang off the same pid, because that is
+    // what a group signal is delivered through: send_group_signal(pgid) does
+    // pid_get(pgid) and walks that pid's pgroup list. Linked under a different
+    // pid, the lookup SUCCEEDS and the list simply does not contain this group,
+    // so the signal reaches nobody and reports no error -- see the comment on
+    // tgroup_restore_ids below, which documents the same hazard.
+    //
+    // For the usual caller the two are identical: a process calling setsid() is
+    // its own group leader, so task->pid == group->leader->pid. They diverge
+    // only when a NON-LEADER thread calls setsid(), where this used to name the
+    // leader in group->sid while filing the membership under the thread's pid.
+    // Linux uses task_pid(group_leader) for both (ksys_setsid ->
+    // set_special_pids).
+    struct pid *pid = pid_get(new_sid);
     list_add(&pid->session, &group->session);
     group->sid = new_sid;
 
