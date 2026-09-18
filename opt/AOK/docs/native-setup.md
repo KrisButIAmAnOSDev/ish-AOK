@@ -36,8 +36,15 @@ a native one. On a current build it links about 110 applets and skips a couple
 of dozen it knows do not work.
 
 It links the **standalone** native programs too, not only SmallCLUE's applets —
-`bash`, `zsh`, [`motepad`](motepad.md), `hx` and the `bmm`/`bmt` benchmarks each
-get a link pointing at their own file. It enumerates `/AOK/native` rather than
+`zsh`, `dash`, `sh`, `bash`, [`motepad`](motepad.md), `hx` and the `bmm`/`bmt`
+benchmarks each get a link pointing at their own file.
+
+**`sh` is worth singling out.** Because this directory goes first on your
+`PATH`, that link is what makes a bare `sh`, and any script you run as
+`sh script`, mean native dash rather than your distro's shell. Scripts with
+`#!/bin/sh` in them are unaffected — a shebang names an absolute path, and
+`/bin/sh` is left alone. If you would rather keep `sh` as it was, remove that
+one link; the rest keep working. It enumerates `/AOK/native` rather than
 naming them, so a program this build does not have is simply absent. Three names
 are deliberately left out: `smallclue` itself (its applets are linked by name,
 so a bare `smallclue` link would only print the banner), `zsh-multio` (an
@@ -73,15 +80,21 @@ default, so on a stock setup this step changes a user you may never log in as,
 and you will not notice it. On the bundled roots that user is `nu`; check with
 `getent passwd 1000`.
 
-By default it picks `/AOK/native/bash` when that exists and `/AOK/native/zsh`
-otherwise. Say so explicitly with `--shell`:
+By default it picks `/AOK/native/zsh` when that exists and `/AOK/native/bash`
+otherwise. It used to prefer bash, and it was changed deliberately: bash is
+**removed in build 556**, so preferring it would keep handing new installs the
+shell that is going away. Say so explicitly with `--shell`:
 
 ```sh
-sh /AOK/tools/native-links.sh --shell zsh        # native zsh
-sh /AOK/tools/native-links.sh --shell bash       # native bash
+sh /AOK/tools/native-links.sh --shell zsh        # native zsh (the default)
+sh /AOK/tools/native-links.sh --shell bash       # native bash, while it lasts
 sh /AOK/tools/native-links.sh --shell /bin/ash   # an absolute path is taken as given
 sh /AOK/tools/native-links.sh --no-shell         # link the applets, leave the shell alone
 ```
+
+`--shell` takes `bash`, `zsh` or a path — there is no `--shell dash`, so ask for
+native dash by its path: `--shell /AOK/native/dash`. It is a scripting shell
+with no line editing or history, which is why it is not one of the shorthands.
 
 The previous shell is recorded in `/etc/aok-native-shell.prev`, so `--remove`
 can put it back.

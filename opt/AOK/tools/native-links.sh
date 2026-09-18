@@ -1,7 +1,7 @@
 #!/bin/sh
 # Link iSH-AOK's native programs into a bin directory so they run natively:
 # SmallCLUE's applets, and the standalone programs beside it in /AOK/native --
-# helix (`hx`), bash and zsh.
+# helix (`hx`), zsh, dash (also linked as `sh`) and bash.
 #
 # /AOK/native/smallclue is compiled into iSH-AOK and runs as host code rather
 # than translated guest instructions, so it costs the same on every guest
@@ -87,13 +87,16 @@ NATIVE_ZSH=/AOK/native/zsh
 #   smallclue    the multicall binary itself; its applets are linked by name
 #                further down, and a `smallclue` link would just be the banner
 PROGRAMS_EXCLUDED="smallclue rust-probe zsh-multio"
-# Which of them becomes the login shell. Empty means "decide below": prefer bash
-# when it is there, otherwise zsh. That ordering keeps this script doing exactly
-# what it always did on a build that HAS bash -- which is the default build, since
-# -Dnative_bash is `auto' and resolves to ON whenever deps/bash is checked out --
-# while making a build configured with -Dnative_bash=disabled, where
-# /AOK/native/bash does not exist at all because linking it would put GPLv3 in the
-# binary, switch to zsh instead of silently switching nothing.
+# Which of them becomes the login shell. Empty means "decide below", and the
+# decision is resolve_native_shell's: prefer zsh when it is there, otherwise
+# bash. It is written out there rather than here, so read it there -- this
+# comment said the opposite of the code for a while, which is exactly what a
+# second copy of a decision buys you.
+#
+# The ordering used to be the other way round. bash is removed in 556 (it is
+# GPLv3, see docs/shell_transition_plan.md), so preferring it would keep handing
+# new installs the shell that is going away; bash stays reachable with
+# --shell bash for as long as it exists.
 SHELL_WANT=
 TARGET_DIR=/usr/local/native-bin
 # MODE is what the run is FOR; DRY_RUN is whether it touches anything. Two

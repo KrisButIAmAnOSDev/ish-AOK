@@ -4,7 +4,7 @@ Most of what you run under iSH-AOK is a guest binary. The emulator reads its
 instructions and translates them, block by block, into instructions the iPhone
 can run. That translation is most of the cost of running anything here.
 
-A **native program** skips it. Programs like `bash`, `zsh` and SmallCLUE's
+A **native program** skips it. Programs like `zsh`, `dash` and SmallCLUE's
 toolbox are compiled into iSH-AOK itself, as ordinary arm64 code, and when the
 guest `execve`s one, the emulator calls that code directly instead of loading a
 guest image. There is no translation, because there is nothing to translate.
@@ -13,8 +13,12 @@ You reach them through `/AOK/native`:
 
 ```sh
 ls /AOK/native
-# bash  bmm  bmt  hx  ktop  libs  motepad  rust-probe  smallclue  zsh  zsh-multio
+# bash  bmm  bmt  dash  ktop  motepad  rust-probe  sh  smallclue  zsh  zsh-multio
 ```
+
+What is actually there depends on how the build was configured, so read the
+directory rather than this page — `hx` and its `libs` appear only in a build
+with helix enabled, which is not the default.
 
 Everything else — `ssh`, `wc`, `vi` — is a symlink to
 `/AOK/native/smallclue`, which picks its applet from the name it was invoked
@@ -108,8 +112,9 @@ diagnostic rather than a program.
 | `/AOK/native/smallclue` | a busybox-style toolbox; the applet is chosen by the name it is invoked under |
 | `ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id` | OpenSSH, as applets of SmallCLUE — note it is built **without OpenSSL**, so the [crypto accelerator](crypto-accel.md) does not apply to it |
 | `vi` | the Nextvi editor, an applet of SmallCLUE |
-| `/AOK/native/bash` | bash 5.2. GPLv3, which is why it has a build switch at all |
-| `/AOK/native/zsh` | zsh, with fork-by-relaunch; `zsh --version` for the exact one |
+| `/AOK/native/bash` | bash 5.2. GPLv3, which is why it has a build switch at all — and why it is **removed in build 556**; your guest `/bin/bash` is unaffected |
+| `/AOK/native/zsh` | zsh, with fork-by-relaunch; `zsh --version` for the exact one. The only native program that can describe its own state, so the only one a [suspend](suspend.md) brings back where it was |
+| `/AOK/native/dash`, `/AOK/native/sh` | dash, the POSIX shell most scripts are written against. BSD-licensed. Its fork-by-relaunch hands the child the parse *tree* rather than the command text, so quoting cannot be lost on the way. Your `/bin/sh` is untouched — but see [native-setup.md](native-setup.md), since the link step is what makes a bare `sh` mean this shell |
 | `/AOK/native/zsh-multio` | a helper for zsh's MULTIOS redirections, which need a process that is not the shell to hold the descriptors |
 | `/AOK/native/motepad` | a modeless terminal text editor, the counterpart to Workspace's MotePad applet — see [motepad.md](motepad.md) |
 | `/AOK/native/ktop` | the process viewer, with no build step — the same source that ships at `/AOK/tools/ktop`, compiled as host code. See [ktop.md](ktop.md) |
