@@ -685,7 +685,9 @@ cache_init() {
     if [ -z "$cache_dir" ] && [ -z "$cache_ro_dir" ]; then
         return
     fi
-    [ -n "$cache_dir" ] && rm -f "$cache_dir/.probe" 2>/dev/null
+    if [ -n "$cache_dir" ]; then
+        rm -f "$cache_dir/.probe" 2>/dev/null || true
+    fi
     # Everything shared by every test: the headers they all include, the
     # compiler, and the machine. Folded in once so the per-test key is one hash.
     cache_key_base=$(
@@ -696,8 +698,14 @@ cache_init() {
         } | sha256sum | cut -c1-32
     )
     echo "test cache: ${cache_dir:-<read-only>} (key $cache_key_base)"
-    [ -n "$cache_ro_dir" ] &&
+    # `if`, not `[ ... ] && echo`. This file runs under `set -eu`, and a
+    # `test && cmd` whose test is false yields 1 -- as the last statement of a
+    # function that makes cache_init RETURN 1, and the whole run dies right
+    # after printing the cache line, with no test built and no error. Which is
+    # exactly what it did on all five roots.
+    if [ -n "$cache_ro_dir" ]; then
         echo "test cache: reading hits from $cache_ro_dir (not writable by $(id -un))"
+    fi
 }
 
 # Echo the cache path for a test, or nothing when caching is off.
