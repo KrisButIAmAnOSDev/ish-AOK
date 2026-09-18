@@ -9,6 +9,10 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
         assert(!(flags & N_SYMLINK_NOFOLLOW));
     else
         assert(flags & N_SYMLINK_NOFOLLOW);
+    // N_PARENT_ONLY never resolves the final component, so there is nothing
+    // for N_SYMLINK_FOLLOW to follow there; asking for both is a caller that
+    // has not decided which walk it wants.
+    assert(!((flags & N_PARENT_ONLY) && (flags & N_SYMLINK_FOLLOW)));
 
     const char *p = path;
     char *o = out;
@@ -83,7 +87,27 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
         if (*p == '\0' && *(p - 1) == '/' && (flags & N_SLASH_EISDIR))
             return _EISDIR;
 
-        if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
+        // Which components get looked up at all. Everything before the last
+        // one always does. The LAST one does when the caller asked to follow
+        // a final symlink -- and also when it was spelled with a trailing
+        // slash, because Linux's lookup_last() turns that slash into
+        // LOOKUP_FOLLOW | LOOKUP_DIRECTORY:
+        //
+        //     if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
+        //             nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+        //
+        // so "link/" follows the link and requires a directory even for an
+        // lstat, a readlink or an open(O_NOFOLLOW) -- measured on Linux 6.12:
+        // lstat("link-to-dir/") reports the DIRECTORY, readlink("link-to-dir/")
+        // is EINVAL, and open("link-to-dir/", O_NOFOLLOW) succeeds. AOK skipped
+        // this whole block for every nofollow caller, so the slash was ignored
+        // outright and lstat("file/") succeeded.
+        //
+        // lookup_last() is reached only from path_lookupat(), never from
+        // path_parentat() -- which is exactly N_PARENT_ONLY, whose callers
+        // spend the slash with their own rules instead.
+        if ((flags & N_SYMLINK_FOLLOW) || *p != '\0' ||
+                (*(p - 1) == '/' && !(flags & N_PARENT_ONLY))) {
             // this buffer is used to store the path that we're readlinking, then
             // if it turns out to point to a symlink it's reused as the buffer
             // passed to the next path_normalize call
@@ -243,25 +267,53 @@ int path_final_dot(const char *path) {
 // No N_PARENT_DIR_WRITE and no create flags, deliberately. This is the walk,
 // not the operation: Linux answers the final-"." rule between the two, so the
 // parent's write permission must not be consulted yet.
+//
+// N_PARENT_ONLY is what makes it a walk rather than a lookup, and it matters
+// for a caller whose path is not dotty after all -- a trailing slash on the
+// final component must stay unspent here, so the caller's own rule gets to
+// answer it.
 int path_parent_walk(struct fd *at, const char *path_raw) {
     char scratch[MAX_PATH];
-    return path_normalize(at, path_raw, scratch, N_SYMLINK_NOFOLLOW);
+    return path_normalize(at, path_raw, scratch, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY);
 }
 
-// Does the already-normalized path `normalized` name something that exists?
-// An lstat (fs->stat is AT_SYMLINK_NOFOLLOW), so a dangling symlink counts as
-// a name that is there -- which is what a lookup of the final component
-// answers, and Linux decides EEXIST from exactly that.
-static bool path_target_exists(const char *normalized) {
+// Linux's `nd->last.name[nd->last.len]`: the character where the final
+// component ends, which is '/' exactly when the name was spelled with a
+// trailing slash. path_normalize() rejects "" before any caller gets here.
+bool path_trailing_slash(const char *path) {
+    size_t len = strlen(path);
+    return len > 0 && path[len - 1] == '/';
+}
+
+// What does the already-normalized path `normalized` name? An lstat (fs->stat
+// is AT_SYMLINK_NOFOLLOW), so a dangling symlink counts as a name that is
+// there -- which is what a lookup of the final component answers, and Linux
+// decides EEXIST from exactly that.
+static bool path_target_lstat(const char *normalized, struct statbuf *stat) {
     char copy[MAX_PATH];       // find_mount_and_trim_path mutates its argument
     strcpy(copy, normalized);
     struct mount *mount = find_mount_and_trim_path(copy);
     if (mount == NULL)
         return false;
-    struct statbuf stat;
-    int err = mount->fs->stat(mount, copy, &stat);
+    int err = mount->fs->stat(mount, copy, stat);
     mount_release(mount);
     return err == 0;
+}
+
+// Does it name anything at all?
+static bool path_target_exists(const char *normalized) {
+    struct statbuf stat;
+    return path_target_lstat(normalized, &stat);
+}
+
+int path_lookup_final(struct fd *at, const char *path_raw, struct statbuf *stat) {
+    char path[MAX_PATH];
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY);
+    if (err < 0)
+        return err;
+    if (!path_target_lstat(path, stat))
+        return _ENOENT;
+    return 0;
 }
 
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
@@ -383,9 +435,37 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     // Without this, mknod("d/fifo/"), mkfifo, symlink and link all created
     // the name WITHOUT the slash and reported success, so a guest could not
     // tell a request for a directory from a request for a fifo.
-    if ((flags & N_SLASH_NOT_A_DIR) && path[strlen(path) - 1] == '/' &&
+    if ((flags & N_SLASH_NOT_A_DIR) && path_trailing_slash(path) &&
             !path_target_exists(out))
         return _ENOENT;
+
+    // N_SLASH_UNLINK: unlink() on a name spelled with a trailing slash. Linux
+    // has a whole label for it, and it answers three different things:
+    //
+    //     slashes:
+    //             if (d_is_negative(dentry))      error = -ENOENT;
+    //             else if (d_is_dir(dentry))      error = -EISDIR;
+    //             else                            error = -ENOTDIR;
+    //
+    // reached from do_unlinkat() on `if (last.name[last.len] || ...)`. The
+    // dentry is the one a LOOKUP_PARENT walk's own lookup produced, so no
+    // symlink was followed to get it: unlink("link-to-a-dir/") is ENOTDIR, not
+    // EISDIR, because the LINK is what the name names.
+    //
+    // Same seat as N_SLASH_NOT_A_DIR above, and for the same reason: after
+    // __path_normalize, so the parent walk's errors still answer first
+    // (unlink("unsearchable/f/") is EACCES), and before N_PARENT_DIR_WRITE,
+    // because may_delete() only runs inside vfs_unlink() afterwards -- so
+    // unlink("unwritable/f/") is ENOTDIR and not EACCES. Measured.
+    //
+    // Without it the slash was ignored outright and unlink("file/") DELETED
+    // the file, which is the one outcome a caller cannot undo.
+    if ((flags & N_SLASH_UNLINK) && path_trailing_slash(path)) {
+        struct statbuf stat;
+        if (!path_target_lstat(out, &stat))
+            return _ENOENT;
+        return S_ISDIR(stat.mode) ? _EISDIR : _ENOTDIR;
+    }
 
     if (flags & N_PARENT_DIR_WRITE) {
         // out is fully resolved and normalized here (begins with '/' or is

@@ -3849,7 +3849,7 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
     // needs search on the way and write on the socket (below). Measured on
     // Linux 6.12 by tests/manual/unix_bind_dir_perms.c.
     int flags = bind_fd != NULL
-        ? N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR
+        ? N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR
         : N_SYMLINK_FOLLOW;
     int err = path_normalize(AT_PWD, path_raw, path, flags);
     if (err < 0)

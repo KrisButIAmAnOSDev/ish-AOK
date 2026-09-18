@@ -898,7 +898,7 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
         return walk < 0 ? walk : _EEXIST;
     }
     char dst[MAX_PATH];
-    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
+    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     // Pre-trim copies for inotify; see generic_openat.
@@ -994,7 +994,8 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     }
     char path[MAX_PATH];
     int err = path_normalize(at, path_raw, path,
-            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
+            N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE |
+            N_REMOVE_ENOENT_FIRST | N_SLASH_UNLINK);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
@@ -1063,6 +1064,49 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
     // flag are rejected with EINVAL (Linux's response for unsupported flags).
     if (flags & ~RENAME_NOREPLACE_)
         return _EINVAL;
+    // A trailing slash on EITHER name asks for a directory, and do_renameat2()
+    // spends both of them on the SOURCE's type:
+    //
+    //     /* unless the source is a directory trailing slashes give -ENOTDIR */
+    //     if (!d_is_dir(old_dentry)) {
+    //             error = -ENOTDIR;
+    //             if (old_last.name[old_last.len])
+    //                     goto exit5;
+    //             if (!(flags & RENAME_EXCHANGE) && new_last.name[new_last.len])
+    //                     goto exit5;
+    //     }
+    //
+    // So rename("file/", x) and rename(file, "anything/") are both ENOTDIR --
+    // even when the destination IS a directory, where the same call without
+    // the slash is EISDIR -- while a directory source spends the slash on
+    // nothing at all and rename("dir/", "gone/") simply succeeds. AOK honoured
+    // neither slash: it renamed "file/" and it CREATED "gone/", so a guest
+    // asking to move something onto a directory got a new plain file instead.
+    //
+    // The rule reads the type of a name the slash need not be on, so it cannot
+    // live in either path_normalize() call. Here it can still be given Linux's
+    // order: after both parent walks, after the source must exist, after
+    // RENAME_NOREPLACE's EEXIST (measured: renameat2(file, "dir/", NOREPLACE)
+    // is EEXIST, and only a destination that is NOT there reaches ENOTDIR) --
+    // and before either parent's write permission, which vfs_rename() asks for
+    // afterwards, so rename("unwritable/f/", x) is ENOTDIR and not EACCES.
+    if (path_trailing_slash(src_raw) || path_trailing_slash(dst_raw)) {
+        int walk = path_parent_walk(src_at, src_raw);
+        if (walk >= 0)
+            walk = path_parent_walk(dst_at, dst_raw);
+        if (walk < 0)
+            return walk;
+        struct statbuf src_stat;
+        int err = path_lookup_final(src_at, src_raw, &src_stat);
+        if (err < 0)
+            return err;     // a source that is not there is ENOENT, as always
+        struct statbuf dst_stat;
+        if ((flags & RENAME_NOREPLACE_) &&
+                path_lookup_final(dst_at, dst_raw, &dst_stat) >= 0)
+            return _EEXIST;
+        if (!S_ISDIR(src_stat.mode))
+            return _ENOTDIR;
+    }
     char src[MAX_PATH];
     // Linux requires write+exec on both the source and destination parent
     // directories for rename (removing the entry from one, adding it to the
@@ -1071,11 +1115,11 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
     // even from an unwritable parent, while a destination that is not there is
     // the ordinary case and leaves the permission error standing.
     int err = path_normalize(src_at, src_raw, src,
-            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
+            N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
     if (err < 0)
         return err;
     char dst[MAX_PATH];
-    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE);
     if (err < 0)
         return err;
     if (contains_mount_point(src))
@@ -1149,7 +1193,7 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
         int walk = path_parent_walk(at, link_raw);
         return walk < 0 ? walk : _EEXIST;
     }
-    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
+    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
@@ -1191,7 +1235,7 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
         return _EPERM;
 
     char path[MAX_PATH];
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
@@ -1302,7 +1346,7 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     }
     // The final component is the name being created and is never followed, so
     // mkdir over an existing (even dangling) symlink reports EEXIST like Linux.
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
@@ -1361,7 +1405,7 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     }
     // rmdir does not follow a final symlink: rmdir("symlink-to-dir") is ENOTDIR.
     int err = path_normalize(at, path_raw, path,
-            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
+            N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
     if (err < 0)
         return err;
     if (contains_mount_point(path))
