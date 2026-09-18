@@ -101,6 +101,13 @@ flash cost to ration, so filling the pool with cold pages costs nothing and buys
 headroom before it is needed. Measured on a device: 239 MB of recovered headroom
 became 433 MB.
 
+This is the **compression-on, swap-off** shape specifically. Turn a swap file on
+as well and the old rule still applies, deliberately: evicting then reaches
+flash, so there is a cost to ration again and the pager goes back to waiting
+until the guest is actually short. If you have both on and you are wondering why
+`/proc/ish/zswap` reports nothing stored on an idle device, that is why, and
+`/proc/ish/swap` will say `kswapd running, N passes, 0 sweeps` to confirm it.
+
 ## And a long tail
 
 - Two symbols that were silently one: dash's `$SHLVL` counter and zsh's shared
