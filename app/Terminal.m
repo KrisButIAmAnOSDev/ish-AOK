@@ -32,6 +32,14 @@ NSNotificationName const TerminalRegistryDidChangeNotification = @"TerminalRegis
 
 @property BOOL loaded;
 @property BOOL didReportLoadFailure;
+// Web content process terminations are counted inside a sliding window so a
+// single reclaim can be recovered from in silence while a genuine kill loop
+// still gets reported. webViewRecoveryGeneration invalidates the watchdog armed
+// by an earlier recovery.
+@property NSUInteger webContentTerminationCount;
+@property CFTimeInterval webContentTerminationWindowStart;
+@property CFTimeInterval lastWebContentTerminationAt;
+@property NSUInteger webViewRecoveryGeneration;
 @property (nonatomic) tty_t tty;
 // lock with dataLock for !linux and @synchronized(self) for linux
 @property (nonatomic) NSMutableData *pendingData;
@@ -178,6 +186,13 @@ static CFTimeInterval ISHTerminalNowMonotonic(void) {
 }
 
 static const CFTimeInterval ISHTerminalOutputWatchdogSeconds = 1.5;
+
+// How long a rebuilt web view gets to finish loading before the failure is
+// reported to the user, and how many terminations inside one window are treated
+// as recoverable before we stop waiting and say so.
+static const CFTimeInterval ISHTerminalRecoveryReportDelay = 8.0;
+static const CFTimeInterval ISHTerminalTerminationWindowSeconds = 60.0;
+static const NSUInteger ISHTerminalTerminationWindowLimit = 3;
 
 static NSString *ISHStringFromBOOL(BOOL value) {
     return value ? @"yes" : @"no";
@@ -363,6 +378,25 @@ static void NotifyTerminalRegistryChanged(void) {
         [oldWebView removeFromSuperview];
         _webView = nil;
         [self webView];
+
+        // The rebuilt view is off-screen until it loads: TerminalView puts it
+        // back from its KVO on `loaded`. If that never arrives the terminal is
+        // really gone, and that is the point at which the user should hear about
+        // it. A later recovery invalidates this watchdog by bumping the
+        // generation, so a second termination does not produce a second report
+        // for a terminal that is being rebuilt again.
+        NSUInteger generation = ++self.webViewRecoveryGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ISHTerminalRecoveryReportDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.webViewRecoveryGeneration != generation || self.loaded)
+                return;
+            [self recordLifecycleEvent:@"terminal.webview.recoverFailed"
+                               details:@{@"reason": reason ?: @"unknown"}];
+            [self reportTerminalLoadFailure:error ?:
+                [NSError errorWithDomain:WKErrorDomain
+                                    code:WKErrorWebContentProcessTerminated
+                                userInfo:@{NSLocalizedDescriptionKey: @"the terminal's web view did not come back"}]];
+        });
     });
 }
 
@@ -475,12 +509,47 @@ struct tty *ISHOpenTerminalForRestoredSession(void) {
 
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
     self.loaded = NO;
+
+    CFTimeInterval now = ISHTerminalNowMonotonic();
+    if (self.webContentTerminationWindowStart == 0 ||
+        now - self.webContentTerminationWindowStart > ISHTerminalTerminationWindowSeconds) {
+        self.webContentTerminationWindowStart = now;
+        self.webContentTerminationCount = 0;
+    }
+    // "Repeating" has to mean the terminal is not staying up, not merely that it
+    // has been killed a few times: a view that is reclaimed every twenty seconds
+    // and recovers each time is a working terminal, and saying otherwise puts an
+    // alert on screen that the recovery immediately withdraws again. So also
+    // require that this kill landed before the last recovery had even settled.
+    CFTimeInterval sinceLast = now - self.lastWebContentTerminationAt;
+    BOOL repeating = self.webContentTerminationCount >= ISHTerminalTerminationWindowLimit - 1 &&
+                     sinceLast < ISHTerminalRecoveryReportDelay;
+    self.lastWebContentTerminationAt = now;
+    self.webContentTerminationCount++;
+
     [self recordLifecycleEvent:@"terminal.webContentProcessTerminated"
-                       details:@{@"webViewHidden": ISHStringFromBOOL(webView.isHidden)}];
+                       details:@{@"webViewHidden": ISHStringFromBOOL(webView.isHidden),
+                                 @"terminationsInWindow": @(self.webContentTerminationCount)}];
+
+    NSString *description = repeating ?
+        @"the system keeps stopping the terminal's web view, most likely to reclaim memory" :
+        @"terminal web content process terminated";
     NSError *error = [NSError errorWithDomain:WKErrorDomain
                                          code:WKErrorWebContentProcessTerminated
-                                     userInfo:@{NSLocalizedDescriptionKey: @"terminal web content process terminated"}];
-    [self reportTerminalLoadFailure:error];
+                                     userInfo:@{NSLocalizedDescriptionKey: description}];
+
+    // Nothing has failed yet, so say nothing yet. The system killing a web
+    // content process is routine on a Mac, where an iOS app's WKWebViews get no
+    // RunningBoard assertion of their own and are the first thing reclaimed
+    // under memory pressure; rebuilding the view puts the terminal back within a
+    // second. reportTerminalLoadFailure: raises a modal alert that has to be
+    // dismissed by hand, so reporting here leaves the user staring at a
+    // complaint about a terminal that already recovered. Recovery arms a
+    // watchdog that reports if the rebuilt view does not load -- unless the
+    // kills are coming faster than recovery can keep up, in which case waiting
+    // longer tells the user nothing they don't already see.
+    if (repeating)
+        [self reportTerminalLoadFailure:error];
     [self recoverTerminalWebViewWithReason:@"webContentProcessTerminated" error:error];
 }
 

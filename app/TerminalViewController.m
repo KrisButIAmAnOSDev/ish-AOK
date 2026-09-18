@@ -221,6 +221,9 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 @property (strong, nonatomic) UIButton *workspaceButton;
 @property (strong, nonatomic) UIButton *saveSessionButton;
 @property (weak, nonatomic) UIAlertController *saveProgressHUD;
+// The alert raised by a terminal load failure, so a terminal that comes back
+// on its own can take its own complaint down again.
+@property (weak, nonatomic) UIAlertController *loadFailureAlert;
 @property (nonatomic) BOOL awaitingSessionChoice;
 // Set when the resume was asked to CONSUME the image it came from. Acted on
 // only after the restore has actually produced a session -- see
@@ -2023,6 +2026,12 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     if (notification.object != self.terminal)
         return;
     [self _hideTerminalStartupOverlay];
+    // The terminal is back, so anything still on screen saying it failed is now
+    // a lie the user would have to dismiss by hand.
+    UIAlertController *staleFailure = self.loadFailureAlert;
+    self.loadFailureAlert = nil;
+    if (staleFailure.presentingViewController != nil)
+        [staleFailure dismissViewControllerAnimated:YES completion:nil];
     // A reload means a fresh JS context (this also fires after
     // recoverTerminalWebViewWithReason: discards the webview), so any find state
     // the bar thinks it has on the JS side is gone. Drop the native half too.
@@ -2035,7 +2044,18 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     NSError *error = notification.userInfo[@"error"];
     NSString *subtitle = error.localizedDescription ?: @"unknown error";
     [self _showTerminalStartupFailureOverlayWithText:@"Terminal UI failed to load."];
-    [self showMessage:@"terminal UI failed to load" subtitle:subtitle];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.presentedViewController != nil)
+            return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"terminal UI failed to load"
+                                                                      message:subtitle
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+        self.loadFailureAlert = alert;
+        [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
