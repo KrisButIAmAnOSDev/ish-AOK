@@ -100,6 +100,10 @@ bool procfd_statat(struct fd *at, const char *path, struct statbuf *stat, int *e
 // for the whole unit.
 bool procns_statat(struct fd *at, const char *path, struct statbuf *stat, int *err_out);
 int generic_setattrat(struct fd *at, const char *path, struct attr attr, bool follow_links);
+// chown(path, -1, -1) asks for no change at all. Linux still resolves the path
+// and reports everything the resolution finds, so this runs exactly the lookup
+// generic_setattrat runs and then changes nothing. See sys_fchownat_common.
+int generic_setattrat_nochange(struct fd *at, const char *path, bool follow_links);
 int generic_utime(struct fd *at, const char *path, struct timespec atime, struct timespec mtime, bool follow_links);
 ssize_t generic_readlinkat(struct fd *at, const char *path, char *buf, size_t bufsize);
 int generic_mkdirat(struct fd *at, const char *path, mode_t_ mode);

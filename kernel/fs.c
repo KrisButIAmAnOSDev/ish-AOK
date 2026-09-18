@@ -424,9 +424,17 @@ int setattr_check(struct statbuf *stat, struct attr attr) {
             // Only the owner may change the mode.
             return current->fsuid == stat->uid ? 0 : _EPERM;
         case attr_uid:
+            // -1 is "leave the owner alone", and Linux runs no ownership check
+            // for it at all: an unprivileged chown(path, -1, -1) on a
+            // root-owned file succeeds. sys_fchownat_common answers that
+            // without a setattr (generic_setattrat_nochange), so nothing
+            // should reach here with -1 -- but if it ever does, refusing it
+            // would be the wrong answer, not a safe one.
+            if (attr.uid == (uid_t_) -1)
+                return 0;
             // Handing a file to another user needs privilege; "changing" it to
             // the current owner is a no-op Linux permits.
-            if (attr.uid == (uid_t_) -1 || attr.uid == stat->uid)
+            if (attr.uid == stat->uid)
                 return current->fsuid == stat->uid ? 0 : _EPERM;
             return _EPERM;
         case attr_gid:
@@ -2808,6 +2816,18 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
         }
         return 0;
     }
+
+    // Both ids -1 is "change nothing", and it used to fall straight out of
+    // here with 0 -- the two blocks below are the only thing that ever
+    // resolved the path, so chown("does-not-exist", -1, -1) succeeded and
+    // lchown("file/", -1, -1) never spent its trailing slash. Linux runs the
+    // whole lookup first and reports what it finds; it just has nothing to set
+    // once it gets there. The shape falls out of any caller that decides the
+    // two ids separately and passes -1 for "leave this one alone" -- when
+    // neither turns out to need changing, the call is still made, and it was
+    // answering 0 for a path that does not exist.
+    if (owner == (uid_t) -1 && group == (uid_t) -1)
+        return generic_setattrat_nochange(at, path, follow_links);
 
     if (owner != (uid_t) -1) {
         err = generic_setattrat(at, path, make_attr(uid, owner), follow_links);

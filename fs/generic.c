@@ -1301,6 +1301,52 @@ int generic_setattrat(struct fd *at, const char *path_raw, struct attr attr, boo
     return err;
 }
 
+// chown(path, -1, -1) -- "change neither the owner nor the group". Linux does
+// not shortcut it: chown_common() is reached only after the full lookup, so
+// every error the resolution can raise is still raised, and only then does it
+// find there is no uid and no gid to set. Measured on Linux 6.12, unprivileged
+// and as root, 64-bit and -m32 all identical:
+//
+//   lchown("gone", -1, -1)            ENOENT      chown("file/", -1, -1)  ENOTDIR
+//   chown("unsearchable/f", -1, -1)   EACCES      chown("dir/", -1, -1)   0
+//   chown("symlink-loop", -1, -1)     ELOOP       chown("dangling", -1, -1) ENOENT
+//
+// Two things it does NOT do, both measured rather than assumed. There is no
+// ownership check -- an unprivileged chown(-1, -1) on a root-owned file
+// succeeds, because setattr_prepare() only tests ATTR_UID/ATTR_GID and neither
+// is set. And it raises no inotify event, even though it does bump ctime:
+// fsnotify_change() maps ATTR_UID/GID/MODE to IN_ATTRIB and a lone ATTR_CTIME
+// to nothing. So this is a lookup and nothing else.
+//
+// (AOK bumps ctime for no setattr at all -- a plain chown and a chmod both
+// leave it alone -- so there is nothing to bump here, and the Linux ctime
+// behaviour is a separate gap rather than one this skips.)
+int generic_setattrat_nochange(struct fd *at, const char *path_raw, bool follow_links) {
+    char path[MAX_PATH];
+    int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
+    if (err < 0)
+        return err;
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
+    if (mount == NULL)
+        return _ENOENT;
+    // Linux takes the write reference before it touches the inode, so a
+    // read-only mount answers EROFS here too. This keeps the position AOK
+    // already gives EROFS for every other setattr rather than inventing a new
+    // one; see the note in 562a4eb5 about that ordering.
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
+    // path_normalize() has resolved and vetted every component it walked, but
+    // a NOFOLLOW caller's final component is only checked for existence here,
+    // which is where lchown("gone", -1, -1) gets its ENOENT.
+    struct statbuf stat = {};
+    err = mount->fs->stat(mount, path, &stat);
+    mount_release(mount);
+    return err < 0 ? err : 0;
+}
+
 int generic_utime(struct fd *at, const char *path_raw, struct timespec atime, struct timespec mtime, bool follow_links) {
     char path[MAX_PATH];
     int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
