@@ -141,6 +141,29 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                         return _ENAMETOOLONG;
                     expanded_path[out_len] = '/';
                     memcpy(expanded_path + out_len + 1, p, p_len + 1);
+                } else if (*(p - 1) == '/') {
+                    // A FINAL symlink component spelled with a trailing slash.
+                    // Nothing follows it, so the branch above does not run and
+                    // the slash -- which says "and this is a directory" -- was
+                    // simply dropped: the recursion below then resolved a path
+                    // that had never been spelled with one, and
+                    // open("dangling-link-to-a-file/") opened the file.
+                    //
+                    // Linux keeps it because the slash belongs to the NAME,
+                    // not to the walk: trailing_slashes turns into
+                    // LOOKUP_DIRECTORY, which survives the symlink being
+                    // followed and is spent on whatever it lands on. Carrying
+                    // it into the expanded path spends it the same way, at the
+                    // must-be-a-directory block below, one level down --
+                    // measured on Linux 6.12, open("link-to-file/") is ENOTDIR
+                    // and open("dangling-link/") is ENOENT, where the same two
+                    // without the slash succeed and report ENOENT
+                    // respectively. A link to a directory is unaffected, which
+                    // is the case everything actually relies on.
+                    if (out_len + 1 >= MAX_PATH)
+                        return _ENAMETOOLONG;
+                    expanded_path[out_len] = '/';
+                    expanded_path[out_len + 1] = '\0';
                 }
                 const char *next_at_path = absolute_target ? root_path : NULL;
                 return __path_normalize(root_path, next_at_path, expanded_path, out, flags, levels + 1);
