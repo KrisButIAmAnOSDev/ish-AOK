@@ -10,6 +10,11 @@ It is a file, not a partition, and it lives inside the app's own storage. Paging
 to it costs flash writes on your device, which is why it is **off by default and
 has to be turned on deliberately**.
 
+There is a second, cheaper way to get the same headroom: compressed memory,
+which holds cold pages in RAM instead of writing them out, and which can be
+used with swap or entirely instead of it. If you only read one section of this
+page, read [Compressed memory](#compressed-memory).
+
 ## Turning it on
 
 In the **iOS Settings app** — not the settings inside iSH-AOK — open
@@ -39,6 +44,51 @@ nothing. 256 MB or 512 MB is a reasonable starting point.
 From the command-line build there is no Settings app, so use the environment
 variable instead — see `ISH_GUEST_SWAP_MB` in
 [tuning-knobs.md](tuning-knobs.md).
+
+## Compressed memory
+
+Compression is the other half of this, and it is worth turning on *before* swap
+is: it buys much the same headroom without spending any flash at all.
+
+In the **iOS Settings app**, under **Settings → iSH-AOK → Compressed Memory**:
+
+- **Enable Compressed Memory**, off by default.
+- **Compressed Memory Size**, the pool's ceiling. It is clamped to a quarter of
+  the device's RAM however large you set it.
+
+What it does depends on whether swap is on too, and you do not pick between the
+two shapes — the combination decides:
+
+- **Compression on, swap off.** The pool is the only storage there is. Cold
+  frames are compressed and kept in RAM, and *nothing is ever written to
+  storage*. A frame that will not compress simply stays resident, which is the
+  correct answer. This is the shape Linux calls zram.
+- **Compression on, swap on.** The pool sits in front of the file, and only
+  what does not compress reaches flash. This is the shape Linux calls zswap.
+
+**Why it helps is not the obvious reason.** iOS already compresses idle memory
+for you, for free — but doing so does not move `phys_footprint`, which is the
+ledger iOS kills the app on. Only compression iSH-AOK does itself, into its own
+buffer with the original released, moves that number. So this is not
+duplicating what the system already does.
+
+It measures 2.2–2.8x on real workloads, so a 128 MB pool holds roughly 300 MB
+of guest memory, and a page comes back in one to three microseconds depending
+on the device — two orders of magnitude under a read from flash.
+
+**Sizing is not the obvious rule either, and it is worth getting right.** The
+swap *area* caps how much can be evicted at all; the *pool* caps how much of
+what is evicted avoids flash. They are not alternatives. Making the area small
+does not save writes — it stops eviction happening, so nothing reaches the pool
+either. If you want compression to do the work, give the area room and let the
+pool absorb it.
+
+**The pool is resident memory**, so it competes with the thing it is saving.
+That is why the quarter-of-RAM ceiling exists.
+
+```sh
+cat /proc/ish/zswap          # what it holds, the ratio, and the flash it saved
+```
 
 ## Seeing what it is doing
 
@@ -102,5 +152,6 @@ switch is on and the guest still reports no swap, read that file first.
 
 - [tuning-knobs.md](tuning-knobs.md) — `ISH_GUEST_SWAP_MB` and the memory-guard
   knobs, for the command-line build.
-- [proc-ish.md](proc-ish.md) — `/proc/ish/swap` and the other emulator files.
+- [proc-ish.md](proc-ish.md) — `/proc/ish/swap`, `/proc/ish/zswap` and the
+  other emulator files.
 - [ktop.md](ktop.md) — watching memory and paging live from inside the guest.

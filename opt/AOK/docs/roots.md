@@ -142,12 +142,15 @@ sh /AOK/tools/mount-root.sh --unmount Devuan6-x86_64
 sh /AOK/tools/mount-root.sh --unmount all
 ```
 
-The script also bind-mounts `/AOK/tools` and `/AOK/tests` into the chroot, so
-`mount-root.sh`, `ktop` and the guest regression suite stay reachable from
-inside it — `/AOK` is the booted root's aokfs mount and does not otherwise
-exist in another root, which is what makes
+The script also bind-mounts `/AOK/tools`, `/AOK/tests` and `/AOK/fakefs` into
+the chroot, so `mount-root.sh`, `ktop` and the guest regression suite stay
+reachable from inside it — `/AOK` is the booted root's aokfs mount and does not
+otherwise exist in another root, which is what makes
 `mount-root.sh <root> -- sh /AOK/tests/setup-regressions.sh --run`
-possible at all. Root names are sanity-checked to reject `/`, `.`, and `..`.
+possible at all. `/AOK/fakefs` is there for the suite's compiled-test cache:
+without it a per-architecture run falls back to that root's own `/tmp`, which
+init clears on restart, so every run recompiles every test. Root names are
+sanity-checked to reject `/`, `.`, and `..`.
 
 Because there's only one real kernel underneath, a process started inside
 a `mount-root.sh` chroot is a completely ordinary process from the outer

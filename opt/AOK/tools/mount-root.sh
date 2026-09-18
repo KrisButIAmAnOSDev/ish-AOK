@@ -12,6 +12,14 @@
 # fails with "No such file or directory", because /AOK is the booted root's
 # aokfs mount and does not exist inside another root.
 #
+# /AOK/fakefs comes in for the same reason one step further on: it is where the
+# suite keeps its compiled-test cache, and it is the only writable location that
+# survives an app restart AND keeps the exec bit. Without it a chroot run falls
+# back to that root's own /tmp, which init clears on restart -- so every
+# per-architecture run recompiles ~190 tests from scratch, on the slowest host
+# there is. Bind it in and the five legs share one cache, which is safe because
+# the cache key already includes the architecture and the toolchain.
+#
 # iSH-AOK has no mount or PID namespaces, so /proc et al. always reflect the
 # one true kernel state regardless of which root you bind them into -- `top`
 # run inside a chroot sees exactly the same processes as `top` run outside
@@ -43,7 +51,7 @@
 set -u
 
 ROOTS_DIR=${ROOTS_DIR:-/AOK/roots}
-BIND_DIRS="proc sys dev dev/pts run AOK/tools AOK/tests"
+BIND_DIRS="proc sys dev dev/pts run AOK/tools AOK/tests AOK/fakefs"
 
 log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
@@ -120,7 +128,7 @@ teardown_mounts() {
     root=$1
     log "Tearing down $root"
     # Reverse order: dev/pts before dev, etc.
-    for d in AOK/tests AOK/tools run dev/pts dev sys proc; do
+    for d in AOK/fakefs AOK/tests AOK/tools run dev/pts dev sys proc; do
         umount_one_dir "$root/$d"
     done
 }

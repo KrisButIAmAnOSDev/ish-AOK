@@ -137,8 +137,10 @@ diagnostics — nothing here changes behaviour except `swap`, and then only on a
 build that offered guest control.
 
 ```sh
-cat /proc/ish/swap        # the swap area: capacity, use, and why it refuses work
-cat /proc/ish/mem_guard   # the jetsam guard: what it sees and whether it is refusing
+cat /proc/ish/swap          # the swap area: capacity, use, why it refuses
+cat /proc/ish/mem_guard     # the jetsam guard: what it sees, what it refuses
+cat /proc/ish/zswap         # compressed memory: what it holds, flash it saved
+cat /proc/ish/mem_compress  # what compressing a given process would buy
 ```
 
 `swap` is the pager's whole state in one screen. The lines worth knowing:
@@ -155,6 +157,29 @@ cat /proc/ish/mem_guard   # the jetsam guard: what it sees and whether it is ref
 | `direct_reclaim` | bytes freed for an allocation that would otherwise have failed |
 | `alloc_failures` / `no_area` | evictions refused because the area is full, or absent |
 | `io_errors` | failed reads or writes against the area |
+
+`zswap` is the compressed tier — see [swap.md](swap.md) for what it is and how
+to turn it on. It answers "did it actually do anything", which a passing swap
+test does not:
+
+| line | what it tells you |
+|---|---|
+| `on` / `cap` | whether there is a pool, and how big you asked for |
+| `objects` | frames held compressed right now |
+| `pool` / `stored` / `original` | what it occupies, the compressed bytes in it, and what those frames used to occupy — `original` over `stored` is the ratio you are getting |
+| `stores` / `loads` | frames kept in RAM, and faults served back out of it |
+| `declined` | frames that would not compress, or arrived with the pool full, so they went to flash |
+| `flash NOT written` | the wear saving, and it comes off the 24-hour write budget |
+
+`mem_compress` is a measurement rather than a report: write a pid to it and it
+walks that process's resident pages and says what compressing them would save,
+at what cost per page. It exists because the host already compresses idle
+memory for free — but that does not move `phys_footprint`, the ledger iOS kills
+on, so only compression AOK does itself can help.
+
+```sh
+echo $$ > /proc/ish/mem_compress && cat /proc/ish/mem_compress
+```
 
 `mem_guard` answers the question "why did that allocation fail?". It prints the
 machine's memory, this process's own ceiling and headroom, the system pressure
