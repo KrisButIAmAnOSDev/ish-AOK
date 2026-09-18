@@ -20,6 +20,7 @@
 #import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
 #import "ShellFileBrowser.h"
+#import "Snippets.h"
 #import "SceneDelegate.h"
 #import <GameController/GameController.h>
 #include "kernel/init.h"
@@ -194,7 +195,7 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
     return command;
 }
 
-@interface TerminalViewController () <UIGestureRecognizerDelegate, UITextFieldDelegate, ISHShellFileBrowserDelegate>
+@interface TerminalViewController () <UIGestureRecognizerDelegate, UITextFieldDelegate, ISHShellFileBrowserDelegate, ISHSnippetsDelegate>
 
 @property UITapGestureRecognizer *tapRecognizer;
 @property (weak, nonatomic) IBOutlet TerminalView *termView;
@@ -580,6 +581,7 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     [self _installTerminalSwitcherButton];
     [self _installSaveSessionButton];
     [self _installCenterKeys];
+    [self _installSnippetsGesture];
     [self _installFindBar];
 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
@@ -1401,6 +1403,52 @@ static const NSTimeInterval kSaveProgressDelay = 0.4;
     button.keyAppearance = UIKeyboardAppearanceLight; // setter applies background/tint/title color
     [button addTarget:self action:action forControlEvents:UIControlEventPrimaryActionTriggered];
     return button;
+}
+
+// Finds a bar button by what it DOES. The storyboard wires these actions
+// straight to the terminal view, so there is no outlet to hold, and matching on
+// a title or an accessibility label would break the first time either is
+// localised.
+static UIButton *ISHBarButtonWithAction(UIView *root, SEL action) {
+    NSString *name = NSStringFromSelector(action);
+    for (UIView *view in root.subviews) {
+        if ([view isKindOfClass:UIButton.class]) {
+            UIButton *button = (UIButton *)view;
+            NSMutableSet *targets = [button.allTargets mutableCopy];
+            [targets addObject:NSNull.null];   // covers a nil-targeted action
+            for (id target in targets) {
+                id resolved = target == NSNull.null ? nil : target;
+                NSArray<NSString *> *actions =
+                    [button actionsForTarget:resolved forControlEvent:UIControlEventPrimaryActionTriggered];
+                if ([actions containsObject:name])
+                    return button;
+            }
+        }
+        UIButton *nested = ISHBarButtonWithAction(view, action);
+        if (nested != nil)
+            return nested;
+    }
+    return nil;
+}
+
+// Snippets hang off the Paste key instead of taking a bar button of their own.
+// The bar is already full -- eight controls plus up to six centre keys, two of
+// which vanish on an iPhone in portrait for want of room -- and a snippet IS a
+// saved paste, so the key that pastes is where somebody would go looking. Cmd-J
+// is the same thing for a hardware keyboard.
+- (void)_installSnippetsGesture {
+    UIButton *pasteKey = ISHBarButtonWithAction(self.barView ?: self.bar, @selector(paste:));
+    if (pasteKey == nil)
+        return;
+    UILongPressGestureRecognizer *longPress =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(_pasteKeyLongPressed:)];
+    [pasteKey addGestureRecognizer:longPress];
+    pasteKey.accessibilityHint = @"Double tap and hold for snippets";
+}
+
+- (void)_pasteKeyLongPressed:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan)
+        [self showSnippets:gesture];
 }
 
 // Up to six extra keys centered on the accessory bar -- characters a shell user
@@ -2384,6 +2432,32 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
                                                          delegate:self];
 }
 
+- (IBAction)showSnippets:(id)sender {
+    // Gives up the keyboard for the same reason -showFileBrowser: does: the bar
+    // is the terminal's inputAccessoryView, and an accessory view floats ABOVE
+    // a presented sheet, so keeping focus would lay the bar over the sheet's
+    // own toolbar. Focus comes back in -snippetsDidDismiss:.
+    [self.termView resignFirstResponder];
+    [ISHSnippetsViewController presentFromViewController:self delegate:self];
+}
+
+#pragma mark ISHSnippetsDelegate
+
+- (void)snippets:(ISHSnippetsViewController *)snippets insertText:(NSString *)text execute:(BOOL)execute {
+    // Delivered as a PASTE rather than as typing, which is the whole reason a
+    // multi-line snippet is usable at all: without the bracketed wrapper every
+    // newline in it runs whatever came before it the moment it lands, so
+    // "insert, do not run" would be a promise the sheet could not keep.
+    NSString *sequence = ISHPasteSequence(text, self.terminal.bracketedPasteEnabled, execute);
+    NSData *input = [sequence dataUsingEncoding:NSUTF8StringEncoding];
+    if (input != nil)
+        [self.terminal sendInput:input];
+}
+
+- (void)snippetsDidDismiss:(ISHSnippetsViewController *)snippets {
+    [self focusTerminal];
+}
+
 #pragma mark ISHShellFileBrowserDelegate
 
 - (void)shellFileBrowser:(ISHShellFileBrowserViewController *)browser insertText:(NSString *)text {
@@ -2690,6 +2764,11 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
                              modifierFlags:UIKeyModifierCommand
                                     action:@selector(showFileBrowser:)
                       discoverabilityTitle:@"Browse Files"]];
+        [commands addObject:
+         [UIKeyCommand keyCommandWithInput:@"j"
+                             modifierFlags:UIKeyModifierCommand
+                                    action:@selector(showSnippets:)
+                      discoverabilityTitle:@"Snippets"]];
         [commands addObject:
          [UIKeyCommand keyCommandWithInput:@"g"
                              modifierFlags:UIKeyModifierCommand

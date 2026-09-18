@@ -130,6 +130,14 @@ extern NSString *const kThemeBackgroundColor;
 // the single source of truth for every request the client actually makes --
 // these two only describe the saved set to pick from.
 @property (nonatomic) NSArray<NSDictionary<NSString *, NSString *> *> *llmDestinations;
+// Saved command-line snippets for the terminal's snippet sheet: an array of
+// {id, name, text, run} dictionaries, keyed by the constants in Snippets.h.
+@property (nonatomic) NSArray<NSDictionary<NSString *, id> *> *snippets;
+// SHA-256, hex, of the snippet JSON as it was last written to or read from the
+// guest-visible mirror. This is what makes "the guest file changed underneath
+// us" an answerable question rather than a guess -- see +[ISHSnippetStore
+// syncWithGuest:].
+@property (nonatomic) NSString *snippetsSyncedDigest;
 @property (nonatomic) NSString *llmActiveDestinationID;
 @property BOOL llmToolsEnabled;
 @property NSInteger llmToolTimeoutSeconds;

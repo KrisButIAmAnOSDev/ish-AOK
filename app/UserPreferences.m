@@ -43,6 +43,8 @@ static NSString *const kPreferenceLLMServerURLKey = @"LLM Server URL";
 static NSString *const kPreferenceLLMModelKey = @"LLM Model";
 static NSString *const kPreferenceLLMAPIKeyKey = @"LLM API Key";
 static NSString *const kPreferenceLLMDestinationsKey = @"LLM Destinations";
+static NSString *const kPreferenceSnippetsKey = @"Snippets";
+static NSString *const kPreferenceSnippetsSyncedDigestKey = @"Snippets Synced Digest";
 static NSString *const kPreferenceLLMActiveDestinationKey = @"LLM Active Destination";
 static NSString *const kPreferenceLLMToolsEnabledKey = @"LLM Tools Enabled";
 static NSString *const kPreferenceLLMToolTimeoutSecondsKey = @"LLM Tool Timeout Seconds";
@@ -259,6 +261,8 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceLLMModelKey: @"openrouter/free",
             kPreferenceLLMAPIKeyKey: @"",
             kPreferenceLLMDestinationsKey: @[],
+            kPreferenceSnippetsKey: @[],
+            kPreferenceSnippetsSyncedDigestKey: @"",
             kPreferenceLLMActiveDestinationKey: @"",
             kPreferenceLLMToolsEnabledKey: @(NO),
             kPreferenceLLMToolTimeoutSecondsKey: @(30),
@@ -409,6 +413,8 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceLLMModelKey: property(llmModel),
             kPreferenceLLMAPIKeyKey: property(llmAPIKey),
             kPreferenceLLMDestinationsKey: property(llmDestinations),
+            kPreferenceSnippetsKey: property(snippets),
+            kPreferenceSnippetsSyncedDigestKey: property(snippetsSyncedDigest),
             kPreferenceLLMActiveDestinationKey: property(llmActiveDestinationID),
             kPreferenceLLMToolsEnabledKey: property(llmToolsEnabled),
             kPreferenceLLMToolTimeoutSecondsKey: property(llmToolTimeoutSeconds),
@@ -760,6 +766,30 @@ void amd64_jit_preference_set(bool enabled) {
 
 - (void)setLlmDestinations:(NSArray<NSDictionary<NSString *, NSString *> *> *)llmDestinations {
     [_defaults setObject:llmDestinations ?: @[] forKey:kPreferenceLLMDestinationsKey];
+}
+
+// MARK: snippets
+// Same shape as llmDestinations and the same reason for staying out of
+// friendlyPreferenceMapping: an array of dictionaries has no sensible string
+// form for the guest-side `defaults` tool. Snippets do not need one -- the
+// guest edits them through the JSON mirror instead, which is a better fit for
+// multi-line text than a preference string could ever be.
+- (NSArray<NSDictionary<NSString *, id> *> *)snippets {
+    NSArray *stored = [_defaults arrayForKey:kPreferenceSnippetsKey];
+    return [stored isKindOfClass:NSArray.class] ? stored : @[];
+}
+
+- (void)setSnippets:(NSArray<NSDictionary<NSString *, id> *> *)snippets {
+    [_defaults setObject:snippets ?: @[] forKey:kPreferenceSnippetsKey];
+}
+
+// MARK: snippetsSyncedDigest
+- (NSString *)snippetsSyncedDigest {
+    return [_defaults stringForKey:kPreferenceSnippetsSyncedDigestKey] ?: @"";
+}
+
+- (void)setSnippetsSyncedDigest:(NSString *)snippetsSyncedDigest {
+    [_defaults setObject:snippetsSyncedDigest ?: @"" forKey:kPreferenceSnippetsSyncedDigestKey];
 }
 
 // MARK: llmActiveDestinationID
