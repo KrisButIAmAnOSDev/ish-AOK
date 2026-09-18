@@ -630,6 +630,17 @@ src_for() {
 # still helps across repeated local runs. ISH_AOK_REGRESS_CACHE overrides it,
 # and ISH_AOK_REGRESS_NOCACHE=1 turns the whole thing off.
 cache_dir=
+# A second cache directory that we may only be able to READ. The shared cache
+# under /AOK/fakefs is created by whichever run gets there first, and a root run
+# leaves it 0755 root-owned -- after which an unprivileged run (every device run
+# over ssh, since sshd logs you in as a user) could not write a probe file into
+# it, disqualified the whole directory, and fell back to one beside the work
+# dir. That fallback lives under /tmp, which the app clears on restart, so the
+# effect on a device was: 229 perfectly good cached binaries sitting right there
+# unusable, every test recompiled from scratch, and the new cache written
+# somewhere that would not survive the next launch. Reading a hit needs no write
+# permission at all, so the unwritable directory stays on as a read source.
+cache_ro_dir=
 cache_key_base=
 
 cache_init() {
@@ -654,14 +665,27 @@ cache_init() {
     # back costs a rebuild; not falling back meant an unwritable cache, and
     # before the unlink fix it meant the whole suite dying at the first miss.
     if ! (: >"$cache_dir/.probe") 2>/dev/null; then
+        # Try to make it shared before giving up on writing to it: 1777, so any
+        # uid can add an entry and the sticky bit still stops one run deleting
+        # another's. This succeeds for the owner (and for root), which means the
+        # next unprivileged run finds it usable rather than repeating this.
+        chmod 1777 "$cache_dir" 2>/dev/null
+    fi
+    if ! (: >"$cache_dir/.probe") 2>/dev/null; then
+        # Still not ours to write. Keep it as a READ source -- serving a hit is
+        # a copy out of it and needs no write permission -- and put new entries
+        # beside the work dir.
+        cache_ro_dir=$cache_dir
         cache_dir=$work_dir/../ish-aok-regress-cache
         if ! mkdir -p "$cache_dir" 2>/dev/null ||
                 ! (: >"$cache_dir/.probe") 2>/dev/null; then
             cache_dir=
-            return
         fi
     fi
-    rm -f "$cache_dir/.probe" 2>/dev/null
+    if [ -z "$cache_dir" ] && [ -z "$cache_ro_dir" ]; then
+        return
+    fi
+    [ -n "$cache_dir" ] && rm -f "$cache_dir/.probe" 2>/dev/null
     # Everything shared by every test: the headers they all include, the
     # compiler, and the machine. Folded in once so the per-test key is one hash.
     cache_key_base=$(
@@ -671,7 +695,9 @@ cache_init() {
             cat "$src_dir"/test_common.h "$src_dir"/x86/atomic_common.h 2>/dev/null
         } | sha256sum | cut -c1-32
     )
-    echo "test cache: $cache_dir (key $cache_key_base)"
+    echo "test cache: ${cache_dir:-<read-only>} (key $cache_key_base)"
+    [ -n "$cache_ro_dir" ] &&
+        echo "test cache: reading hits from $cache_ro_dir (not writable by $(id -un))"
 }
 
 # Echo the cache path for a test, or nothing when caching is off.
@@ -682,9 +708,11 @@ cache_path_for() {
     # right after "+ build <first test>" -- which is every unprivileged run
     # after a root one, since the cache a root run creates is not theirs to
     # write.
-    [ -n "$cache_dir" ] || return 0
+    [ -n "$cache_dir" ] || [ -n "$cache_ro_dir" ] || return 0
     _h=$(sha256sum "$2" | cut -c1-32)
-    echo "$cache_dir/$1.$cache_key_base.$_h"
+    # The WRITE path. cache_try also looks the same basename up in
+    # $cache_ro_dir, and cache_store is a no-op when there is nowhere to write.
+    echo "${cache_dir:-$cache_ro_dir}/$1.$cache_key_base.$_h"
 }
 
 # Serve $1 from the cache entry at $2 if there is one. Returns 0 on a hit (the
@@ -693,8 +721,15 @@ cache_path_for() {
 # build_one, still gets the cache.
 cache_try() {
     _name=$1
-    [ -n "$2" ] && [ -x "$2" ] || return 1
-    cp "$2" "$work_dir/bin/$_name" 2>/dev/null || return 1
+    [ -n "$2" ] || return 1
+    _entry=$2
+    # A hit in the shared cache we may not be able to write to still counts:
+    # serving it is a copy OUT, which needs no write permission.
+    if [ ! -x "$_entry" ] && [ -n "$cache_ro_dir" ]; then
+        _entry=$cache_ro_dir/${2##*/}
+    fi
+    [ -x "$_entry" ] || return 1
+    cp "$_entry" "$work_dir/bin/$_name" 2>/dev/null || return 1
     chmod +x "$work_dir/bin/$_name" 2>/dev/null
     echo "  (cached)"
     return 0
@@ -735,6 +770,7 @@ build_one() {
 # once is routine) never sees a half-copied binary and treats it as a hit.
 cache_store() {
     [ -n "$1" ] || return 0
+    [ -n "$cache_dir" ] || return 0   # read-only cache: nothing to publish into
     _tmp=$1.tmp.$$
     if cp "$2" "$_tmp" 2>/dev/null; then
         chmod +x "$_tmp" 2>/dev/null
