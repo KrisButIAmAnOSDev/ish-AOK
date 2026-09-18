@@ -28,6 +28,28 @@ int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(120));
 
+    // This test's whole verdict is "the child DIED of SIGHUP", which depends on
+    // SIGHUP still having its default action. An ignored disposition is
+    // inherited across fork and exec, so anything that starts the suite under
+    // `nohup` -- whose entire job is to set SIGHUP to SIG_IGN -- hands that
+    // ignore to the child, the hangup is delivered exactly as it should be, the
+    // child shrugs and lives, and this test reports "no SIGHUP was sent".
+    //
+    // That is a lie about the kernel, and an expensive one: it cost most of an
+    // afternoon of the 555 device leg, where the launcher used `setsid nohup`
+    // and the failure was blamed on tty_hangup, on pty reuse, on process-group
+    // bookkeeping and on a debugger, in that order. `setsid` alone is what
+    // detaches a run; nohup was never needed.
+    //
+    // So check the precondition rather than assume it, and say which it is.
+    struct sigaction hup_was;
+    if (sigaction(SIGHUP, NULL, &hup_was) == 0 && hup_was.sa_handler == SIG_IGN) {
+        printf("tty_hangup_signal: SKIP (SIGHUP is ignored in this process -- "
+               "started under nohup? an inherited SIG_IGN makes the child "
+               "survive a hangup that WAS delivered)\n");
+        return 0;
+    }
+
     int master, slave;
     if (openpty(&master, &slave, NULL, NULL, NULL) < 0) {
         printf("tty_hangup_signal: SKIP (openpty: %s)\n", strerror(errno));
