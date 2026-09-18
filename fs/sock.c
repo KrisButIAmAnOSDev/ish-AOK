@@ -597,7 +597,19 @@ static uint32_t netlink_linux_if_flags(unsigned host_flags) {
         // upstream servers and UDP path never even get tried), which turned
         // all hostname resolution off for the whole Arch guest via
         // nsswitch's "resolve [!UNAVAIL=return]" hard stop.
-        linux_flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+        //
+        // Only when the link is administratively UP, though. Darwin sets
+        // IFF_RUNNING on a utun device that is not IFF_UP, and carrier without
+        // "up" is not a state Linux produces: every interface on a Linux 6.12
+        // box reports UP and LOWER_UP together, never one without the other.
+        // wicked rejects the combination outright -- "utun5: unexpected
+        // combination of interface flags 0x10040", once per link per scan, in
+        // an openSUSE guest. A link left with no flags by this falls through
+        // to the IFF_NOARP default below, which is what Linux reports for its
+        // own flagless device (sit0), so it stays a link systemd-networkd will
+        // accept.
+        if (host_flags & IFF_UP)
+            linux_flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
     }
 #ifdef IFF_NOARP
     if (host_flags & IFF_NOARP)
