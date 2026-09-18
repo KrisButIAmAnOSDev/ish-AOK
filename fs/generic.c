@@ -886,12 +886,17 @@ int generic_accessat(struct fd *dirfd, const char *path_raw, int mode) {
 
 int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw) {
     char src[MAX_PATH];
-    // Only the destination: link("dir/.", new) is a different error entirely.
-    if (path_final_dot(dst_raw))
-        return _EEXIST;
     int err = path_normalize(src_at, src_raw, src, N_SYMLINK_NOFOLLOW);
     if (err < 0)
         return err;
+    // Only the destination: link("dir/.", new) is a different error entirely.
+    // After the SOURCE lookup (do_linkat() resolves it before it calls
+    // filename_create at all) and after the destination's own parent walk,
+    // never before either -- see path_parent_walk().
+    if (path_final_dot(dst_raw) != 0) {
+        int walk = path_parent_walk(dst_at, dst_raw);
+        return walk < 0 ? walk : _EEXIST;
+    }
     char dst[MAX_PATH];
     err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
@@ -981,9 +986,12 @@ static int sticky_check(struct mount *mount, const char *path, struct statbuf *e
 
 int generic_unlinkat(struct fd *at, const char *path_raw) {
     // Linux: unlink(".") is EISDIR, not a permission failure. Same ordering
-    // point as the create family; see path_final_dot().
-    if (path_final_dot(path_raw))
-        return _EISDIR;
+    // point as the create family -- after the parent walk (path_parent_walk),
+    // before the parent's permissions.
+    if (path_final_dot(path_raw) != 0) {
+        int walk = path_parent_walk(at, path_raw);
+        return walk < 0 ? walk : _EISDIR;
+    }
     char path[MAX_PATH];
     int err = path_normalize(at, path_raw, path,
             N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
@@ -1039,9 +1047,18 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
 
 int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw, int flags) {
     // Linux answers EBUSY when either operand ends in "." or "..", rather than
-    // the create family's EEXIST. Same ordering point; see path_final_dot().
-    if (path_final_dot(src_raw) || path_final_dot(dst_raw))
-        return _EBUSY;
+    // the create family's EEXIST. Same ordering point: do_renameat2() runs
+    // filename_parentat() on BOTH operands before it looks at either one's
+    // last_type, so a dotty operand whose parent cannot be walked reports the
+    // walk's error. Source first, then destination, which is Linux's order.
+    if (path_final_dot(src_raw) != 0 || path_final_dot(dst_raw) != 0) {
+        // BOTH parents, even the operand that is not the dotty one: measured,
+        // rename("dir/.", "missing/x") is ENOENT and not EBUSY.
+        int walk = path_parent_walk(src_at, src_raw);
+        if (walk >= 0)
+            walk = path_parent_walk(dst_at, dst_raw);
+        return walk < 0 ? walk : _EBUSY;
+    }
     // RENAME_NOREPLACE is implemented; RENAME_EXCHANGE/WHITEOUT and any unknown
     // flag are rejected with EINVAL (Linux's response for unsupported flags).
     if (flags & ~RENAME_NOREPLACE_)
@@ -1126,9 +1143,12 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     // A final "." or ".." names no creatable entry; Linux reports this from
     // filename_create() before touching the parent's permissions. Doing it the
     // other way round gave a normal user EACCES where root got EEXIST -- see
-    // path_final_dot().
-    if (path_final_dot(link_raw))
-        return _EEXIST;
+    // path_final_dot(). It comes after the parent walk, though, which is what
+    // path_parent_walk() is for.
+    if (path_final_dot(link_raw) != 0) {
+        int walk = path_parent_walk(at, link_raw);
+        return walk < 0 ? walk : _EEXIST;
+    }
     int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR);
     if (err < 0)
         return err;
@@ -1162,8 +1182,11 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
 int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ dev) {
     if (S_ISDIR(mode) || S_ISLNK(mode))
         return _EINVAL;
-    if (path_final_dot(path_raw))
-        return _EEXIST;
+    // After the parent walk, before anything else; see path_parent_walk().
+    if (path_final_dot(path_raw) != 0) {
+        int walk = path_parent_walk(at, path_raw);
+        return walk < 0 ? walk : _EEXIST;
+    }
     if (!superuser() && (S_ISBLK(mode) || S_ISCHR(mode)))
         return _EPERM;
 
@@ -1272,8 +1295,11 @@ ssize_t generic_readlinkat(struct fd *at, const char *path_raw, char *buf, size_
 
 int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     char path[MAX_PATH];
-    if (path_final_dot(path_raw))
-        return _EEXIST;
+    // After the parent walk, before anything else; see path_parent_walk().
+    if (path_final_dot(path_raw) != 0) {
+        int walk = path_parent_walk(at, path_raw);
+        return walk < 0 ? walk : _EEXIST;
+    }
     // The final component is the name being created and is never followed, so
     // mkdir over an existing (even dangling) symlink reports EEXIST like Linux.
     int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
@@ -1323,12 +1349,16 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
 int generic_rmdirat(struct fd *at, const char *path_raw) {
     char path[MAX_PATH];
     // Linux: rmdir(".") is EINVAL and rmdir("..") is ENOTEMPTY. Both are
-    // decided before the parent's permissions, same as the create family.
+    // decided before the parent's permissions and after the parent walk, same
+    // as the create family -- do_rmdir() reaches its last_type switch only
+    // once filename_parentat() has returned. See path_parent_walk().
     int dot = path_final_dot(path_raw);
-    if (dot == 1)
-        return _EINVAL;
-    if (dot == 2)
-        return _ENOTEMPTY;
+    if (dot != 0) {
+        int walk = path_parent_walk(at, path_raw);
+        if (walk < 0)
+            return walk;
+        return dot == 1 ? _EINVAL : _ENOTEMPTY;
+    }
     // rmdir does not follow a final symlink: rmdir("symlink-to-dir") is ENOTDIR.
     int err = path_normalize(at, path_raw, path,
             N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);

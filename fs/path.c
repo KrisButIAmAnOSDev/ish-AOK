@@ -228,6 +228,26 @@ int path_final_dot(const char *path) {
     return 0;
 }
 
+// Walk everything the final component is reached THROUGH, the way Linux's
+// filename_parentat() does, and report only what that walk had to say: 0 if it
+// arrived, else its error (a missing parent's ENOENT, a parent that is a
+// regular file's ENOTDIR, an unsearchable one's EACCES).
+//
+// For a path whose final component is "." or ".." -- the only caller, see
+// path_final_dot() -- normalizing the whole path IS that walk and nothing
+// more: such a component names no entry, and __path_normalize consumes it
+// lexically (skip, or pop the last component) without ever looking it up. The
+// components before it are the parent, and each is checked exactly as Linux
+// checks it: it must exist, be a directory, and be searchable.
+//
+// No N_PARENT_DIR_WRITE and no create flags, deliberately. This is the walk,
+// not the operation: Linux answers the final-"." rule between the two, so the
+// parent's write permission must not be consulted yet.
+int path_parent_walk(struct fd *at, const char *path_raw) {
+    char scratch[MAX_PATH];
+    return path_normalize(at, path_raw, scratch, N_SYMLINK_NOFOLLOW);
+}
+
 // Does the already-normalized path `normalized` name something that exists?
 // An lstat (fs->stat is AT_SYMLINK_NOFOLLOW), so a dangling symlink counts as
 // a name that is there -- which is what a lookup of the final component

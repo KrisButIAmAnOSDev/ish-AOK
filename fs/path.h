@@ -91,6 +91,17 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags);
 // into this directory", so the command worked for root and failed for every
 // normal user.
 int path_final_dot(const char *path);
+
+// The parent walk that has to happen BEFORE path_final_dot's answer is given:
+// Linux's filename_create()/do_unlinkat()/do_rmdir() all run
+// filename_parentat() first and only then look at the final component's type,
+// so a parent that is missing, is a regular file, or cannot be searched
+// reports its own error and this rule reports nothing. AOK answered the rule
+// with nothing resolved at all, which made mknod("gone/.") EEXIST where Linux
+// says ENOENT. Returns 0 if the walk arrived, else the error to report.
+// Only meaningful for a path whose final component is "." or ".."; see the
+// definition in fs/path.c.
+int path_parent_walk(struct fd *at, const char *path_raw);
 bool path_is_normalized(const char *path);
 
 // Helper function for iterating through a normalized path.
