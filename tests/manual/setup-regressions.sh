@@ -669,7 +669,12 @@ cache_init() {
         # uid can add an entry and the sticky bit still stops one run deleting
         # another's. This succeeds for the owner (and for root), which means the
         # next unprivileged run finds it usable rather than repeating this.
-        chmod 1777 "$cache_dir" 2>/dev/null
+        # `|| true` is load-bearing: this chmod fails for anyone who does not
+        # own the directory, it is the last command in this if-block, so the
+        # block's status becomes 1 and `set -e` kills the run -- before a single
+        # line of output. Which is every unprivileged run, i.e. every device
+        # run, i.e. exactly the case this whole branch exists to serve.
+        chmod 1777 "$cache_dir" 2>/dev/null || true
     fi
     if ! (: >"$cache_dir/.probe") 2>/dev/null; then
         # Still not ours to write. Keep it as a READ source -- serving a hit is
@@ -704,7 +709,7 @@ cache_init() {
     # after printing the cache line, with no test built and no error. Which is
     # exactly what it did on all five roots.
     if [ -n "$cache_ro_dir" ]; then
-        echo "test cache: reading hits from $cache_ro_dir (not writable by $(id -un))"
+        echo "test cache: reading hits from $cache_ro_dir (not writable by uid $(id -u))"
     fi
 }
 
