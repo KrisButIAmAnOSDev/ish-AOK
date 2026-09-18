@@ -115,3 +115,30 @@ became 433 MB.
   and process-tree viewers can tell that two descriptors are two ends of one
   pipe; and the write end reports itself write-only rather than read-only.
 - The guest test gate no longer skips anything. Every test it has, it runs.
+
+## Issues you reported, closed in this build
+
+- **[#587](https://github.com/emkey1/ish-AOK/issues/587)** — `reboot` took the
+  app down with it. The guest's init was killed, and a dead init will not adopt
+  children, so there was nothing left to run. It now halts and says so.
+- **[#572](https://github.com/emkey1/ish-AOK/issues/572)** — Gradle could not
+  determine a usable IP. Two separate bugs: `SIOCGIFCONF` ignored a NULL-buffer
+  size query the way OpenJDK asks it, and then the Gradle daemon died at startup
+  because a `MAP_FIXED` commit inside the JVM's large `PROT_NONE` heap
+  reservation faulted on every page.
+- **[#485](https://github.com/emkey1/ish-AOK/issues/485)** — Qt applications
+  such as Falkon could not reach a session bus. The desktop session has its own
+  now.
+- **[#482](https://github.com/emkey1/ish-AOK/issues/482)** and
+  **[#483](https://github.com/emkey1/ish-AOK/issues/483)** — the Wayland desktop
+  is sized from the window showing it, and resizing no longer crashes wayvnc.
+- **[#580](https://github.com/emkey1/ish-AOK/issues/580)** — terminal content
+  kept clear of the iPadOS window controls in windowed mode.
+- **[#579](https://github.com/emkey1/ish-AOK/issues/579)** — a trackpad
+  selection no longer leaves the terminal without keyboard focus.
+
+Still open and worth naming, because it was misfiled rather than fixed:
+**[#575](https://github.com/emkey1/ish-AOK/issues/575)** ("unable to delete
+machines") is a reachability bug, not a missing button — the delete exists on
+the machine's detail screen, but a swipe in the machines list does nothing at
+all. The row action is not in this build.
