@@ -223,6 +223,27 @@ static void check_log_stamp_clock(double up) {
 // to it, in LOCAL time -- which is also how mktime reads it back, so the two
 // cancel and no timezone question arises.
 //
+// ONLY for dmesg's OWN stamp, which is the one at column 0. There are two
+// bracketed stamps on a line here and they are in different zones:
+//
+//   [Fri Sep 18 07:05:39 2026] [Fri Sep 18 14:05:28 2026] iSH-AOK 5.20.66 ...
+//    dmesg -T, LOCAL             kernel/log.c output_line(), UTC
+//
+// AOK stamps every stored line itself, and util-linux treats a leading `[` as
+// its own timestamp only when the next byte is a digit or a space -- so
+// `[Fri ...]` stays in the message text and dmesg prepends its rendering in
+// front of it. Continuation lines of a multi-line record get NO stamp from
+// dmesg, so the first `[...]` on those is the UTC one.
+//
+// Scanning for the first `[...]` on every line therefore mixes local and UTC
+// stamps, and picking the newest of that mixture reads a UTC stamp as local --
+// a record 7 hours in the future on a PDT guest. It passed everywhere it was
+// run because every Mac test root is Etc/UTC, where the two zones coincide;
+// the device is America/Los_Angeles and failed it at once. Take the stamp at
+// column 0 and skip any line that has not got one. See kernel/log.c and
+// fs/mem.c's kmsg_line_time(), which round-trip the UTC stamp with timegm();
+// check_log_stamp_clock() above tests that one directly.
+//
 // Not every guest has a dmesg that can do this: busybox's takes no -T. That is
 // reported rather than silently passed, because a check that never ran looks
 // exactly like one that succeeded. The C-level assertion above covers the same
@@ -245,7 +266,12 @@ static void check_dmesg_ctime(double up) {
         char line[1024], newest[256] = "";
         time_t newest_t = 0;
         while (fgets(line, sizeof(line), p) != NULL) {
-            const char *open_bracket = strchr(line, '[');
+            // Column 0 only: that is dmesg's own rendering, in local time.
+            // A line starting with anything else is a continuation, whose
+            // only bracketed stamp is the message's own UTC one.
+            if (line[0] != '[')
+                continue;
+            const char *open_bracket = line;
             const char *close_bracket = open_bracket != NULL ? strchr(open_bracket, ']') : NULL;
             if (open_bracket == NULL || close_bracket == NULL ||
                     close_bracket - open_bracket > (long) sizeof(newest))
