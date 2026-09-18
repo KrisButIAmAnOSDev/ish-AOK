@@ -12,8 +12,9 @@
  *     parses the file (as a decimal number);
  *   - a second of polling sees many distinct values (Linux: 100 per second;
  *     the assertion only asks for better than whole seconds);
- *   - btime is stable across reads, and btime + uptime lands within a second
- *     of the wall clock, which is what "the machine booted at btime" means;
+ *   - btime is stable across reads, and a realtime reading taken before and
+ *     after a /proc/uptime read brackets it, which is what "the machine booted
+ *     at btime" means;
  *   - sysinfo(2)'s uptime is whole seconds rounded UP (Linux's do_sysinfo adds
  *     one for any fraction), so it is never below /proc/uptime read just
  *     before it, and never more than a second above a reading just after;
@@ -83,6 +84,14 @@ static int uptime_line_is_linux_shaped(const char *raw) {
             return 0;
     }
     return *p == '\0';
+}
+
+// failf's fields are unsigned and printed as hex, so a negative value has to
+// be handed over as its two's complement -- which reads as ffff...N and is
+// unmistakable -- rather than cast from a double, where a negative saturates
+// to zero on arm64 and silently reports "0".
+static uint64_t signed_ms(double seconds) {
+    return (uint64_t) (int64_t) (seconds * 1000.0 + (seconds < 0 ? -0.5 : 0.5));
 }
 
 static long read_btime(void) {
@@ -161,36 +170,85 @@ int main(int argc, char **argv) {
         failf("/proc/uptime's idle time never goes backward", (uint64_t) idle_backward, 0, 0, 0, 0, 0);
 
     // btime: stable, and consistent with the wall clock minus uptime.
+    //
+    // Asserted as a BRACKET, not a tolerance. Realtime is read before AND
+    // after both /proc reads, so every sample either file was built from --
+    // including the two clock reads /proc/stat makes internally to derive
+    // btime -- was taken inside [r0, r1], and the only slack the bounds need
+    // is the quantisation each value really carries plus the MEASURED
+    // duration of the reads. On a correct kernel it then holds however slow
+    // the host is.
+    //
+    // It used to read realtime ONCE, before the /proc/uptime read, and allow
+    // the difference a fixed [-0.05, 1.05]. That -0.05 was not a clock
+    // tolerance at all: it was a budget for how long an open+read of
+    // /proc/uptime takes, and under fakefs lock contention beside a
+    // concurrent build it went straight through it -- the test failed on
+    // 2026-09-17 with a `ninja` running alongside and passed on a quiet
+    // machine, same binary. clock_boot_origin.c was rewritten away from the
+    // same shape; this is the other half of it.
     long btime0 = read_btime();
     if (btime0 <= 0) {
         failf("read btime from /proc/stat", 0, 0, 0, 1, 0, 0);
     } else {
         int changed = 0;
-        double worst = 0;
+        double slack = 1e9;
         for (int i = 0; i < 40; i++) {
+            double r0 = now_realtime();
             long b = read_btime();
             double up;
-            double real = now_realtime();
             if (read_uptime(&up, NULL, 0) != 0)
                 break;
-            if (b != btime0)
+            double r1 = now_realtime();
+            if (b != btime0) {
                 changed++;
-            // real - up is the moment of boot; btime is that moment in whole
-            // seconds, so the difference is in [0, 1), plus read skew.
-            double off = real - up - (double) b;
-            if (off < 0 ? -off > worst : off > worst)
-                worst = off;
-            if (off < -0.05 || off > 1.05) {
-                test_log_if(1, "  btime %ld, realtime %.3f, uptime %.2f: offset %.3f\n",
-                            b, real, up, off);
-                failf("btime + uptime matches the wall clock (ms)",
-                      (uint64_t) (off * 1000), 0, 0, 0, 0, 0);
+                test_log_if(changed <= 3, "  btime changed: %ld -> %ld\n", btime0, b);
+            }
+            // Where the machine booted, in wall-clock seconds:
+            //
+            //   the uptime was sampled somewhere in [r0, r1] and /proc/uptime
+            //   truncates to hundredths, so boot is in (r0 - up - 0.01, r1 - up];
+            //   the kernel truncates its own uptime to a 10 ms tick before
+            //   subtracting, which can only put ITS boot instant later;
+            //   btime is that instant in WHOLE seconds, so it can sit up to a
+            //   second lower and never higher;
+            //   and the kernel's two reads are somewhere in the same [r0, r1],
+            //   so they can be d = r1 - r0 apart either way.
+            //
+            // d is measured, not assumed: a slow read widens the window by
+            // exactly what the read cost and by nothing else.
+            double d = r1 - r0;
+            double lo = r0 - up - 0.01 - 1.0 - d;
+            double hi = r1 - up + 0.01 + d;
+            double margin = (double) b - lo < hi - (double) b ? (double) b - lo : hi - (double) b;
+            if (margin < slack)
+                slack = margin;
+            if ((double) b < lo || (double) b > hi) {
+                test_log_if(1, "  btime %ld is outside [%.3f, %.3f]: realtime %.3f..%.3f "
+                               "(%.3f s), uptime %.2f\n",
+                            b, lo, hi, r0, r1, d, up);
+                // Both edges, in signed milliseconds: room below btime, room
+                // above it, and the measured read duration that sets the
+                // width. Exactly one of the first two is negative, which says
+                // which bound was missed. The old line reported
+                // (uint64_t) (off * 1000) of a NEGATIVE double, which
+                // saturates to 0 on arm64 -- the failure printed
+                // got=0000000000000000 and said nothing at all.
+                failf("btime is the wall clock minus uptime (ms below, ms above, ms read)",
+                      signed_ms((double) b - lo), signed_ms(hi - (double) b),
+                      signed_ms(d), 0, 0, 0);
                 break;
             }
             usleep(25000);
         }
-        test_logf("btime %ld, changed in %d of 40 reads, worst offset %.3f\n",
-                  btime0, changed, worst);
+        test_logf("btime %ld, changed in %d of 40 reads, tightest margin %.3f s\n",
+                  btime0, changed, slack);
+        // btime is a constant: the machine booted when it booted. It is not
+        // read from anywhere, though -- /proc/stat derives it every time from
+        // realtime minus uptime -- so it is stable only if that subtraction
+        // has room between the gap in its two reads and the next second
+        // boundary. Losing uptime's sub-second part left it none, and this
+        // caught it: 1 of 40 reads differed under load.
         if (changed != 0)
             failf("btime is stable", (uint64_t) changed, 0, 0, 0, 0, 0);
     }

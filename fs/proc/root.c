@@ -327,7 +327,26 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
 #endif
     proc_printf(buf, "ctxt %"PRIu64"\n", ctxt);
     struct uptime_info btime = get_uptime();
-    struct timespec uptime_ts = {.tv_sec = btime.uptime_ticks / 100, .tv_nsec = btime.uptime_ticks % 100};
+    // uptime_ticks counts USER_HZ ticks, so the remainder of the division is
+    // CENTISECONDS -- it was stored straight into tv_nsec, a field 10 million
+    // times finer, which threw uptime's whole sub-second part away and left
+    // the subtraction below working with floor(uptime) instead of uptime.
+    //
+    // The btime it printed was right anyway, because
+    // guest_clock_place_origins puts the guest's uptime zero on a whole
+    // second: the dropped fraction moved the computed boot instant forward by
+    // less than a second, and the truncation to tv_sec took it straight back
+    // off. But that left NO room. The realtime read below happens after the
+    // uptime read, so any stall between them adds to the same fraction, and
+    // whenever the fraction was near a full second a stall of a few tens of
+    // milliseconds carried the floor onto the NEXT second -- btime changed
+    // between two reads taken a moment apart. Carrying the real fraction
+    // leaves the gap a whole second of room instead of whatever happens to
+    // be left of the current one. (proc_uptime_clock asserts both halves.)
+    struct timespec uptime_ts = {
+        .tv_sec = (time_t) (btime.uptime_ticks / 100),
+        .tv_nsec = (long) (btime.uptime_ticks % 100) * 10000000L,   // a tick is 10 ms
+    };
     struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), uptime_ts);
     proc_printf(buf, "btime %ld\n", boot_time.tv_sec);
     // Cumulative, not the live count: Linux's "processes" is the number of
