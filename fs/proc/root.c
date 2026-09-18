@@ -1271,6 +1271,9 @@ enum sysfs_node_kind {
     sysfs_mains_uevent,
     sysfs_mains_type,
     sysfs_mains_online,
+    sysfs_class_tty,
+    sysfs_tty_tty0,
+    sysfs_tty0_active,
 };
 
 // A node is identified by (kind, cpu, index). cpu is -1 except under cpuN/,
@@ -1474,6 +1477,16 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_mains_uevent, sysfs_power_mains, "uevent", SYSFS_REG},
     {sysfs_mains_type, sysfs_power_mains, "type", SYSFS_REG},
     {sysfs_mains_online, sysfs_power_mains, "online", SYSFS_REG},
+
+    // /sys/class/tty/tty0/active: the virtual console currently in the
+    // foreground. systemd checks for it by name and says so when it is
+    // missing -- "System has /dev/tty0 but not /sys/class/tty/tty0/active
+    // which is broken, ignoring: No such file or directory" -- before falling
+    // back to guessing which console to put a getty on. AOK has one console,
+    // the one /proc/consoles and the synthesized console= already name.
+    {sysfs_class_tty, sysfs_class, "tty", SYSFS_DIR},
+    {sysfs_tty_tty0, sysfs_class_tty, "tty0", SYSFS_DIR},
+    {sysfs_tty0_active, sysfs_tty_tty0, "active", SYSFS_REG},
 };
 
 #undef SYSFS_DIR
@@ -1870,6 +1883,14 @@ static size_t sysfs_file_data(struct sysfs_node node, char *buf, size_t bufsize)
             return snprintf(buf, bufsize, "1\n");
         case sysfs_cpu_uevent:
             return snprintf(buf, bufsize, "DRIVER=processor\n");
+
+        // Always a tty name: this file names a VIRTUAL CONSOLE, and tty1 is
+        // the one AOK presents even when the console itself was redirected to
+        // a pts (the CLI), where Linux would have no tty0 to ask about.
+        case sysfs_tty0_active:
+            if (console_major == TTY_CONSOLE_MAJOR)
+                return snprintf(buf, bufsize, "tty%d\n", console_minor);
+            return snprintf(buf, bufsize, "tty1\n");
 
         case sysfs_topo_physical_package_id:
         case sysfs_topo_cluster_id:
