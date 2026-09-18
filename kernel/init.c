@@ -200,7 +200,18 @@ struct rlimit_ init_rlimits[16] = {
     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_NPROC_]      = {1024, 1024},
     [RLIMIT_NOFILE_]     = {1024, 4096},
-    [RLIMIT_MEMLOCK_]    = {64*1024, 64*1024},
+    // 8 MiB, both limits, which is what an unprivileged process gets on a
+    // real Linux: verified on the Debian 13 oracle (kernel 6.12), where
+    // /proc/self/limits reads "Max locked memory 8388608 8388608" for an
+    // ordinary user. This was 64*1024 -- the historical kernel default, which
+    // no distro has shipped in years, since systemd sets DefaultLimitMEMLOCK=8M.
+    //
+    // It survived because the CLI harness runs as uid 0 and root ignores
+    // RLIMIT_MEMLOCK entirely, so every Mac run of the suite passed. The device
+    // leg runs over sshd as an ordinary user and mmap_lazy_split_commit failed
+    // three mlock assertions with ENOMEM -- the test is careful to stay inside
+    // 8 MiB precisely so it can run unprivileged, and it was right.
+    [RLIMIT_MEMLOCK_]    = {8*1024*1024, 8*1024*1024},
     [RLIMIT_AS_]         = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_LOCKS_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_SIGPENDING_] = {1024, 1024},
