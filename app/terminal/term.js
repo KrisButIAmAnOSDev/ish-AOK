@@ -336,6 +336,38 @@ hterm.FindBar.prototype.updateCounterLabel_ = function() {
 
 hterm.openUrl = (url) => native.openLink(url);
 
+// Bracketed paste (DECSET 2004) reaches the guest through NATIVE, not through
+// hterm: Cmd-V, the Paste bar button and the snippet sheet all write bytes
+// straight to the tty, so hterm's own onPasteData_ -- the thing that knows
+// about the mode and wraps the payload in \e[200~ ... \e[201~ -- never runs
+// for any of them. Without that wrapper a multi-line paste arrives as a run of
+// typed lines and the shell executes each one as it lands, and an editor with
+// the mode on cannot tell a paste from typing. hterm still PARSES the mode, so
+// publish its state and let native do the wrapping.
+//
+// reset() and softReset() replace options_ wholesale instead of going through
+// setBracketedPaste, so a `reset` that clears the mode has to be caught here
+// too, or the native flag stays stuck on with nothing to turn it off.
+function syncBracketedPaste() {
+    native.propUpdate('bracketedPasteEnabled', !!term.options_.bracketedPaste);
+}
+const realSetBracketedPaste = hterm.Terminal.prototype.setBracketedPaste;
+hterm.Terminal.prototype.setBracketedPaste = function(state) {
+    realSetBracketedPaste.call(this, state);
+    if (this === term)
+        syncBracketedPaste();
+};
+for (const resetName of ['reset', 'softReset']) {
+    const realReset = hterm.Terminal.prototype[resetName];
+    hterm.Terminal.prototype[resetName] = function(...args) {
+        const result = realReset.apply(this, args);
+        if (this === term)
+            syncBracketedPaste();
+        return result;
+    };
+}
+
+
 native.load();
 native.syncFocus();
 

@@ -616,9 +616,16 @@ static const NSTimeInterval kPendingInputTimeout = 0.075;
 
 - (void)paste:(id)sender {
     NSString *string = UIPasteboard.generalPasteboard.string;
-    if (string) {
-        [self insertText:string];
-    }
+    if (string == nil)
+        return;
+    // Deliberately not -insertText:, which is the TYPING path. A guest that
+    // asked for bracketed paste is asking to be able to tell a paste from
+    // typing, and it only can if the payload arrives wrapped -- otherwise a
+    // multi-line clipboard runs as a sequence of commands the moment it lands.
+    // -insertRawText: keeps the input-slot ordering that the Cmd-V keypress has
+    // already reserved, which is why the bytes still go out through the view
+    // rather than straight to the terminal.
+    [self insertRawText:ISHPasteSequence(string, self.terminal.bracketedPasteEnabled, NO)];
 }
 
 - (void)copy:(id)sender {

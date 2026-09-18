@@ -680,6 +680,36 @@ struct tty *ISHOpenTerminalForRestoredSession(void) {
 }
 
 
+// The control characters xterm and hterm strip out of a bracketed paste:
+// everything below 0x20 except backspace, tab, newline and carriage return.
+// ESC falls inside that range, which is what stops a payload from closing its
+// own bracket.
+static NSCharacterSet *ISHPasteForbiddenCharacters(void) {
+    static NSCharacterSet *forbidden;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *set = [NSMutableCharacterSet new];
+        [set addCharactersInRange:NSMakeRange(0x00, 0x08)];  // NUL .. BEL
+        [set addCharactersInRange:NSMakeRange(0x0b, 0x02)];  // VT, FF
+        [set addCharactersInRange:NSMakeRange(0x0e, 0x12)];  // SO .. US (incl. ESC)
+        forbidden = [set copy];
+    });
+    return forbidden;
+}
+
+NSString *ISHPasteSequence(NSString *text, BOOL bracketed, BOOL execute) {
+    NSString *body = [text ?: @"" stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
+    if (bracketed) {
+        NSCharacterSet *forbidden = ISHPasteForbiddenCharacters();
+        if ([body rangeOfCharacterFromSet:forbidden].location != NSNotFound)
+            body = [[body componentsSeparatedByCharactersInSet:forbidden] componentsJoinedByString:@""];
+        body = [NSString stringWithFormat:@"\x1b[200~%@\x1b[201~", body];
+    }
+    if (execute)
+        body = [body stringByAppendingString:@"\r"];
+    return body;
+}
+
 - (void)sendInput:(NSData *)input {
     tty_t tty;
     @synchronized (self) {
