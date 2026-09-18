@@ -22,13 +22,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>This is required for connecting to localhost and using the ping command.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_ssh._tcp</string>
-		<string>_http._tcp</string>
-	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<!-- NSAllowsLocalNetworking must NOT be added back beside this.
@@ -39,18 +32,15 @@
 		     networking and the exception domains below", which is how plain
 		     HTTP to a public host came to fail in the app while HTTPS and
 		     localhost worked. Arbitrary loads is strictly the broader of the
-		     two, so nothing is lost by letting it apply. -->
+		     two, so nothing is lost by letting it apply.
+
+		     Xcode rewrites this file alphabetically when it edits it, and it
+		     drops XML comments when it does -- this one was lost that way
+		     once already. If it goes missing again, put it back. -->
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>localhost</key>
-			<dict>
-				<key>NSExceptionAllowsInsecureHTTPLoads</key>
-				<true/>
-				<key>NSIncludesSubdomains</key>
-				<true/>
-			</dict>
 			<key>127.0.0.1</key>
 			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
@@ -61,8 +51,22 @@
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<true/>
 			</dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
 		</dict>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ssh._tcp</string>
+		<string>_http._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This is required for connecting to localhost and using the ping command.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>Programs running in iSH will be allowed to track your location in the background.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
