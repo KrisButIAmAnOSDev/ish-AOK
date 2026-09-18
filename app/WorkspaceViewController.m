@@ -5919,16 +5919,18 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
     ISHWorkspaceContainedWindowView *windowView =
         [self terminalWindowForMenuSourceView:sourceView] ?: [self frontmostDesktopTerminalWindow];
     TerminalViewController *terminalViewController = windowView.hostedTerminalViewController;
-    if (terminalViewController == nil) {
-        // Nothing to insert into. A toast rather than an alert: the user asked
-        // for a list of commands, not for a dialog to dismiss.
-        [self showDesktopToastWithText:@"  Open a terminal window first  " holdFor:2.5];
-        return;
+    // Open the library either way. A desktop with no terminal window on it --
+    // every window an applet, or the terminals living inside a guest desktop in
+    // the Wayland applet -- still has snippets worth reading and editing, and
+    // the first version of this refused with a toast, which from the other side
+    // of the screen is a menu item that does nothing. With no terminal the sheet
+    // says so in its prompt and a tap opens the snippet instead of inserting it.
+    if (terminalViewController != nil) {
+        // Bring the target to the front before the sheet covers the desktop. The
+        // text is about to appear on that window's command line, and a snippet
+        // put into a window the user cannot see is how a command gets run twice.
+        [self focusDesktopWindow:windowView];
     }
-    // Bring the target to the front before the sheet covers the desktop. The
-    // text is about to appear on that window's command line, and a snippet put
-    // into a window the user cannot see is how a command gets run twice.
-    [self focusDesktopWindow:windowView];
     // Presented from the Workspace (it is what is on screen) but delegated to
     // the terminal, which is the only thing that knows whether the guest has
     // bracketed paste on and therefore how the text has to be wrapped.

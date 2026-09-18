@@ -461,6 +461,10 @@ static void ISHSnippetConfigureAsShellInput(id<UITextInputTraits> input) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Snippets";
+    // A sheet with no delegate cannot insert (see -useSnippet:). Say so rather
+    // than let the first tap be the explanation.
+    if (self.delegate == nil)
+        self.navigationItem.prompt = @"No terminal window open — tap a snippet to read or edit it.";
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                       target:self
@@ -548,6 +552,15 @@ static void ISHSnippetConfigureAsShellInput(id<UITextInputTraits> input) {
     NSString *text = ISHSnippetString(snippet, kISHSnippetText);
     if (text.length == 0)
         return;
+    // Nowhere to insert into -- opened from the Workspace desktop with no
+    // terminal window on it. The library is still worth having open, so a tap
+    // opens the snippet for reading and editing instead of dismissing the sheet
+    // and doing nothing, which is indistinguishable from the feature being
+    // broken. -viewDidLoad says so in the prompt.
+    if (self.delegate == nil) {
+        [self editSnippet:snippet];
+        return;
+    }
     [self.delegate snippets:self insertText:text execute:execute];
     [self dismissViewControllerAnimated:YES completion:nil];
 }

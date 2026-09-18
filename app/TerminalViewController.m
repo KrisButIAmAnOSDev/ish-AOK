@@ -2560,6 +2560,16 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
         }];
     }
 
+    // Snippets live behind a long press on the Paste key, which is in the
+    // accessory bar -- and this button only appears when there is no accessory
+    // bar, which is exactly the case a hardware keyboard produces. Without an
+    // entry here the library is unreachable by touch on the setup most likely
+    // to want it, and inside Workspace there is no bar to long-press at all.
+    [alert addActionWithTitle:@"Snippets…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        [self showSnippets:nil];
+    }];
     [alert addActionWithTitle:@"Find in Scrollback…"
                         style:UIAlertActionStyleDefault
                       handler:^(__unused UIAlertAction *action) {

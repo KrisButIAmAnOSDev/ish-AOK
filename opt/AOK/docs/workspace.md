@@ -37,7 +37,15 @@ Paste key, or Cmd-J, both of which want the keyboard up; here they are one tap
 from anywhere on the desktop. A snippet goes to the terminal window whose ☰ you
 used, or to the frontmost one when you opened the menu from the desktop or the
 corner button — and that window comes to the front before the list appears, so
-you can see where the text is about to land.
+you can see where the text is about to land. With no terminal window open the
+list still opens, to read and edit; it says so at the top, and a tap opens the
+snippet rather than inserting it.
+
+A terminal window has its own way in as well: the **Switch Terminal** button,
+the one showing overlapping rectangles, lists **Snippets…** too. That is the
+route to use with a hardware keyboard, which hides the accessory bar the Paste
+key lives in — the same button then floats over the bottom-right of the
+terminal. Cmd-J opens the list from the keyboard.
 
 Window arrangements can be bookmarked and saved, so a favorite layout of
 terminals and applets can be recalled later.
