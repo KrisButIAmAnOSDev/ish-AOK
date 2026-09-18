@@ -316,8 +316,14 @@ static void ISHSnippetConfigureAsShellInput(id<UITextInputTraits> input) {
     _nameField.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
     _nameField.adjustsFontForContentSizeCategory = YES;
     _nameField.text = ISHSnippetString(_original ?: @{}, kISHSnippetName);
+    // Shell rules here too, autocapitalisation included. A snippet name is not
+    // prose: it is usually the command itself, or a fragment of one, which is
+    // why an unnamed snippet falls back to its own first line. Capitalising it
+    // is wrong more often than right, and iOS re-arms the shift every time the
+    // field goes back to empty -- so a name that starts lowercase is a small
+    // fight rather than a choice. Shift still works for anyone who wants a
+    // capital; none of this prevents one.
     ISHSnippetConfigureAsShellInput(_nameField);
-    _nameField.autocapitalizationType = UITextAutocapitalizationTypeSentences;  // a name is prose
 
     UILabel *runLabel = [UILabel new];
     runLabel.text = @"Run on tap";
