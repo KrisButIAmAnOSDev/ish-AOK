@@ -1362,6 +1362,49 @@ feature -- iPad plus console cable -- but it needs specific hardware, Redpark's
 licensing terms, and it is dead code for everyone without the cable. Only worth
 it if the maintainer wants it personally.
 
+### x86 guests have no crypto acceleration, and it costs 18-46x
+
+**Established, measured 2026-09-18** ([docs/guest_pc_sampling_2026_09.md](guest_pc_sampling_2026_09.md)).
+`jit/guest-arm64/crypto.S` maps the arm64 guest's AESE/AESMC/PMULL/SHA256H onto
+the host's own crypto instructions and `kernel/exec.c` advertises them in
+`AT_HWCAP`. The x86 guests get none of it, and `openssl speed` at 16 KB blocks
+shows what that is worth:
+
+| | arm64 guest | amd64 guest | ratio |
+|---|---:|---:|---:|
+| AES-128-GCM | 97,352 kB/s | 5,308 kB/s | **18.3x** |
+| SHA256 | 109,685 kB/s | 2,383 kB/s | **46.0x** |
+
+Not a benchmark artefact: on `apt install` this is 20.6% of on-CPU time on the
+amd64 guest (`libmd` 10.6% + `libcrypto` 10.0%, hashing and verifying packages;
+24.6% of wall) against ~1% on arm64, and 35.8% of on-CPU on amd64 `apk add` against 6.9%.
+
+**The scoping point that makes this tractable.** In `emu/cpuid.h` the AES-NI and
+PCLMULQDQ bits sit inside `#if CPUID_ADVERTISE_VECTOR_STATE`, next to
+XSAVE/OSXSAVE/AVX. That switch is 0 for a real reason -- the signal frame cannot
+carry `ymm_hi`, so advertising AVX would corrupt registers across a signal.
+**AES-NI does not share that debt**: its legacy SSE encodings use `xmm0-15`,
+which the existing 512-byte FXSAVE signal frame already saves in full. The bits
+are bundled there because making OpenSSL emit those encodings is, in that
+comment's words, a separate claim needing its own evidence -- not because XSAVE
+is required.
+
+**Next step**: implement the legacy SSE `AESENC`/`AESENCLAST`/`AESDEC`/
+`AESDECLAST`/`AESIMC`/`AESKEYGENASSIST` and `PCLMULQDQ` in the i386 and amd64
+engines, mapped onto host AESE/AESMC/PMULL as `jit/guest-arm64/crypto.S`
+already does, then advertise **only** bits 1 and 25 and leave
+`CPUID_ADVERTISE_VECTOR_STATE` at 0. Do SHA256 in the same pass -- it is the
+larger half of the loss, and the host instructions for it are already in use by
+the arm64 guest. Note `emu/avx.c`'s `avx_aes_round` is a software S-box today,
+so the VEX forms need the same treatment or they become a trap for anything
+that probes AES-NI and then uses the VEX encoding.
+
+Related and already shipped: `ISH_SYS_AEAD` (`kernel/ish_accel_aes.c` plus the
+OpenSSL provider in `opt/AOK/tools/crypto`) is ABI-neutral, so it already works
+for x86 guests -- but it is off by default, needs a provider installed in the
+root, and covers AEAD ciphers only, not the bare SHA256 that `libmd` and `apt`
+spend their time in.
+
 ---
 
 ## Native program candidates
@@ -1420,6 +1463,48 @@ AOK already has nextvi and micro native, so this is the "modern editor" slot
 rather than a gap. **Next step** is the interposition prototype, not helix
 itself -- pick the smallest Rust program that does one `open` and see whether
 its objects can be made to call `nlibc_open`.
+
+### gzip is already native, and nothing routes to it
+
+**Established, measured 2026-09-18** ([docs/guest_pc_sampling_2026_09.md](guest_pc_sampling_2026_09.md)).
+`tar xzf` spends 50-83% of its on-CPU time in a decompressor **binary**, never
+in libz: `/usr/bin/gzip` on the Devuan roots, `/bin/busybox` on Alpine. Read off
+the ELF, `DT_NEEDED` for `/usr/bin/gzip` is `libc.so.6` alone -- GNU gzip and
+busybox each carry their own inflate, so no libz accelerator of any kind can
+touch this workload.
+
+smallclue already has `gzip`/`gunzip`/`zcat` applets. Shadowing the guest's
+gzip with the native one on PATH, interleaved A/B, median of 4, same 14 MB
+tarball:
+
+| guest | distro gzip | native gzip | speedup |
+|---|---:|---:|---:|
+| amd64 / glibc | 13.130 s | 4.759 s | **2.76x** |
+| arm64 / glibc | 5.583 s | 4.797 s | **1.16x** |
+
+So the capability exists and is unreached, because `/AOK/tools/native-links.sh`
+is not applied by default. **Next step** is a decision, not code: whether
+shadowing a distro binary by default is acceptable (it changes what `tar -z`
+runs, and the applets' flag coverage would need to be checked against GNU
+gzip's first). The arm64 win is smaller because what is left there is tar's own
+file creation through fakefs, not the codec.
+
+### Library-level native interposition: measured, and the answer is no
+
+**Established 2026-09-18.** The idea of running a host libz/libcrypto/libc in
+place of the guest's was measured with a sampling profiler
+(`kernel/guestprof.c`, `ISH_GUEST_PROFILE`) across four workloads and four
+guests. It does not pay:
+
+- `tar xzf` reaches no shared library at all (above).
+- In `git clone`, libz is 8-11% of on-CPU against `[kernel]` at 22-38%.
+- The only library clearing a high bar is `liblzma` (27-40% of on-CPU in
+  `apt install`, because `.deb` data is xz) -- and on musl that slot is libz
+  instead, because `.apk` is gzip. Even "accelerate the package manager's
+  codec" is a different library per distro, for a win confined to one of them.
+
+No further work is planned on it. The instrument stays; the full argument,
+including what would have had to be true for a go, is in the doc.
 
 ---
 

@@ -583,6 +583,8 @@ static void exit_hangup_session_tty(struct task *leader, struct tty_hangup_targe
 // and re-parents any children. It ensures the task is not in a critical section and that
 // all locks are released before proceeding.  At least in theory
 noreturn void do_exit(struct task *task, int status) {
+    if (unlikely(guestprof_on))
+        guestprof_slot_release(task);
     if(task->reference.ready_to_be_freed) {
         // Already queued for deletion by someone else, but the struct is still
         // alive on that queue -- publish here too, or a de_thread waiting on

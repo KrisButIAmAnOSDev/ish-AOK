@@ -183,6 +183,10 @@ static noreturn void cli_halt(int status) {
         extern void lockstats_dump(void); // no-op unless a lockstats knob is set
         lockstats_dump();
     }
+    {
+        // no-op unless ISH_GUEST_PROFILE is set
+        guestprof_dump();
+    }
     // Deliberately NOT fflush(NULL). That walks every host stream and takes
     // each one's lock, and the shim gives a native program host FILEs for its
     // stdout and stderr -- so a guest task killed inside stdio leaves a stream
@@ -504,6 +508,7 @@ int main(int argc, char *const argv[]) {
     // every acquire, and a lock held from before it was armed would be dropped
     // as an unmatched release.
     lockstats_init();
+    guestprof_init();
     run_at_boot();
     configure_standalone_i386_safety(argc, argv);
     configure_standalone_amd64_jit();

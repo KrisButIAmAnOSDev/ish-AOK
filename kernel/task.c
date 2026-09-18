@@ -935,6 +935,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     // guest that reported anything.
     task->cpu.poked_ptr = &task->cpu._poked;
     task->cpu._poked = false;
+    task->prof_slot = -1; // never inherited; see the field's comment
     task->cpu_time_banked = false; // per-task, not inherited via the parent copy
     task->host_thread_started = false; // ditto; task_start sets it
     task->exit_rusage_counted = false; // ditto; do_exit sets it
@@ -1201,6 +1202,8 @@ void task_unlink_locked(struct task *task) {
 }
 
 static void task_free_final(struct task *task) {
+    if (unlikely(guestprof_on))
+        guestprof_slot_release(task);
     // A native program recorded by execve but never reached -- the task died
     // between the exec and its first execution (task_start failing, say).
     native_exec_discard_pending(task);
@@ -1494,7 +1497,11 @@ void task_run_current(void) {
         task_pthread_canary_check_self_at(
                 "at the top of task_run_current's loop, where the cleanup list must be empty",
                 true);
+        if (unlikely(guestprof_on))
+            guestprof_state(GUESTPROF_GUEST);
         int interrupt = cpu_run_to_interrupt(cpu, &tlb);
+        if (unlikely(guestprof_on))
+            guestprof_state(GUESTPROF_KERNEL);
         task_pthread_canary_check_self("after guest execution");
 
         read_unlock(&save->mem->lock);

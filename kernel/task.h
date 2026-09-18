@@ -15,6 +15,7 @@
 #include "util/list.h"
 #include "util/timer.h"
 #include "util/sync.h"
+#include "kernel/guestprof.h"
 
 extern void task_ref_cnt_mod(struct task *task, int value);
 
@@ -413,6 +414,12 @@ struct task {
     // not exiting. See fs/fuse.c's bounded wait.
     bool mm_teardown;
     bool io_block;
+    // This task's guestprof slot, or -1. On the task, not in thread-local
+    // storage, because the release hook runs on whichever thread reaps the
+    // struct. NOT inherited: task_create_ resets it explicitly, for the same
+    // reason it resets cpu.poked_ptr -- the whole-struct copy from the parent
+    // would otherwise hand a child its parent's slot to publish into.
+    int prof_slot;
     // Set once do_exit has banked this task's final thread CPU time into its
     // per-virtual-CPU accounting slot (task_bank_cpu_time); tells the
     // /proc/stat walker to stop live-sampling a thread that may be gone.
@@ -998,11 +1005,18 @@ void task_pthread_canary_note_unwind(void);
 // unblock it after the function is executed.
 __attribute__((always_inline)) inline int task_may_block_start(void) {
     current->io_block = 1;
+    // The profiler's off-CPU bucket. Without it a workload that spends its wall
+    // time waiting on a socket reports as "not in guest code", which reads like
+    // emulator overhead rather than the network.
+    if (unlikely(guestprof_on))
+        guestprof_state(GUESTPROF_BLOCKED);
     return 0;
 }
 
 __attribute__((always_inline)) inline int task_may_block_end(void) {
     current->io_block = 0;
+    if (unlikely(guestprof_on))
+        guestprof_state(GUESTPROF_KERNEL);
     return 0;
 }
 

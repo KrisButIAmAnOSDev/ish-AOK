@@ -5036,6 +5036,8 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     qword_t raw_args[6];
     dword_t args[6];
     qword_t syscall_num = dispatch->syscall_number(cpu);
+    if (unlikely(guestprof_on))
+        guestprof_state_syscall((unsigned long) syscall_num);
     // iSH-private syscalls live above every real syscall range (ISH_SYS_AEAD =
     // 0xacc0, ISH_SYS_PIXOP = 0xacc1), so they'd fail the range check below
     // and index the table out of bounds. Intercept them here, for EVERY guest
@@ -6726,6 +6728,11 @@ void handle_timer_interrupt(__attribute__((unused)) struct cpu_state *cpu) {
 
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
+
+    // On this task's own thread, with no address-space lock held: the one
+    // context in which the profiler can read this task's mappings safely.
+    if (unlikely(guestprof_on))
+        guestprof_maps_checkpoint();
 
     switch (interrupt) {
         case INT_SYSCALL:

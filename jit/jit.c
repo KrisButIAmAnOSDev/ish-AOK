@@ -1,6 +1,7 @@
 #define DEFAULT_CHANNEL instr
 #include "debug.h"
 #include "jit/jit.h"
+#include "kernel/guestprof.h"
 #include "jit/gen.h"
 #include "jit/frame.h"
 #include "emu/cpu.h"
@@ -1751,6 +1752,8 @@ rearm_i386:
             break;
         }
         addr_t ip = frame->cpu.eip;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
@@ -2177,6 +2180,8 @@ rearm_arm64:
             break;
         }
         guest_addr_t ip = frame->cpu.arm64_pc;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
@@ -2705,6 +2710,8 @@ rearm_riscv64:
             break;
         }
         guest_addr_t ip = frame->cpu.riscv64_pc;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
@@ -3089,6 +3096,8 @@ rearm_amd64:
 
         fallback_to_interp = false;
         ip = frame->cpu.amd64_rip;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         if (unlikely(amd64_frontend_debug_active()) && amd64_cc1_force_interp_block(ip)) {
             frame->last_block = NULL;
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));

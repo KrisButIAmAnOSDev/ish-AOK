@@ -565,6 +565,7 @@ src = [
     'kernel/user.c',
     'kernel/vdso.c', vdso,
     'kernel/task.c',
+    'kernel/guestprof.c',
     'kernel/group.c',
     'kernel/log.c',
 
