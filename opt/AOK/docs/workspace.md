@@ -30,6 +30,15 @@ Terminal lists your sessions and Utils lists every applet, in five groups:
   described in [roots.md](roots.md).
 - **Support** — Settings, Diagnostics.
 
+The menu **Utilities…** sits in — the ☰ button, the desktop long press, and
+each window's own ☰ all raise it — also has **Snippets…**, your library of
+saved command lines. In a plain terminal those hang off a long press on the
+Paste key, or Cmd-J, both of which want the keyboard up; here they are one tap
+from anywhere on the desktop. A snippet goes to the terminal window whose ☰ you
+used, or to the frontmost one when you opened the menu from the desktop or the
+corner button — and that window comes to the front before the list appears, so
+you can see where the text is about to land.
+
 Window arrangements can be bookmarked and saved, so a favorite layout of
 terminals and applets can be recalled later.
 

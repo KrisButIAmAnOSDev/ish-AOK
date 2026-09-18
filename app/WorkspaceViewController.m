@@ -9,6 +9,7 @@
 #include "fs/devices.h"
 #include "kernel/init.h"
 #import "TerminalViewController.h"
+#import "Snippets.h"
 #import "DisplayViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
@@ -5817,6 +5818,20 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
             [self presentTerminalDockActionsFromView:sourceView];
         });
     }];
+    // Snippets are a terminal feature, but in Workspace the terminal's own ways
+    // in are both awkward: the long press is on the Paste key, which lives in an
+    // accessory bar that needs the keyboard up, and Cmd-J needs a hardware one.
+    // The root menu is the surface every Workspace style has and all three ways
+    // of raising it -- the desktop long press, the corner button, and a window's
+    // own menu button -- land here, so this is the one place that reaches them
+    // from anywhere on the desktop.
+    [sheet addActionWithTitle:@"Snippets…"
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentSnippetsForMenuSourceView:sourceView];
+        });
+    }];
     [sheet addActionWithTitle:@"Launcher"
                         style:UIAlertActionStyleDefault
                       handler:^(__unused UIAlertAction *action) {
@@ -5881,6 +5896,43 @@ static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewControl
     [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
 
     [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
+}
+
+// Which terminal window a snippet belongs to. Two of the three ways the root
+// menu is raised name a window -- a window's own menu button is a subview of it
+// -- and a snippet picked there belongs to that window rather than to whatever
+// happens to be in front. The desktop long press and the corner button name
+// nothing, and then the frontmost terminal window is the only honest answer.
+// A non-terminal window's menu button names no terminal either, so it falls
+// through to the same place.
+- (ISHWorkspaceContainedWindowView *)terminalWindowForMenuSourceView:(UIView *)sourceView {
+    for (UIView *view = sourceView; view != nil; view = view.superview) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        return windowView.hostedTerminalViewController != nil ? windowView : nil;
+    }
+    return nil;
+}
+
+- (void)presentSnippetsForMenuSourceView:(UIView *)sourceView {
+    ISHWorkspaceContainedWindowView *windowView =
+        [self terminalWindowForMenuSourceView:sourceView] ?: [self frontmostDesktopTerminalWindow];
+    TerminalViewController *terminalViewController = windowView.hostedTerminalViewController;
+    if (terminalViewController == nil) {
+        // Nothing to insert into. A toast rather than an alert: the user asked
+        // for a list of commands, not for a dialog to dismiss.
+        [self showDesktopToastWithText:@"  Open a terminal window first  " holdFor:2.5];
+        return;
+    }
+    // Bring the target to the front before the sheet covers the desktop. The
+    // text is about to appear on that window's command line, and a snippet put
+    // into a window the user cannot see is how a command gets run twice.
+    [self focusDesktopWindow:windowView];
+    // Presented from the Workspace (it is what is on screen) but delegated to
+    // the terminal, which is the only thing that knows whether the guest has
+    // bracketed paste on and therefore how the text has to be wrapped.
+    [ISHSnippetsViewController presentFromViewController:self delegate:terminalViewController];
 }
 
 // Reached by long-pressing the terminal accessory bar's 4-way arrow key in place (see
