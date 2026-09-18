@@ -115,6 +115,10 @@ became 433 MB.
   and process-tree viewers can tell that two descriptors are two ends of one
   pipe; and the write end reports itself write-only rather than read-only.
 - The guest test gate no longer skips anything. Every test it has, it runs.
+- An unprivileged process may lock 8 MiB of memory, as it may on Linux.
+  `RLIMIT_MEMLOCK` was 64 KiB -- the historical kernel default, which no distro
+  has shipped in years -- so anything calling `mlock` on more than a page or
+  two got ENOMEM unless it was running as root.
 
 ## Issues you reported, closed in this build
 
