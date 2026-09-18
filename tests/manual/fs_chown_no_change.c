@@ -32,7 +32,10 @@
 //   - It raises no inotify event, even though it does bump ctime:
 //     fsnotify_change() maps ATTR_UID/GID/MODE to IN_ATTRIB and a lone
 //     ATTR_CTIME to nothing. Asserted below by watching a real chown fire
-//     IN_ATTRIB on the same file in the same watch.
+//     IN_ATTRIB on the same file in the same watch. True of a file with no
+//     setuid bits, which is what every fixture here is: a chown that strips
+//     them sets ATTR_MODE and so DOES raise IN_ATTRIB -- measured, and left
+//     to fs_chown_kills_privs.c along with the rest of that rule.
 //
 // The trailing-slash cases are here because a lookup is exactly what spends a
 // trailing slash (562a4eb5), and with no lookup there was nothing to spend it
@@ -277,6 +280,8 @@ static void changes_nothing(void) {
 // Linux bumps ctime but raises no inotify event for it, so a watch that sees
 // IN_ATTRIB from a real chown must see nothing from chown(-1, -1). The real
 // chown is the positive control: without it, a broken watch would "pass".
+// The watched file is 0644 on purpose -- on a setuid one the same call strips
+// the bit, which IS a mode change and does raise IN_ATTRIB.
 static void no_inotify_event(uid_t me, gid_t mg) {
     char p[256];
     at(p, sizeof p, "file");
@@ -342,9 +347,11 @@ static void unprivileged_cases(void) {
     // succeeds; the same call with real ids is EPERM. /etc/passwd is the one
     // root-owned, non-setuid, world-readable file every root here has --
     // and nothing below writes to it. A setuid file would be EPERM instead,
-    // because stripping its setuid bit is a mode change and THAT is checked;
-    // that is a separate behaviour AOK does not implement yet, so this
-    // deliberately uses a file with no such bits.
+    // because stripping its setuid bit is a mode change and THAT is checked.
+    // That is the other half of the rule and lives in fs_chown_kills_privs.c,
+    // so this deliberately uses a file with no such bits -- which is also what
+    // keeps the two tests independent: a regression in the strip cannot make
+    // this one fail, and vice versa.
     struct stat st;
     if (stat("/etc/passwd", &st) < 0 || st.st_uid == getuid() ||
         (st.st_mode & (S_ISUID | S_ISGID)) != 0) {

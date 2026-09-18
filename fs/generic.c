@@ -1318,6 +1318,12 @@ int generic_setattrat(struct fd *at, const char *path_raw, struct attr attr, boo
 // fsnotify_change() maps ATTR_UID/GID/MODE to IN_ATTRIB and a lone ATTR_CTIME
 // to nothing. So this is a lookup and nothing else.
 //
+// Both of those hold for the file this sees, which is one with no setuid bits.
+// Stripping them is a mode change, and that brings back the ownership check
+// AND the IN_ATTRIB -- but it is not this function's job: the caller decides
+// the strip from a stat it takes first, and applies it through the ordinary
+// generic_setattrat() afterwards. See chown_privs_to_drop() in kernel/fs.c.
+//
 // (AOK bumps ctime for no setattr at all -- a plain chown and a chmod both
 // leave it alone -- so there is nothing to bump here, and the Linux ctime
 // behaviour is a separate gap rather than one this skips.)

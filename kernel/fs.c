@@ -2808,11 +2808,76 @@ dword_t sys_chmod_guest(guest_addr_t path_addr, dword_t mode) {
     return sys_fchmodat_guest(AT_FDCWD_, path_addr, mode);
 }
 
+// Linux's chown_common(): a successful chown drops the file's setuid bit, and
+// usually its setgid bit with it. A chown is how a setuid binary changes hands,
+// and the bits cannot survive the handover -- the program would go on running
+// as whoever owns it now. Nothing did this, so a user could hand a setuid-root
+// binary to themselves and keep the bit.
+//
+// Measured on Linux 6.12.101, ext4 and tmpfs, 64-bit and -m32, unprivileged and
+// as root -- every leg identical. chown(f, -1, -1), which sets no id at all,
+// strips exactly as much as a chown with real ids: chown_common() adds
+// ATTR_KILL_SUID for any non-directory before it has looked at the ids.
+//
+//   4755 -> 0755   suid always goes...
+//   4644 -> 0644   ...with no execute bit anywhere, too
+//   2711 -> 0711   sgid goes when the group-execute bit is set
+//   2644 -> 2644   ...but not without it: that combination is a mandatory
+//                  locking marker rather than a privilege
+//   6644 -> 2644   the two bits are decided separately
+//   7755 -> 1755   the sticky bit is not a privilege and is never touched
+//   DIR            exempt whatever it is set to, 4755/2755/6755 all survive
+//   FIFO 4644 -> 0644   "not a directory" is the whole test, not "regular"
+//
+// Root is NOT exempt, and that is the trap here. The CAP_FSETID exemption
+// everybody remembers is in the WRITE path -- file_remove_privs() above --
+// not in this one: chown_common() sets the kill flags with no capability test,
+// and a root chown of /usr/bin/passwd really does clear its setuid bit
+// (measured, on the real file). Capability decides one narrow case only, the
+// sgid-without-group-x below.
+//
+// That case is not simply "keep it". setattr_should_drop_sgid() keeps the
+// marker only for a caller who is in the file's group or privileged; for
+// anyone else it goes. Measured: a 2644 file owned by me in a group I am not
+// in comes back 0644, where the same file in my own group stays 2644.
+//
+// The gid it asks about is the file's gid BEFORE the chown, which is the one
+// thing here that cannot be reconstructed afterwards -- a chgrp is exactly
+// what moves a file out of the group being asked about. Measured: a 2644 file
+// owned by me with group daemon, which I am not in, comes back 0644 when I
+// chgrp it to my own group; decided from the new gid it would have kept the
+// bit. So every caller below takes this from a stat made before it sets
+// anything.
+//
+// No permission check here: dropping the bits turns the call into a mode
+// change, and the callers apply it through the ordinary setattr path, so
+// setattr_check()'s chmod arm raises the EPERM at the right point and after
+// the errors that outrank it. That EPERM is the whole reason an unprivileged
+// chown(-1, -1) answers 0 on a plain root-owned file and EPERM on a setuid
+// one -- with no id set there is nothing else left to check.
+static mode_t_ chown_privs_to_drop(struct statbuf *stat) {
+    if (S_ISDIR(stat->mode))
+        return 0;
+    mode_t_ drop = 0;
+    if (stat->mode & S_ISUID)
+        drop |= S_ISUID;
+    if ((stat->mode & S_ISGID) &&
+            ((stat->mode & S_IXGRP) ||
+             (!current_in_group(stat->gid) && !current_capable(CAP_FSETID_))))
+        drop |= S_ISGID;
+    return drop;
+}
+
 static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
     STRACE("fchown(%d, %d, %d)", f, owner, group);
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
+    // Before anything is set; see chown_privs_to_drop(). A file we cannot stat
+    // has no mode for us to strip anything from, and leaving drop at 0 keeps
+    // the call exactly as it behaved before rather than inventing an error.
+    struct statbuf pre = {};
+    mode_t_ drop = generic_fstat(fd, &pre) < 0 ? 0 : chown_privs_to_drop(&pre);
     int err;
     if (owner != (uid_t) -1) {
         err = generic_fsetattr(fd, make_attr(uid, owner));
@@ -2824,6 +2889,8 @@ static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
         if (err < 0)
             return err;
     }
+    if (drop != 0)
+        return generic_fsetattr(fd, make_attr(mode, pre.mode & ~drop & ~S_IFMT));
     return 0;
 }
 
@@ -2861,6 +2928,13 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     if (path[0] == '\0') {
         if (!(flags & AT_EMPTY_PATH_))
             return _ENOENT;
+        // Before anything is set; see chown_privs_to_drop(). AT_FDCWD_ here
+        // names the current directory, which is exempt, but it costs nothing
+        // to ask the same question about it as about any other target.
+        struct statbuf pre = {};
+        int pre_err = at_f == AT_FDCWD_ ? generic_statat(AT_PWD, ".", &pre, 0)
+                                        : generic_fstat(at, &pre);
+        mode_t_ drop = pre_err < 0 ? 0 : chown_privs_to_drop(&pre);
         if (owner != (uid_t) -1) {
             err = at_f == AT_FDCWD_ ? generic_setattrat(AT_PWD, ".", make_attr(uid, owner), true)
                                     : generic_fsetattr(at, make_attr(uid, owner));
@@ -2873,8 +2947,21 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
             if (err < 0)
                 return err;
         }
+        if (drop != 0) {
+            struct attr attr = make_attr(mode, pre.mode & ~drop & ~S_IFMT);
+            return at_f == AT_FDCWD_ ? generic_setattrat(AT_PWD, ".", attr, true)
+                                     : generic_fsetattr(at, attr);
+        }
         return 0;
     }
+
+    // Before anything is set; see chown_privs_to_drop(). When the stat fails
+    // the calls below raise the real error, so the lookup's own errors keep
+    // beating anything this could have decided.
+    struct statbuf pre = {};
+    int pre_err = generic_statat(at, path, &pre, follow_links ? 0 : AT_SYMLINK_NOFOLLOW_);
+    mode_t_ drop = pre_err < 0 ? 0 : chown_privs_to_drop(&pre);
+    struct attr strip = make_attr(mode, pre.mode & ~drop & ~S_IFMT);
 
     // Both ids -1 is "change nothing", and it used to fall straight out of
     // here with 0 -- the two blocks below are the only thing that ever
@@ -2885,8 +2972,16 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     // two ids separately and passes -1 for "leave this one alone" -- when
     // neither turns out to need changing, the call is still made, and it was
     // answering 0 for a path that does not exist.
-    if (owner == (uid_t) -1 && group == (uid_t) -1)
-        return generic_setattrat_nochange(at, path, follow_links);
+    //
+    // It still strips, though: the kill flags do not depend on the ids. The
+    // lookup goes first so a read-only mount answers EROFS rather than the
+    // EPERM the strip would raise on the same file.
+    if (owner == (uid_t) -1 && group == (uid_t) -1) {
+        err = generic_setattrat_nochange(at, path, follow_links);
+        if (err < 0 || drop == 0)
+            return err;
+        return generic_setattrat(at, path, strip, follow_links);
+    }
 
     if (owner != (uid_t) -1) {
         err = generic_setattrat(at, path, make_attr(uid, owner), follow_links);
@@ -2898,6 +2993,8 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
         if (err < 0)
             return err;
     }
+    if (drop != 0)
+        return generic_setattrat(at, path, strip, follow_links);
     return 0;
 }
 
