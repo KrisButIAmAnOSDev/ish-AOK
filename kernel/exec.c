@@ -1937,8 +1937,8 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
             // Legacy setuid-root: grant full permitted and effective caps so
             // helpers like sudo can use keepcaps+setresuid to drop uid while
             // retaining CAP_SETGID for a subsequent setresgid call.
-            current->cap_effective[0] = current->cap_effective[1] = UINT32_MAX;
-            current->cap_permitted[0] = current->cap_permitted[1] = UINT32_MAX;
+            current->cap_effective[0] = current->cap_permitted[0] = CAP_FULL_LOW_;
+            current->cap_effective[1] = current->cap_permitted[1] = CAP_FULL_HIGH_;
         }
     }
     if (stat.mode & S_ISGID) {

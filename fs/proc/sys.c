@@ -527,8 +527,9 @@ static int sys_show_kernel_osrelease(struct proc_entry *UNUSED(entry), struct pr
 }
 
 static int sys_show_kernel_cap_last_cap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    // Keep this aligned with the advertised 4.20 kernel release.
-    proc_printf(buf, "%d\n", 37);
+    // CAP_LAST_CAP_ is the same number the full capability masks in
+    // /proc/PID/status are built from, so the two cannot drift apart.
+    proc_printf(buf, "%d\n", CAP_LAST_CAP_);
     return 0;
 }
 

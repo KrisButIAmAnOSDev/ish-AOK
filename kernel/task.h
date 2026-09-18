@@ -17,6 +17,26 @@
 #include "util/sync.h"
 #include "kernel/guestprof.h"
 
+// The highest capability number this kernel defines. /proc/sys/kernel/cap_last_cap
+// reports it, and it is chosen to match the 4.20 release AOK advertises.
+//
+// The "full" set is bits 0..CAP_LAST_CAP_ and deliberately NOT all ones. Linux
+// never reports a mask wider than the capabilities it actually has -- a 6.12 box
+// with cap_last_cap 40 reports CapBnd 000001ffffffffff -- and systemd uses an
+// all-ones mask as its own CAP_MASK_UNSET sentinel. pidref_get_capability()
+// rejects the WHOLE of /proc/PID/status with EBADMSG the moment a field parses
+// to it, so with all-ones AOK every ConditionCapability= in the unit set came
+// back "Couldn't determine result for ConditionCapability=CAP_SYS_ADMIN,
+// assuming failed: Bad message" and the unit was skipped -- systemd-sysext.socket,
+// dev-hugepages.mount, dev-mqueue.mount, sys-kernel-debug.mount and
+// sys-kernel-tracing.mount, every boot, in an openSUSE guest.
+//
+// Nothing gains or loses a capability by this: every capability AOK checks is
+// well below 37, so the bits being dropped name capabilities that do not exist.
+#define CAP_LAST_CAP_ 37
+#define CAP_FULL_LOW_ 0xffffffffu
+#define CAP_FULL_HIGH_ ((1u << (CAP_LAST_CAP_ - 31)) - 1)
+
 extern void task_ref_cnt_mod(struct task *task, int value);
 
 // Define a structure for the pending deletion queue

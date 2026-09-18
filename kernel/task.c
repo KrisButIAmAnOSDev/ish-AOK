@@ -905,9 +905,10 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
         // guest helpers such as setpriv can drop or reshuffle capabilities
         // without tripping over uninitialized state.
         task->abi = GUEST_ABI_I386;
-        task->cap_effective[0] = task->cap_effective[1] = UINT32_MAX;
-        task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
-        task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
+        task->cap_effective[0] = task->cap_permitted[0] =
+            task->cap_inheritable[0] = CAP_FULL_LOW_;
+        task->cap_effective[1] = task->cap_permitted[1] =
+            task->cap_inheritable[1] = CAP_FULL_HIGH_;
     }
     // NOT inherited: which native program is running, and what it said about
     // itself.
