@@ -231,9 +231,15 @@ int main(int argc, char **argv) {
     // and it fails for exactly one reason -- a frame reachable from two address
     // spaces was evicted and shared back.
     int evict_err = evict_self(SWEEPS, base_stores, NULL);
-    if (evict_err == EPERM) {
-        printf("zswap_fork_cow: SKIP (/proc/ish/swap_evict is EPERM: the "
-               "forced-eviction control is a CLI/Xcode-only gate)\n");
+    // EACCES as well as EPERM. /proc/ish/swap_evict is 0644 root-owned, so an
+    // unprivileged run cannot even open it for writing and fopen fails with
+    // EACCES -- a different errno from the handler's own superuser refusal,
+    // and the one every device run actually gets, because sshd logs you in as
+    // a user. Only EPERM was handled, so the device fell past this skip, did
+    // SWEEPS no-op sweeps and blamed the pager for storing nothing.
+    if (evict_err == EPERM || evict_err == EACCES) {
+        printf("zswap_fork_cow: SKIP (cannot drive /proc/ish/swap_evict: %s -- "
+               "forcing an eviction needs root)\n", strerror(evict_err));
         char go = 'g';
         if (write(to_child[1], &go, 1) != 1) { }
         waitpid(child, NULL, 0);
@@ -281,6 +287,13 @@ int main(int argc, char **argv) {
 
     unsigned long long before2 = zswap_field("stores", &ok);
     evict_err = evict_self(SWEEPS, before2, NULL);
+    // This return used to be discarded, so a control we were never allowed to
+    // write reported itself as "the pager stored nothing".
+    if (evict_err == EPERM || evict_err == EACCES) {
+        printf("zswap_fork_cow: SKIP (cannot drive /proc/ish/swap_evict: %s -- "
+               "forcing an eviction needs root)\n", strerror(evict_err));
+        return 0;
+    }
     unsigned long long after2 = zswap_field("stores", &ok);
     if (after2 <= before2) {
         printf("zswap_fork_cow: FAIL (after the child exited and the COW chain "
