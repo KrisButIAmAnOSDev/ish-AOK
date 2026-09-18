@@ -16,8 +16,10 @@ on. A pipeline comes back with the bytes still in it. A file comes back at the
 offset it was read to, and two processes that shared a descriptor still share
 it. A zsh session comes back with its variables, functions and aliases, because
 a native shell is *asked to describe itself* rather than photographed — there is
-no serialising a host C stack, so the rule is that a native program either knows
-how to dump its own state or the checkpoint refuses while it is running.
+no serialising a host C stack. The native programs that cannot describe
+themselves do not block the save: they are re-launched from their command line,
+which for a shell at a prompt is the same thing, and the save says which ones
+those were.
 
 You come back to the terminal you were looking at, not to a new shell beside
 your old one. A terminal cannot be restored — the one you had belonged to an app
@@ -34,13 +36,21 @@ launch simply boots, which is the behaviour you get with the switch off. The
 guest is never harmed by the attempt: a checkpoint is a copy, and the machine is
 stopped only for as long as it takes to write one.
 
-Two limits worth naming rather than leaving to be discovered. An image from a
+Three limits worth naming rather than leaving to be discovered. An image from a
 different build is refused outright, because the register file travels as bytes
-and reinterpreting one would be worse than declining it. And
-`/AOK/native/dash` cannot describe itself — it has no way to write its shell
-functions back out as text — so a checkpoint refuses by name while one is
-running. Nothing reaches native dash unless you ask for it; it is not
-`/bin/sh`.
+and reinterpreting one would be worse than declining it. A descriptor with no
+rule for rebuilding it is refused by number — though regular files,
+directories, terminals, pipes, sockets and the standard streams all have one.
+And a native program that is not making any system calls cannot be stopped,
+because there is nowhere to stop it: a shell waiting on a read is fine, a native
+program in a tight compute loop is not.
+
+What is *not* a refusal any more is a native program that simply cannot write
+its own state down. Only `/AOK/native/zsh` can; bash, dash and the editors come
+back re-launched from their command line instead, and the save reports which.
+That used to refuse, and it was the wrong trade — the alternative to a degraded
+restore is not a perfect one, it is no restore at all, because iOS kills the app
+either way.
 
 The guest can also take one for itself:
 
@@ -51,6 +61,11 @@ The guest can also take one for itself:
 the app and run as host code — a POSIX shell that starts in a fraction of the
 time an emulated one does, which matters when a script forks one per line. It is
 BSD-licensed and it is the shell most scripts are actually written against.
+
+Your `/bin/sh` is untouched. You reach dash at its own path, or as plain `sh`
+once `native-links.sh` has put `/usr/local/native-bin` first on your `PATH` —
+which is worth knowing, because that is the step that makes `sh` mean this
+shell rather than your distro's.
 
 Its subshells work the way bash's and zsh's do here — a fork becomes a
 re-launch, because a native program is a function call and not a process — but
@@ -75,8 +90,8 @@ goes is the natively-compiled copy at `/AOK/native/bash`.
 
 If your login shell in `/etc/passwd` is `/AOK/native/bash`, this build moves it
 to the guest bash for you, and to `/AOK/native/zsh` if there is none. Native zsh
-is the interactive shell this project recommends, and it is the one that can be
-suspended and restored.
+is the interactive shell this project recommends, and the one that comes back
+from a suspend with your session still in it.
 
 ## Compressed memory is no longer lazy
 

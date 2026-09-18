@@ -228,6 +228,15 @@ libc 符号。它是特意手动运行的，没有接进构建流程。
 > [Native bash and licensing](README.md#native-bash-and-licensing) 为准，
 > 下文为便于理解的译文。
 
+> **原生 bash 将在构建 556 中移除。** bash 采用 GPLv3，App Store 提交物不能包含
+> 它，因此保留下来的 shell 是 zsh —— 它的许可证是宽松的，而且其原生实现本来就是
+> 两者中更完整的一个。原生 bash 不会获得检查点支持：它无法写下自己的状态，
+> 因此挂起不会把它恢复到原来的位置，而是从命令行重新启动它并如实报告这一点。
+> zsh 是唯一一个能带着你的会话原样回来的原生程序。指向
+> `/AOK/native/bash` 的登录 shell 会由 `native-links.sh` 自动转换为客户机自带的
+> bash，因此不会有人因为升级而被挡在登录之外。
+> 参见 [docs/shell_transition_plan.md](docs/shell_transition_plan.md)。
+
 bash 作为原生程序编译进应用。收益在于解释执行而非 fork：算术循环比模拟执行的 shell
 快约 16 倍，而子 shell 和命令替换则接近持平，因为原生程序无法 `fork`，只能重新启动
 自身。数据与测量方法见 [docs/bash_native_plan.md](docs/bash_native_plan.md)。这同时
@@ -268,6 +277,27 @@ Licensing
 
 二进制中的其余部分不含第三方 GPL：SmallCLUE 是 MIT，OpenSSH 和 libarchive 是 BSD，
 liblzma 属于公有领域。
+
+**需要加脚注的是 dash，而且这是刻意为之而非疏漏。** dash 采用 BSD-3-Clause ——
+唯独 `src/mksignames.c` 是 GPL-2+，而它的*输出*会被链接进二进制。Debian 自己的
+copyright 文件正好标明了这一点：
+
+```
+Files: src/mksignames.c
+Comment: This file is not directly linked with dash.  However, its output is.
+License: GPL-2+
+```
+
+**iSH-AOK 不构建该文件。** 它是一个构建期生成器，其全部输出就是一张信号名称与
+编号的表，完全可以从平台自身的 `signal.h` 推导出来；AOK 自行生成该表，从不编译
+`mksignames.c`。若有人为了省事想把它加回来，请先读这一段 —— 那等于为了一张三十
+行就能生成的表，把 GPL 衍生内容重新放进二进制。
+
+**在这里 GPL-2+ 并不比 GPLv3 更宽松**，这一点值得明说，因为直觉往往相反。上述
+两起 App Store 下架都是 GPLv2，而 FSF 给出的分析适用于所有 GPL 版本。`+` 的意思
+是"或任何更新版本"，它给接收者一个版本选择权，并不缓和与商店使用条款的冲突。
+
+这是关于链接什么的工程判断，而非法律意见。
 
 ## 原生 zsh
 

@@ -239,6 +239,17 @@ ninja -C build
 > [Native bash and licensing](README.md#native-bash-and-licensing) 이 정본입니다.
 > 아래는 이해를 돕기 위한 번역입니다.
 
+> **네이티브 bash 는 빌드 556 에서 제거됩니다.** bash 는 GPLv3 이고 App Store
+> 제출물에 포함될 수 없으므로, 남는 셸은 zsh 입니다 — 라이선스가 허용적이고,
+> 네이티브 구현도 둘 중 더 완성도가 높습니다. 네이티브 bash 에는 체크포인트
+> 지원이 추가되지 않습니다: 자기 상태를 기록할 수 없으므로, 서스펜드는 bash 를
+> 원래 있던 자리로 되돌리는 대신 명령줄에서 다시 실행하고 그렇게 했다고
+> 보고합니다. 세션을 그대로 담은 채 돌아오는 네이티브 프로그램은 zsh
+> 하나뿐입니다. `/AOK/native/bash` 를
+> 가리키는 로그인 셸은 `native-links.sh` 가 게스트 자체의 bash 로 자동
+> 변환하므로, 업그레이드 때문에 로그인하지 못하게 되는 사람은 없습니다.
+> [docs/shell_transition_plan.md](docs/shell_transition_plan.md) 을 참고하십시오.
+
 bash 는 네이티브 프로그램으로 앱에 컴파일되어 들어갑니다. 이득은 fork 가 아니라
 해석(interpretation)에 있습니다. 산술 루프는 에뮬레이트되는 셸보다 약 16배 빠르고,
 서브셸과 명령 치환은 거의 같은 수준입니다. 네이티브 프로그램은 `fork` 를 할 수
@@ -287,6 +298,31 @@ GPL 도구와 동일한 단순 병합(mere aggregation) 입장입니다.
 
 바이너리의 나머지에는 서드파티 GPL 이 없습니다. SmallCLUE 는 MIT, OpenSSH 와
 libarchive 는 BSD, liblzma 는 퍼블릭 도메인입니다.
+
+**각주가 필요한 쪽은 dash 이며, 이는 실수가 아니라 의도된 것입니다.** dash 는
+BSD-3-Clause 입니다 — 단 `src/mksignames.c` 만은 GPL-2+ 이고, 그 *출력물* 이
+바이너리에 링크됩니다. 데비안 자신의 copyright 파일이 바로 그 점을 명시합니다:
+
+```
+Files: src/mksignames.c
+Comment: This file is not directly linked with dash.  However, its output is.
+License: GPL-2+
+```
+
+**iSH-AOK 는 그 파일을 빌드하지 않습니다.** 이것은 빌드 시점 생성기이며, 그
+출력물 전체가 시그널 이름과 번호의 테이블로서 플랫폼 자신의 `signal.h` 에서
+유도할 수 있습니다. AOK 는 그 테이블을 스스로 생성하며 `mksignames.c` 를 결코
+컴파일하지 않습니다. 편의를 위해 되살리고 싶은 사람은 이 문단을 먼저
+읽으십시오 — 서른 줄이면 만들 수 있는 테이블을 위해 GPL 파생 콘텐츠를 다시
+바이너리에 넣는 일이 됩니다.
+
+**여기서 GPL-2+ 가 GPLv3 보다 무른 입장인 것은 아닙니다.** 그렇게 가정하기
+쉬우므로 짚어 둘 가치가 있습니다. 위의 App Store 제거 사례 두 건은 모두
+GPLv2 였고, FSF 가 밝힌 분석은 모든 GPL 버전에 적용됩니다. `+` 는 "또는 그 이후
+버전"을 뜻하며 수령자에게 버전 선택권을 줄 뿐, 스토어 이용 약관과의 충돌을
+완화하지 않습니다.
+
+이는 무엇을 링크할 것인가에 대한 엔지니어링 판단이며, 법률 자문이 아닙니다.
 
 ## 네이티브 zsh
 

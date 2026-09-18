@@ -238,8 +238,10 @@ build.
 > **Native bash is being removed in build 556.** bash is GPLv3 and an App Store
 > submission cannot contain it, so the shell that stays is zsh — which is
 > permissive, and whose native implementation is the more complete of the two
-> anyway. Native bash will not gain checkpoint support, and `/proc/ish/checkpoint`
-> refuses while it is on a task stack rather than waiting for a quiet point.
+> anyway. Native bash will not gain checkpoint support: it cannot write its own
+> state down, so a suspend re-launches it from its command line and says that it
+> did, rather than bringing it back where it was. zsh is the one native program
+> that comes back with your session still in it.
 > Login shells naming `/AOK/native/bash` are converted to the guest's own bash
 > automatically by `native-links.sh`, so nobody is locked out by the upgrade.
 > See [docs/shell_transition_plan.md](docs/shell_transition_plan.md).
