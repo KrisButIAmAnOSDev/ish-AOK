@@ -37,6 +37,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -44,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <time.h>
@@ -130,6 +132,91 @@ static void check_waited(const char *what, double elapsed, double want) {
 }
 
 static void onsig(int sig) { (void) sig; }
+
+// The kernel log's own wall-clock stamp, read straight out of the byte stream
+// with no dmesg in the way.
+//
+// syslog(2)'s READ_ALL hands back the log's raw bytes -- what `dmesg --syslog`,
+// busybox's dmesg and `cat /proc/kmsg` all show -- and every line in it carries
+// the stamp kernel/log.c's output_line() writes. That stamp is guest-visible
+// text, so it is in UTC: the host's timezone is not something a guest can
+// learn, and the guest's own is a userspace file no kernel reads. Read back
+// with timegm() it must therefore agree with the guest's own clock.
+//
+// It did not. output_line() rendered the HOST's local time with ctime(3), so on
+// a host an hour off UTC every line read an hour into the FUTURE: `dmesg -S -T`
+// printed [Fri Sep 18 06:29:43 2026] in a guest whose own `date` said 05:29:43,
+// and check_dmesg_ctime below failed at -3600 s. That check needs util-linux's
+// dmesg AND some earlier test to have logged something, which is why it fired
+// only in a full suite run on one root; this one runs on every root and logs
+// its own line.
+//
+// A host that is itself on UTC cannot show the difference -- there is nothing
+// to see. To exercise it deliberately, force the host's zone far from UTC:
+// TZ=Pacific/Kiritimati ./build/ish -f <root> ...
+static void check_log_stamp_clock(double up) {
+    // /dev/kmsg is 0644 and root-owned, as on Linux. An unprivileged run just
+    // reads whatever is already in the log, which is no weaker an assertion --
+    // the boot banner alone is enough.
+    int fd = open("/dev/kmsg", O_WRONLY);
+    if (fd >= 0) {
+        dprintf(fd, "clock_boot_origin stamp probe\n");
+        close(fd);
+    }
+
+    static char buf[65536];
+    // READ_ALL is a peek: it does not consume, unlike READ, so it cannot steal
+    // records from anything else reading the log.
+    int n = (int) syscall(SYS_syslog, 3 /* SYSLOG_ACTION_READ_ALL */,
+                          buf, (int) sizeof(buf) - 1);
+    double now = clock_read(CLOCK_REALTIME);
+    if (n <= 0) {
+        test_log_if(1, "  SKIP kernel-log stamp: syslog(READ_ALL) returned %d (%s)\n",
+                    n, n < 0 ? strerror(errno) : "empty log");
+        return;
+    }
+    buf[n] = '\0';
+
+    // The newest stamp in the buffer. A truncated first line (READ_ALL gives
+    // the LAST n bytes) simply does not parse, and neither does a '[' inside a
+    // message, so scanning every one of them and keeping the latest is safe.
+    time_t newest = 0;
+    char newest_stamp[64] = "";
+    for (const char *p = buf; (p = strchr(p, '[')) != NULL; p++) {
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        const char *end = strptime(p + 1, "%a %b %e %H:%M:%S %Y", &tm);
+        if (end == NULL || *end != ']')
+            continue;
+        time_t t = timegm(&tm);
+        if (t == (time_t) -1 || t < newest)
+            continue;
+        newest = t;
+        snprintf(newest_stamp, sizeof(newest_stamp), "%.*s",
+                 (int) (end - (p + 1)), p + 1);
+    }
+    if (newest == 0) {
+        test_log_if(1, "  SKIP kernel-log stamp: no stamped line in %d bytes of log\n", n);
+        return;
+    }
+
+    double behind = now - (double) newest;
+    test_logf("kernel log's newest stamp [%s] is %.0f s behind the guest's clock\n",
+              newest_stamp, behind);
+    // Exact bounds, not a tolerance: the stamp is whole seconds, so it reads up
+    // to a second EARLY and never late, and no line can predate boot, so it is
+    // never more than uptime old. An hour either way is 3600 times the slack.
+    if (behind < -1.0 || behind > up + 1.0) {
+        test_log_if(1, "  the log stamps [%s], the guest's clock says %.0f: %.0f s "
+                       "apart, and the guest booted %.1f s ago\n",
+                    newest_stamp, now, behind, up);
+        // Both instants in epoch seconds rather than a signed difference --
+        // failf's fields are unsigned, and the two numbers say which way and
+        // by how much without any decoding.
+        failf("the kernel log's stamp is on the guest's clock (epoch s)",
+              (uint64_t) newest, 0, 0, (uint64_t) now, 0, 0);
+    }
+}
 
 // The symptom itself, through the program that showed it. `dmesg -T` renders a
 // record's monotonic stamp as a wall-clock time by adding get_boot_time_hires()
@@ -307,6 +394,7 @@ int main(int argc, char **argv) {
     }
     (void) real;
 
+    check_log_stamp_clock(up);
     check_dmesg_ctime(up);
 
     // ---- monotonic, and running at one second per second -----------------

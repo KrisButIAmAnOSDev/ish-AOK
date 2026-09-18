@@ -298,8 +298,9 @@ int kmsg_stream_poll(unsigned long pos) {
 // warning.
 #define KMSG_PRIORITY 6
 
-// output_line() stamps every stored line with ctime(3)'s fixed 24-character
-// form in brackets: "[Www Mmm dd hh:mm:ss yyyy] ", 27 characters in all.
+// output_line() stamps every stored line with asctime(3)'s fixed
+// 24-character form in brackets: "[Www Mmm dd hh:mm:ss yyyy] ", 27 characters
+// in all, rendered in UTC (see the timezone note on kmsg_line_time below).
 #define KMSG_CTIME_LEN 27
 
 // Most log lines are well under this; the rest take a malloc.
@@ -332,17 +333,17 @@ static bool kmsg_two_digits(const char *s, int *out) {
 // of the timestamp and then the same time again in words, from the same clock.
 // Nothing is lost by that: /proc/kmsg still carries the line verbatim.
 //
-// The resolution is whole seconds, because ctime's is. The origin is boot_time,
-// which is where kernel/task.c puts the guest's uptime zero, so these agree
-// with /proc/uptime and with /proc/stat's btime.
+// The resolution is whole seconds, because the stamp's is. The origin is
+// boot_time, which is where kernel/task.c puts the guest's uptime zero, so
+// these agree with /proc/uptime and with /proc/stat's btime.
 //
-// They do NOT currently agree with what `dmesg -T` prints, and that is a
-// separate gap: util-linux derives the boot instant as "now minus
-// CLOCK_BOOTTIME", and AOK's CLOCK_BOOTTIME and CLOCK_MONOTONIC report the
-// HOST's uptime rather than the guest's (measured: /proc/uptime 0.77 against
-// CLOCK_BOOTTIME 1264336). The relative times `dmesg` prints are right either
-// way; only the absolute ones dmesg reconstructs are off, by however long the
-// host had been up when the guest booted.
+// They agree with what `dmesg -T` prints, too, since acce7647: util-linux
+// derives the boot instant as "now minus CLOCK_BOOTTIME", and that is now the
+// guest's own uptime rather than the host's, so the absolute times dmesg
+// reconstructs from these records land on the guest's wall clock. (Before it,
+// CLOCK_BOOTTIME reported the HOST's uptime -- measured: /proc/uptime 0.77
+// against CLOCK_BOOTTIME 1264336 -- and `dmesg -T` printed records 14 days in
+// the past. The relative times were right either way.)
 static uint64_t kmsg_line_time(const char *line, size_t len, size_t *text_off) {
     extern time_t boot_time;
     *text_off = 0;
@@ -368,13 +369,16 @@ static uint64_t kmsg_line_time(const char *line, size_t len, size_t *text_off) {
     struct tm tm = {
         .tm_year = year - 1900, .tm_mon = mon, .tm_mday = day,
         .tm_hour = hour, .tm_min = min, .tm_sec = sec,
-        // ctime() rendered local time, so mktime() is its exact inverse. -1
-        // lets it work out DST; the one ambiguous hour a year can land on
-        // either side of the change, which costs an hour on those records and
-        // nothing on any other.
-        .tm_isdst = -1,
+        // output_line() renders UTC, so timegm() is its exact inverse and no
+        // timezone question arises. It used to render the HOST's local time
+        // and be read back with mktime(): that round-tripped, because both
+        // ends run in this one process and share its zone, but it put a
+        // wall-clock time the guest cannot interpret into guest-visible log
+        // text, and left one genuinely ambiguous hour a year where mktime
+        // could pick either side of a DST change.
+        .tm_isdst = 0,
     };
-    time_t when = mktime(&tm);
+    time_t when = timegm(&tm);
     if (when == (time_t) -1)
         return 0;
     // Only now is the stamp known to be one of ours, so only now is it right

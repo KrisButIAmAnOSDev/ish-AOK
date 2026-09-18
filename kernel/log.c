@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <fcntl.h>
+#include <time.h>
 #include <stdarg.h>
 #include <string.h>
 #include <sys/uio.h>
@@ -470,13 +471,42 @@ static void log_line(const char *line);
 static void output_line(const char *line) {
      if (strncmp(line, "INFO:", 5) == 0)
          return;
+     // UTC, not the host's local time.
+     //
+     // This stamp is guest-visible text: /proc/kmsg and syslog(2) hand the
+     // line back byte for byte, so `dmesg --syslog`, busybox's dmesg and
+     // `cat /proc/kmsg` all print it exactly as it stands. It was rendered
+     // with ctime(3), which is the HOST's local time -- a zone the guest has
+     // no way to learn and no reason to share. On a Mac on BST every line in
+     // a UTC guest read an hour into the FUTURE, and `dmesg -S -T` printed
+     // both times an hour apart on the same line: its own correct rendering
+     // and this one. Measured 2026-09-18, exactly -3600 s.
+     //
+     // UTC is the one reference the two ends can agree on without asking
+     // userspace where it thinks it is. It also removes a real ambiguity:
+     // kmsg_line_time() in fs/mem.c has to read this stamp back, and a local
+     // rendering is genuinely ambiguous for one hour a year across a DST
+     // change, where timegm() is an exact inverse of asctime_r(gmtime_r()).
+     // Local time still reaches the user where it belongs -- `dmesg -T`
+     // renders the READER's zone from the record timestamp recovered here.
      time_t t = time(NULL);
-     char* c_time_string = ctime(&t);
-     const size_t tlen = strlen(c_time_string); // We can trust c_time_string to be null terminated
-     c_time_string[tlen - 1] = '\0'; // Remove trailing newline
+     struct tm utc;
+     char stamp[32];
+     // asctime_r wants 26 bytes and ends the string with a newline, which is
+     // ctime's exact layout minus the timezone question. It only fails on a
+     // time_t no clock will produce; a line still gets logged if it does,
+     // just without a stamp (kmsg_line_time reports 0 for one it cannot
+     // parse, which is what Linux reports for a record with no timestamp).
+     if (gmtime_r(&t, &utc) == NULL || asctime_r(&utc, stamp) == NULL)
+         stamp[0] = '\0';
+     else
+         stamp[strcspn(stamp, "\n")] = '\0';
 
      char tmpbuff[16384];
-     if (snprintf(tmpbuff, sizeof(tmpbuff), "[%s] %s", c_time_string, line) >= (int) sizeof(tmpbuff)) { // Insufficient room, need to terminate at buffer size
+     int stamped = stamp[0] != '\0'
+         ? snprintf(tmpbuff, sizeof(tmpbuff), "[%s] %s", stamp, line)
+         : snprintf(tmpbuff, sizeof(tmpbuff), "%s", line);
+     if (stamped >= (int) sizeof(tmpbuff)) { // Insufficient room, need to terminate at buffer size
          tmpbuff[sizeof(tmpbuff) - 1] = '\0';
      }
     // send it to stdout or wherever
