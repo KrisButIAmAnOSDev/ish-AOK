@@ -73,15 +73,32 @@ int main(int argc, char **argv) {
 
     int st = 0;
     pid_t w = 0;
+    // WUNTRACED, because without it a STOPPED child is reported by waitpid
+    // exactly like a running one -- 0 -- and this test would then say "no
+    // SIGHUP was sent" about a child that was signalled and stopped rather
+    // than never signalled at all. tcsetpgrp above can raise SIGTTOU, and the
+    // hangup's SIGCONT is what is supposed to bring such a child back far
+    // enough to die of its pending SIGHUP, so "stopped" is a distinct and
+    // interesting outcome and must not be reported as the other one.
     for (int i = 0; i < 60; i++) {
-        w = waitpid(c, &st, WNOHANG);
+        w = waitpid(c, &st, WNOHANG | WUNTRACED);
         if (w == c)
             break;
         nap(100);
     }
-    if (w != c) {
+    if (w == c && WIFSTOPPED(st)) {
+        failf("hangup delivers SIGHUP", (uint64_t) WSTOPSIG(st), 0, 0,
+              (uint64_t) SIGHUP, 0, 0);
+        printf("FAIL: the hangup left the child STOPPED by signal %d -- it was "
+               "signalled, but the SIGCONT that should have let it die of "
+               "SIGHUP did not arrive\n", WSTOPSIG(st));
+        kill(c, SIGCONT);
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
+    } else if (w != c) {
         failf("hangup delivers SIGHUP", 0, 0, 0, (uint64_t) SIGHUP, 0, 0);
-        printf("FAIL: still alive 6s after the hangup -- no SIGHUP was sent\n");
+        printf("FAIL: still running 6s after the hangup, and not stopped "
+               "either -- no SIGHUP was sent\n");
         kill(c, SIGKILL);
         waitpid(c, &st, 0);
     } else {
