@@ -6229,7 +6229,10 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     self.bootCommandField.text = [UserPreferences.shared.bootCommand componentsJoinedByString:@" "];
     self.customDnsCell.textLabel.text = @"Custom DNS Servers";
     NSString *customDnsServers = [UserPreferences.shared.customDnsServers stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    self.customDnsCell.detailTextLabel.text = customDnsServers.length > 0 ? customDnsServers : @"Automatic";
+    if (UserPreferences.shared.shouldDisableResolvConfRewrite)
+        self.customDnsCell.detailTextLabel.text = @"Off (guest manages)";
+    else
+        self.customDnsCell.detailTextLabel.text = customDnsServers.length > 0 ? customDnsServers : @"Automatic";
 
     self.upgradeApkCell.userInteractionEnabled = FsNeedsRepositoryUpdate();
     self.upgradeApkLabel.enabled = FsNeedsRepositoryUpdate();
@@ -6346,7 +6349,7 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     (void) cell;
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:@"Custom DNS Servers"
-                                            message:@"Space- or comma-separated nameserver IPs written into the guest's /etc/resolv.conf on every refresh. Leave blank to follow this device's network-provided DNS automatically."
+                                            message:@"Space- or comma-separated nameserver IPs written into the guest's /etc/resolv.conf on every refresh. Leave blank to follow this device's network-provided DNS automatically, or pick Don't Manage to leave the file alone entirely, for a root that runs its own resolver."
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = UserPreferences.shared.customDnsServers;
@@ -6358,9 +6361,21 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
         textField.keyboardType = UIKeyboardTypeURL;
     }];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Don't Manage" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        // Mutually exclusive from here: picking this drops any pinned list, so
+        // the cell never shows servers it is no longer writing.
+        UserPreferences.shared.customDnsServers = @"";
+        UserPreferences.shared.shouldDisableResolvConfRewrite = YES;
+        [self _updateUI];
+        AppDelegate *dnsOffDelegate = (AppDelegate *) UIApplication.sharedApplication.delegate;
+        if ([dnsOffDelegate isKindOfClass:AppDelegate.class]) {
+            [dnsOffDelegate refreshDnsConfiguration];
+        }
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         NSString *value = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
         UserPreferences.shared.customDnsServers = value;
+        UserPreferences.shared.shouldDisableResolvConfRewrite = NO;
         [self _updateUI];
         AppDelegate *appDelegate = (AppDelegate *) UIApplication.sharedApplication.delegate;
         if ([appDelegate isKindOfClass:AppDelegate.class]) {

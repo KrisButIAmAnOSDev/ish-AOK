@@ -53,6 +53,7 @@ static NSString *const kPreferenceLLMToolMaxRoundsKey = @"LLM Tool Max Rounds";
 static NSString *const kPreferenceLLMHideThinkingKey = @"LLM Hide Thinking";
 static NSString *const kPreferenceShortcutsRunCommandsEnabledKey = @"Shortcuts Run Commands Enabled";
 static NSString *const kPreferenceCustomDnsServersKey = @"Custom DNS Servers";
+static NSString *const kPreferenceDisableResolvConfRewriteKey = @"Disable Resolv Conf Rewrite";
 
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
 NSString *const kPreferenceBootCommandKey = @"Boot Command";
@@ -278,6 +279,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceOptionMappingKey: @(OptionMapNone),
             kPreferenceBacktickEscapeKey: @(NO),
             kPreferenceDisableDimmingKey: @(NO),
+            kPreferenceDisableResolvConfRewriteKey: @(NO),
             kPreferenceLaunchCommandKey: ISHDefaultLaunchCommand(),
             kPreferenceBootCommandKey: ISHDefaultBootCommand(),
             // The SESSION SHELL, not the console, and that is what makes a
@@ -355,6 +357,8 @@ void amd64_jit_preference_set(bool enabled) {
             @"font_size": kPreferenceFontSizeKey,
             @"line_height": kPreferenceLineHeightKey,
             @"disable_dimming": kPreferenceDisableDimmingKey,
+            @"custom_dns_servers": kPreferenceCustomDnsServersKey,
+            @"disable_resolv_conf_rewrite": kPreferenceDisableResolvConfRewriteKey,
             @"enable_llm_client": kPreferenceEnableLLMClientKey,
             @"llm_provider": kPreferenceLLMProviderKey,
             @"llm_server_url": kPreferenceLLMServerURLKey,
@@ -423,6 +427,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceLLMHideThinkingKey: property(llmHideThinking),
             kPreferenceShortcutsRunCommandsEnabledKey: property(shortcutsRunCommandsEnabled),
             kPreferenceCustomDnsServersKey: property(customDnsServers),
+            kPreferenceDisableResolvConfRewriteKey: property(shouldDisableResolvConfRewrite),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
             kPreferenceCursorStyleKey: property(cursorStyle),
@@ -894,6 +899,19 @@ void amd64_jit_preference_set(bool enabled) {
 
 - (BOOL)validateCustomDnsServers:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSString.class];
+}
+
+// MARK: shouldDisableResolvConfRewrite
+- (BOOL)shouldDisableResolvConfRewrite {
+    return [_defaults boolForKey:kPreferenceDisableResolvConfRewriteKey];
+}
+
+- (void)setShouldDisableResolvConfRewrite:(BOOL)disable {
+    [_defaults setBool:disable forKey:kPreferenceDisableResolvConfRewriteKey];
+}
+
+- (BOOL)validateShouldDisableResolvConfRewrite:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
 }
 
 // MARK: ShouldEnablemulticore

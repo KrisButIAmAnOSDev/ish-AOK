@@ -4061,7 +4061,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
 
 - (void)configureDns {
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.configure.begin"];
-    [self ensureLocalDnsServer];
+    // Not even at boot: the responder binds 127.0.0.1:53 on the host, which a
+    // guest resolver asking for that port gets EADDRINUSE from.
+    if (!UserPreferences.shared.shouldDisableResolvConfRewrite)
+        [self ensureLocalDnsServer];
     [self scheduleDnsRefresh:@"manual"];
     if (!self.dnsNotifyRegistered) {
         ISHDnsConfigurationNotifyKeyFunc notifyKeyFunc = ISHDnsConfigurationNotifyKeySymbol();
@@ -4146,6 +4149,20 @@ static TerminalViewController *CreateTerminalViewController(void) {
 }
 
 - (void)performDnsRefresh:(NSString *)reason {
+    // The guest owns its own resolv.conf when the user says so. Checked before
+    // the custom list below, so a list left behind in preferences cannot bring
+    // the rewrite back, and paired with releasing 127.0.0.1:53: a root running
+    // its own resolver wants the file AND the port, and holding one without the
+    // other is the half-configured state that breaks it.
+    if (UserPreferences.shared.shouldDisableResolvConfRewrite) {
+        [self stopLocalDnsServer];
+        [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.skipped"
+                                      details:@{@"reason": reason ?: @"unknown",
+                                                @"source": @"disabled"}];
+        [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+        return;
+    }
+
     NSString *dnsSource = @"dnsinfo";
     NSMutableString *resolvConf = nil;
     BOOL customOverrideActive = NO;

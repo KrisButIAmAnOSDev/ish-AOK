@@ -169,6 +169,15 @@ extern NSString *const kThemeBackgroundColor;
 @property NSArray<NSString *> *launchCommand;
 @property NSArray<NSString *> *bootCommand;
 @property (nonatomic) NSString *customDnsServers;
+// When YES, AOK never writes the guest's /etc/resolv.conf and never binds the
+// local DNS responder on 127.0.0.1:53, leaving name resolution entirely to the
+// guest. The default (NO) rewrites the file on every network path change, which
+// is what most roots want -- but a root running its own resolver (dnsmasq,
+// systemd-resolved, unbound) owns that file and wants that port, and the
+// rewrite bumps the file's mtime on every cellular path update, which those
+// resolvers poll for. Checked before customDnsServers, so a list left behind in
+// preferences cannot resurrect the rewrite.
+@property BOOL shouldDisableResolvConfRewrite;
 // When YES, new terminal sessions launched with the default "/bin/login -f root" command log in
 // as the unprivileged UID 1000 account instead, matching how a real Linux desktop is normally
 // used. Sessions with a customized launch command are unaffected. The headless command surfaces
