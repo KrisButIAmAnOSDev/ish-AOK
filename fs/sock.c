@@ -2840,6 +2840,55 @@ static void netlink_reply_reset_locked(struct fd *sock) {
     sock->socket.netlink_reply = NULL;
     sock->socket.netlink_reply_len = 0;
     sock->socket.netlink_reply_off = 0;
+    free(sock->socket.netlink_reply_bounds);
+    sock->socket.netlink_reply_bounds = NULL;
+    sock->socket.netlink_reply_nbounds = 0;
+    sock->socket.netlink_reply_bounds_cap = 0;
+}
+
+// Closes the datagram being built, if it has any bytes in it.
+//
+// A netlink socket is a datagram socket: one recvmsg returns ONE datagram.
+// Linux builds a dump one skb per recvmsg -- netlink_dump() runs again on each
+// receive, and the call after the last entry yields an skb holding only
+// NLMSG_DONE -- so a dump reaches the reader as [entries...] and THEN [DONE].
+// Measured on Linux 6.12 for an RTM_GETROUTE dump: recvfrom #1 = 1308 bytes of
+// routes, recvfrom #2 = 20 bytes of DONE.
+//
+// AOK used to hand the whole queue to a single read, DONE included, which is
+// not a shape Linux can produce. fastfetch's default-route scan leaves its
+// message loop as soon as it finds a zero-metric route -- a break out of the
+// wrong loop, its own bug -- and reads again for the DONE it never reached.
+// On Linux that read returns the DONE datagram and it finishes; on AOK there
+// was nothing left to return and the read blocked for ever. It only became a
+// hang in 555: before netlink's blocking receive was implemented that read
+// failed at once with EAGAIN, so the module gave up and printed nothing.
+static int netlink_reply_seal_locked(struct fd *sock) {
+    size_t sealed = sock->socket.netlink_reply_nbounds == 0 ? 0 :
+        sock->socket.netlink_reply_bounds[sock->socket.netlink_reply_nbounds - 1];
+    if (sock->socket.netlink_reply_len == sealed)
+        return 0;
+    if (sock->socket.netlink_reply_nbounds == sock->socket.netlink_reply_bounds_cap) {
+        size_t cap = sock->socket.netlink_reply_bounds_cap == 0 ? 8 :
+            sock->socket.netlink_reply_bounds_cap * 2;
+        size_t *grown = realloc(sock->socket.netlink_reply_bounds, cap * sizeof(*grown));
+        if (grown == NULL)
+            return _ENOMEM;
+        sock->socket.netlink_reply_bounds = grown;
+        sock->socket.netlink_reply_bounds_cap = cap;
+    }
+    sock->socket.netlink_reply_bounds[sock->socket.netlink_reply_nbounds++] =
+        sock->socket.netlink_reply_len;
+    return 0;
+}
+
+// Where the datagram the reader is positioned in ends: the first boundary past
+// netlink_reply_off, or the end of the buffer when the tail is still open.
+static size_t netlink_reply_datagram_end_locked(struct fd *sock) {
+    for (size_t i = 0; i < sock->socket.netlink_reply_nbounds; i++)
+        if (sock->socket.netlink_reply_bounds[i] > sock->socket.netlink_reply_off)
+            return sock->socket.netlink_reply_bounds[i];
+    return sock->socket.netlink_reply_len;
 }
 
 static void netlink_reply_reset(struct fd *sock) {
@@ -2864,8 +2913,9 @@ static int netlink_reply_append_locked(struct fd *sock, const void *data, size_t
 // interleaved with a guest thread's own append, and corrupt message framing
 // -- a fully self-contained nlmsg record is the smallest unit that's safe to
 // interleave with others in the reply stream.
-static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
-        uint32_t seq, const void *payload, size_t payload_len) {
+static int netlink_append_nlmsg_ex(struct fd *sock, uint16_t type, uint16_t flags,
+        uint32_t seq, const void *payload, size_t payload_len,
+        bool seal_before, bool seal_after) {
     struct nlmsghdr_ hdr = {
         .nlmsg_len = NLMSG_HDRLEN + payload_len,
         .nlmsg_type = type,
@@ -2876,7 +2926,16 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
         .nlmsg_pid = sock->socket.netlink_port_id,
     };
     lock(&sock->socket.netlink_reply_lock, 0);
-    int err = netlink_reply_append_locked(sock, &hdr, sizeof(hdr));
+    int err = 0;
+    // Under the same lock hold as the append, so a notification from the watch
+    // thread cannot land between closing the previous datagram and opening this
+    // one.
+    if (seal_before) {
+        err = netlink_reply_seal_locked(sock);
+        if (err < 0)
+            goto out;
+    }
+    err = netlink_reply_append_locked(sock, &hdr, sizeof(hdr));
     if (err < 0)
         goto out;
     if (payload_len != 0) {
@@ -2890,6 +2949,8 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
         static const char zeros[NLMSG_ALIGNTO] = {};
         err = netlink_reply_append_locked(sock, zeros, pad_len);
     }
+    if (err == 0 && seal_after)
+        err = netlink_reply_seal_locked(sock);
     // Wakes a receive blocked on the empty queue (netlink_wait_for_message_
     // locked), whichever thread queued this: a notification from the watch
     // thread, or a reply to a request another thread sent on this socket.
@@ -2898,6 +2959,17 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
 out:
     unlock(&sock->socket.netlink_reply_lock);
     return err;
+}
+
+// A standalone reply, an ACK or a notification is a datagram of its own, the
+// way Linux sends each as its own skb. A multi-part dump entry (NLM_F_MULTI)
+// instead accumulates into the datagram being built, which netlink_append_done
+// closes before adding the DONE.
+static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
+        uint32_t seq, const void *payload, size_t payload_len) {
+    bool standalone = !(flags & NLM_F_MULTI_);
+    return netlink_append_nlmsg_ex(sock, type, flags, seq, payload, payload_len,
+            standalone, standalone);
 }
 
 static int netlink_append_error(struct fd *sock, uint32_t seq,
@@ -2921,7 +2993,12 @@ static int netlink_append_done(struct fd *sock, uint32_t seq) {
     // resolution via nsswitch's "resolve [!UNAVAIL=return]"), and why
     // networkctl printed "0 links listed" -- while busybox ip, which doesn't
     // care about the DONE flags, parsed the same bytes fine.
-    return netlink_append_nlmsg(sock, NLMSG_DONE_, NLM_F_MULTI_, seq, &status, sizeof(status));
+    //
+    // Sealed on both sides: the entries queued before it are closed into their
+    // own datagram, and the DONE becomes another, which is the [entries][DONE]
+    // shape Linux delivers. See netlink_reply_seal_locked.
+    return netlink_append_nlmsg_ex(sock, NLMSG_DONE_, NLM_F_MULTI_, seq,
+            &status, sizeof(status), true, true);
 }
 
 static int diag_socket_push(struct diag_socket_entry *entries, struct fd *fd) {
@@ -3743,7 +3820,8 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
         if (ret < 0)
             goto out;
     }
-    available = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
+    size_t datagram_end = netlink_reply_datagram_end_locked(sock);
+    available = datagram_end - sock->socket.netlink_reply_off;
     // No capacity==0 early-out here: a zero-length read must still fall
     // through to the loop below, which truncate-AND-CONSUMES the first
     // message (Linux datagram semantics: a recv always eats the datagram,
@@ -3758,7 +3836,7 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
 
     size_t copied = 0;
     size_t reply_off = sock->socket.netlink_reply_off;
-    while (reply_off + sizeof(struct nlmsghdr_) <= sock->socket.netlink_reply_len) {
+    while (reply_off + sizeof(struct nlmsghdr_) <= datagram_end) {
         struct nlmsghdr_ *hdr = (struct nlmsghdr_ *)
             (sock->socket.netlink_reply + reply_off);
         size_t msg_len = NLMSG_ALIGN(hdr->nlmsg_len);
@@ -3782,6 +3860,11 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
             break;
     }
 
+    // Whatever is left of THIS datagram does not survive the read, so the
+    // reader is told it was truncated -- including on a peek, as Linux does.
+    if (reply_off < datagram_end)
+        msg->msg_flags |= MSG_TRUNC;
+
     if (msg->msg_name != NULL) {
         struct sockaddr_nl_ name = {
             .nl_family = AF_NETLINK_,
@@ -3795,8 +3878,11 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
             memcpy(msg->msg_name, &name, copy_len);
         msg->msg_namelen = sizeof(name);
     }
+    // Linux datagram semantics: a receive eats the whole datagram, however
+    // little of it fit. Advancing only to reply_off would hand the untaken tail
+    // of a truncated batch back as a datagram of its own on the next read.
     if (!peek)
-        sock->socket.netlink_reply_off = reply_off;
+        sock->socket.netlink_reply_off = datagram_end;
     if (!peek && sock->socket.netlink_reply_off >= sock->socket.netlink_reply_len)
         netlink_reply_reset_locked(sock);
     if ((msg->msg_flags & MSG_TRUNC) && want_trunc_len)
@@ -9815,8 +9901,19 @@ static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
     if (cmd == SIOCGIFNETMASK_)
         return sock_ifreq_addr_field_from_name(arg, SOCK_IFREQ_NETMASK_);
     if (fd->real_fd < 0) {
-        if (cmd == FIONREAD_)
-            *(dword_t *) arg = (dword_t) (fd->socket.netlink_reply_len - fd->socket.netlink_reply_off);
+        if (cmd == FIONREAD_) {
+            // SIOCINQ on a datagram socket is the size of the NEXT datagram,
+            // not the whole backlog. Gated on the domain like every other
+            // reader of these fields: other real_fd<0 kinds alias the union.
+            dword_t queued = 0;
+            if (fd->socket.domain == AF_NETLINK_) {
+                lock(&fd->socket.netlink_reply_lock, 0);
+                queued = (dword_t) (netlink_reply_datagram_end_locked(fd) -
+                        fd->socket.netlink_reply_off);
+                unlock(&fd->socket.netlink_reply_lock);
+            }
+            *(dword_t *) arg = queued;
+        }
         else if (cmd == SIOCOUTQ_)
             // Emulated (netlink) sockets never queue outgoing bytes.
             *(dword_t *) arg = 0;

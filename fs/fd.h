@@ -271,6 +271,15 @@ struct fd {
             char *netlink_reply;
             size_t netlink_reply_len;
             size_t netlink_reply_off;
+            // Datagram boundaries inside netlink_reply: each entry is the END
+            // offset of one datagram, and bytes past the last entry are a
+            // datagram still being built. A netlink socket is a datagram
+            // socket, so one recvmsg returns ONE of these -- see
+            // netlink_reply_seal_locked in fs/sock.c for why a dump's
+            // NLMSG_DONE has to arrive in a datagram of its own.
+            size_t *netlink_reply_bounds;
+            size_t netlink_reply_nbounds;
+            size_t netlink_reply_bounds_cap;
             // Guards the three netlink_reply* fields above (and the
             // notification-append path below) against a background
             // notifier thread racing the guest thread's own sendmsg/
