@@ -15,6 +15,7 @@
 #include "fs/proc/ish.h"
 #include "kernel/errno.h"
 #import "NSObject+SaneKVO.h"
+#include <os/lock.h>
 #include <archive.h>
 #include <archive_entry.h>
 #include "tools/fakefs.h"
@@ -125,25 +126,26 @@ static NSArray<NSString *> *RequiredManifestKeys(void) {
     return keys;
 }
 
-static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoicesFromManifest(void) {
-    NSURL *manifestURL = [NSBundle.mainBundle URLForResource:@"manifest" withExtension:@"json"];
-    if (manifestURL == nil) {
-        NSLog(@"manifest.json not found in app bundle (deps/rootfs-manifest submodule) -- no downloadable filesystem choices available");
-        return @[];
-    }
-    NSData *data = [NSData dataWithContentsOfURL:manifestURL];
+// Parses one manifest, whatever it came from -- the copy inside the app, the
+// cached copy of the last good download, or bytes straight off the network.
+// One function on purpose: the downloaded manifest decides which filesystems
+// the app will fetch and from where, so it has to clear exactly the same bar
+// as the one shipped in the IPA, not a laxer one. `source` only labels log
+// lines. Returns nil (not @[]) when the manifest as a whole is unusable, so a
+// caller can tell "this source failed" from "this source lists nothing".
+static NSArray<NSDictionary<NSString *, NSString *> *> *ParseRootManifest(NSData *data, NSString *source) {
     NSError *error = nil;
     id parsed = data != nil ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
     if (![parsed isKindOfClass:NSArray.class]) {
-        NSLog(@"rootfs-manifest.json could not be parsed: %@", error);
-        return @[];
+        NSLog(@"rootfs manifest (%@) could not be parsed: %@", source, error);
+        return nil;
     }
 
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *entries = [NSMutableArray array];
     NSMutableSet<NSString *> *seenIdentifiers = [NSMutableSet set];
     for (id rawEntry in (NSArray *) parsed) {
         if (![rawEntry isKindOfClass:NSDictionary.class]) {
-            NSLog(@"rootfs-manifest.json: skipping non-object entry");
+            NSLog(@"rootfs manifest (%@): skipping non-object entry", source);
             continue;
         }
         NSDictionary<NSString *, NSString *> *entry = rawEntry;
@@ -151,16 +153,29 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
         for (NSString *key in RequiredManifestKeys()) {
             id value = entry[key];
             if (![value isKindOfClass:NSString.class] || [(NSString *) value length] == 0) {
-                NSLog(@"rootfs-manifest.json: entry missing required key '%@', skipping", key);
+                NSLog(@"rootfs manifest (%@): entry missing required key '%@', skipping", source, key);
                 valid = NO;
                 break;
             }
         }
         if (!valid)
             continue;
+        // The manifest can now arrive over the network, so the URL it hands the
+        // downloader has to be one worth following. https only: a plain-http
+        // entry would let anyone on the path choose the root filesystem a user
+        // installs. Every entry ever shipped is already https, so this rejects
+        // nothing that exists today -- it stops what could be added later.
+        NSString *downloadURLString = entry[kBundledRootDownloadURLKey];
+        NSURLComponents *components = [NSURLComponents componentsWithString:downloadURLString];
+        if (![components.scheme isEqualToString:@"https"] || components.host.length == 0) {
+            NSLog(@"rootfs manifest (%@): entry '%@' has a non-https downloadURL, skipping",
+                  source, entry[kBundledRootIdentifierKey]);
+            continue;
+        }
+
         NSString *identifier = entry[kBundledRootIdentifierKey];
         if ([seenIdentifiers containsObject:identifier]) {
-            NSLog(@"rootfs-manifest.json: duplicate identifier '%@', skipping", identifier);
+            NSLog(@"rootfs manifest (%@): duplicate identifier '%@', skipping", source, identifier);
             continue;
         }
         [seenIdentifiers addObject:identifier];
@@ -181,7 +196,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
         for (NSString *key in @[kBundledRootSeriesKey, kBundledRootVersionKey]) {
             id value = entry[key];
             if (value != nil && ![value isKindOfClass:NSString.class]) {
-                NSLog(@"rootfs-manifest.json: entry '%@' has a non-string '%@', ignoring that key", identifier, key);
+                NSLog(@"rootfs manifest (%@): entry '%@' has a non-string '%@', ignoring that key", source, identifier, key);
                 NSMutableDictionary<NSString *, NSString *> *fixedUp = [entry mutableCopy];
                 [fixedUp removeObjectForKey:key];
                 entry = fixedUp;
@@ -192,11 +207,72 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
     return entries;
 }
 
-static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void) {
-    static NSArray<NSDictionary<NSString *, NSString *> *> *choices;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSMutableArray<NSDictionary<NSString *, NSString *> *> *mutableChoices = [@[
+// The catalogue is fetched from here at runtime, and the copy inside the app is
+// only the fallback. It has to work that way: the app bundles a SNAPSHOT of
+// manifest.json taken when it was built, so an installed build's idea of which
+// filesystems exist is frozen at its release. Publishing a new rootfs left
+// every existing install unable to see it, and withdrawing one left them asking
+// for a URL that had stopped existing -- "Couldn't download the filesystem
+// image", with nothing fixable from the device. Now an old build tracks the
+// catalogue like a new one.
+static NSString *const kRemoteManifestURLString =
+    @"https://raw.githubusercontent.com/emkey1/ish-AOK-rootfs/main/manifest.json";
+// A catalogue is a few kB; anything remotely near this is not one, and the cap
+// keeps a wrong or hostile response from being read into memory wholesale.
+static const NSUInteger kRemoteManifestMaxBytes = 1024 * 1024;
+// Re-fetching on every glance at the Filesystems screen would hammer the host
+// for a file that changes a few times a year.
+static const NSTimeInterval kRemoteManifestMinRefreshInterval = 10 * 60;
+
+NSNotificationName const RootsCatalogDidChangeNotification = @"RootsCatalogDidChangeNotification";
+
+// Last good download, kept so the catalogue survives being offline: a device
+// that has fetched once never falls back to the frozen in-app snapshot again.
+// A .json here is ignored by cachedRootArchiveURLs, which only collects archive
+// suffixes, so it cannot show up as an importable file.
+static NSURL *RemoteManifestCacheURL(void) {
+    NSURL *container = ContainerURL();
+    if (container == nil)
+        return nil;
+    return [[[container URLByAppendingPathComponent:@"AOK" isDirectory:YES]
+             URLByAppendingPathComponent:@"persist" isDirectory:YES]
+            URLByAppendingPathComponent:@"manifest-cache.json"];
+}
+
+// Best catalogue available right now, newest source first. Each is validated by
+// the same parser, and a source that fails to parse falls through to the next
+// rather than emptying the picker.
+static NSArray<NSDictionary<NSString *, NSString *> *> *DownloadableRootChoices(void) {
+    NSURL *cacheURL = RemoteManifestCacheURL();
+    if (cacheURL != nil) {
+        NSData *cached = [NSData dataWithContentsOfURL:cacheURL];
+        if (cached != nil) {
+            NSArray *entries = ParseRootManifest(cached, @"downloaded");
+            if (entries != nil)
+                return entries;
+            // Corrupt or truncated: drop it so the next fetch starts clean,
+            // and use the in-app copy meanwhile.
+            [NSFileManager.defaultManager removeItemAtURL:cacheURL error:NULL];
+        }
+    }
+    NSURL *bundledURL = [NSBundle.mainBundle URLForResource:@"manifest" withExtension:@"json"];
+    if (bundledURL == nil) {
+        NSLog(@"manifest.json not found in app bundle (deps/rootfs-manifest submodule) -- no downloadable filesystem choices available");
+        return @[];
+    }
+    return ParseRootManifest([NSData dataWithContentsOfURL:bundledURL], @"in-app") ?: @[];
+}
+
+// Rebuilt whenever a fetch lands, so it cannot be a dispatch_once. Read from
+// the guest's thread (the /proc/ish/roots catalogue listing) as well as the
+// UI's, so the array is swapped under a lock and never mutated in place -- an
+// enumeration in progress keeps walking the array it started on.
+static os_unfair_lock gRootChoicesLock = OS_UNFAIR_LOCK_INIT;
+static NSArray<NSDictionary<NSString *, NSString *> *> *gRootChoices;
+static NSArray<NSDictionary<NSString *, NSString *> *> *gOfferedRootChoices;
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *BuildRootChoices(void) {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *mutableChoices = [@[
             // Bundled-in-the-app choices (arm64 guests -- the only architecture
             // still shipped in the IPA); every download-backed choice comes from
             // the rootfs-manifest submodule instead (loaded below).
@@ -230,10 +306,38 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void)
                 kBundledRootTierKey: kBundledRootTierOfficial,
             },
         ] mutableCopy];
-        [mutableChoices addObjectsFromArray:LoadDownloadableRootChoicesFromManifest()];
-        choices = mutableChoices;
-    });
-    return choices;
+    [mutableChoices addObjectsFromArray:DownloadableRootChoices()];
+    return mutableChoices;
+}
+
+// Recomputes both cached arrays from whatever catalogue is current. Returns YES
+// if what the picker offers actually changed, so a fetch that returns the same
+// manifest does not churn the table.
+// Defined below, beside the series/version rule it implements.
+static NSArray<NSDictionary<NSString *, NSString *> *> *OfferedRootChoices(NSArray<NSDictionary<NSString *, NSString *> *> *choices);
+
+static BOOL ReloadRootChoices(void) {
+    NSArray<NSDictionary<NSString *, NSString *> *> *all = BuildRootChoices();
+    NSArray<NSDictionary<NSString *, NSString *> *> *offered = OfferedRootChoices(all);
+    os_unfair_lock_lock(&gRootChoicesLock);
+    BOOL changed = ![offered isEqualToArray:gOfferedRootChoices ?: @[]];
+    gRootChoices = all;
+    gOfferedRootChoices = offered;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return changed;
+}
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void) {
+    os_unfair_lock_lock(&gRootChoicesLock);
+    NSArray<NSDictionary<NSString *, NSString *> *> *choices = gRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    if (choices != nil)
+        return choices;
+    ReloadRootChoices();
+    os_unfair_lock_lock(&gRootChoicesLock);
+    choices = gRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return choices ?: @[];
 }
 
 // The subset of BundledRootChoices() the picker (and `ish-cli roots catalog`)
@@ -746,6 +850,12 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 
         if ((!self.defaultRoot || ![self.roots containsObject:self.defaultRoot]) && self.roots.count)
             self.defaultRoot = PreferredDefaultRootName(self.roots);
+
+        // Not only when the Filesystems screen opens: a first launch with no
+        // roots goes straight to picking one, and that picker should list what
+        // exists today rather than whatever this build shipped with. Async, so
+        // it costs launch nothing and a device with no network is unaffected.
+        [self refreshRootCatalogFromNetwork];
     }
     return self;
 }
@@ -766,12 +876,72 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 }
 
 - (NSArray<NSDictionary<NSString *,NSString *> *> *)offeredRootChoices {
-    static NSArray<NSDictionary<NSString *, NSString *> *> *offered;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        offered = OfferedRootChoices(BundledRootChoices());
-    });
-    return offered;
+    BundledRootChoices();   // builds both arrays on first use
+    os_unfair_lock_lock(&gRootChoicesLock);
+    NSArray<NSDictionary<NSString *, NSString *> *> *offered = gOfferedRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return offered ?: @[];
+}
+
+// Fetches the current catalogue and, if it differs from what is on screen,
+// swaps it in and says so. Everything about this is best-effort: no network, a
+// GitHub outage, a truncated body or a manifest that will not parse all leave
+// the previous catalogue exactly as it was. The picker is never emptied by a
+// failed refresh, and nothing here blocks a caller.
+- (void)refreshRootCatalogFromNetwork {
+    static os_unfair_lock refreshLock = OS_UNFAIR_LOCK_INIT;
+    static NSDate *lastAttempt;
+    static BOOL inFlight;
+    os_unfair_lock_lock(&refreshLock);
+    BOOL tooSoon = lastAttempt != nil &&
+        [NSDate.date timeIntervalSinceDate:lastAttempt] < kRemoteManifestMinRefreshInterval;
+    if (inFlight || tooSoon) {
+        os_unfair_lock_unlock(&refreshLock);
+        return;
+    }
+    inFlight = YES;
+    lastAttempt = NSDate.date;
+    os_unfair_lock_unlock(&refreshLock);
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kRemoteManifestURLString]];
+    // The catalogue is the thing being checked for changes, so a stored copy is
+    // exactly what must not be served here.
+    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    request.timeoutInterval = 15;
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:request
+            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        os_unfair_lock_lock(&refreshLock);
+        inFlight = NO;
+        os_unfair_lock_unlock(&refreshLock);
+
+        NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
+            ? ((NSHTTPURLResponse *) response).statusCode : 0;
+        if (error != nil || status != 200 || data.length == 0 || data.length > kRemoteManifestMaxBytes) {
+            NSLog(@"root catalogue refresh skipped (status %ld, %lu bytes): %@",
+                  (long) status, (unsigned long) data.length, error.localizedDescription ?: @"no error");
+            return;
+        }
+        // Parse BEFORE caching: a body that does not survive the same
+        // validation the in-app copy gets must not replace a good cache.
+        if (ParseRootManifest(data, @"downloaded") == nil)
+            return;
+
+        NSURL *cacheURL = RemoteManifestCacheURL();
+        if (cacheURL != nil) {
+            [NSFileManager.defaultManager createDirectoryAtURL:cacheURL.URLByDeletingLastPathComponent
+                                   withIntermediateDirectories:YES attributes:nil error:NULL];
+            NSError *writeError = nil;
+            if (![data writeToURL:cacheURL options:NSDataWritingAtomic error:&writeError])
+                NSLog(@"root catalogue downloaded but could not be cached: %@", writeError);
+        }
+        if (ReloadRootChoices()) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [NSNotificationCenter.defaultCenter postNotificationName:RootsCatalogDidChangeNotification
+                                                                  object:self];
+            });
+        }
+    }];
+    [task resume];
 }
 
 - (BOOL)bundledRootChoiceNeedsDownload:(NSDictionary<NSString *, NSString *> *)choice {

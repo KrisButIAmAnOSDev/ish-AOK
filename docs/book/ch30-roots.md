@@ -32,6 +32,25 @@ before anything is downloaded.
 PSCAL + SmallCLUE — downloaded on demand into `/AOK/persist/roots` and imported
 from there. The catalogue itself is `deps/rootfs-manifest`.
 
+The catalogue is **downloaded**, and the copy inside the app is the fallback.
+That distinction is load-bearing: the app bundles a snapshot of `manifest.json`
+taken when it was built, so an installed build's idea of which filesystems
+exist used to be frozen at its release. Publishing a new rootfs left every
+existing install unable to see it, and withdrawing one left them asking for a
+URL that had stopped existing — "Couldn't download the filesystem image", with
+nothing fixable from the device. `refreshRootCatalogFromNetwork` fetches the
+published manifest at launch and whenever the Filesystems screen opens (rate
+limited), caches the last good copy in the App Group container, and falls back
+cache → in-app snapshot. A failed refresh — no network, an outage, an
+unparseable body — leaves the current catalogue exactly as it was; the picker
+is never emptied by one. The downloaded manifest goes through the same
+validation as the bundled one, because it decides which filesystems get
+fetched and from where; `downloadURL` must be `https`.
+
+The other half of that rule lives in the rootfs repo: an entry may be dropped
+from the manifest, but **an archive may never be deleted**, because installs
+that still hold an older manifest keep asking for it.
+
 A catalogue entry may also carry a `series` and a `version`. That is for images
 this project builds itself from sources that keep moving, rather than a
 distribution's own release: the PSCAL + SmallCLUE rootfs is rebuilt every so

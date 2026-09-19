@@ -17,6 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 FOUNDATION_EXPORT NSNotificationName const RootsDidFinishInitialSelectionNotification;
+// Posted on the main thread when a catalogue refresh changed what is offered.
+FOUNDATION_EXPORT NSNotificationName const RootsCatalogDidChangeNotification;
 
 @interface Roots : NSObject
 
@@ -42,6 +44,12 @@ FOUNDATION_EXPORT NSNotificationName const RootsDidFinishInitialSelectionNotific
 // list with every superseded version of a series removed (only the two most
 // recent survive). See the series/version notes in Roots.m.
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)offeredRootChoices;
+// Fetches the published catalogue so this build offers the filesystems that
+// exist now rather than the ones that existed when it was built. Returns
+// immediately; posts RootsCatalogDidChangeNotification if the offered list
+// actually changed. Safe to call often -- it rate-limits itself, and every
+// failure leaves the current catalogue untouched.
+- (void)refreshRootCatalogFromNetwork;
 // YES if this bundled choice's archive isn't shipped in the app bundle and
 // hasn't already been downloaded into /AOK/persist/roots -- i.e. selecting it
 // will trigger a network download before it can be imported.

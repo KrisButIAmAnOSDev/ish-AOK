@@ -406,7 +406,19 @@
         [self updateEmptyState];
         [self.tableView reloadData];
     }];
+    // A refresh that lands while this screen is up rewrites the distribution
+    // rows under the user, so redraw when the catalogue changes rather than
+    // leaving them looking at the list the app was built with.
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(rootCatalogDidChange:)
+                                               name:RootsCatalogDidChangeNotification
+                                             object:nil];
     [self updateEmptyState];
+}
+
+- (void)rootCatalogDidChange:(__unused NSNotification *)notification {
+    [self updateEmptyState];
+    [self.tableView reloadData];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -415,6 +427,9 @@
     // (wget/scp/Files) since this screen was last shown.
     [self reloadCachedRootArchives];
     [self.tableView reloadData];
+    // Opening this screen is the moment the catalogue matters, so check for a
+    // newer one. Rate-limited inside, so flipping back and forth is free.
+    [Roots.instance refreshRootCatalogFromNetwork];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
