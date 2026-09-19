@@ -139,6 +139,21 @@ elif command -v apk >/dev/null 2>&1; then
 fi
 command -v waybar >/dev/null 2>&1 \
     || note "warning: waybar did not install -- the desktop runs without a panel"
+# The font is the other half of a working panel, and its install is best-effort
+# too. Only waybar's absence used to be checked, so a font that failed to install
+# produced a panel of empty boxes and no warning.
+if command -v waybar >/dev/null 2>&1; then
+    if command -v fc-list >/dev/null 2>&1; then
+        font_hits=$(fc-list 2>/dev/null | grep -ci 'font *awesome')
+    else
+        font_hits=$(find /usr/share/fonts -iname '*awesome*' 2>/dev/null | grep -c .)
+    fi
+    if [ "${font_hits:-0}" = 0 ]; then
+        note "warning: waybar installed but Font Awesome did not -- every panel icon"
+        note "         will be an empty box with a code in it. Install it by hand,"
+        note "         then reopen the desktop."
+    fi
+fi
 
 # Best-effort, not required: a renamed/missing package on some future
 # Debian/Alpine release shouldn't block installing the actual Wayland stack

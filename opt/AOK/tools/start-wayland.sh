@@ -94,6 +94,31 @@ die()  {
     exit 1
 }
 
+# Whether Font Awesome is actually available to fontconfig. waybar's modules
+# draw their icons from its private-use codepoints, so without it every icon is
+# an empty box with the codepoint printed in it -- which is what a user saw on a
+# panel reading "11% [F2DB]  13% [F059]  85% [F0A0]". setup-wayland.sh installs
+# the font best-effort, and only waybar's OWN absence was ever checked, so a
+# failed font install produced a panel full of boxes and said nothing at all.
+aok_font_awesome_present() {
+    if command -v fc-list >/dev/null 2>&1; then
+        fc-list 2>/dev/null | grep -qi 'font *awesome'
+    else
+        # No fontconfig tools: look for the files the packages drop instead.
+        find /usr/share/fonts /usr/local/share/fonts "$HOME/.local/share/fonts" \
+            -iname '*awesome*' 2>/dev/null | grep -q .
+    fi
+}
+
+# The package that carries it, named per distro so the advice is actionable.
+aok_font_awesome_package() {
+    if command -v apt-get >/dev/null 2>&1; then printf 'fonts-font-awesome'
+    elif command -v pacman >/dev/null 2>&1; then printf 'otf-font-awesome'
+    elif command -v apk >/dev/null 2>&1; then printf 'font-awesome'
+    else printf 'the Font Awesome font'
+    fi
+}
+
 WAYVNC_PORT="${WAYVNC_PORT:-5901}"
 COMPOSITOR_CMD="${WAYLAND_COMPOSITOR_CMD:-labwc}"
 READY_FILE="${ISH_DISPLAY_READY_FILE:-/tmp/ish-display.ready}"
@@ -1199,6 +1224,12 @@ echo "READY $WAYVNC_PORT"
 if [ "$COMPOSITOR_CMD" = "labwc" ] && command -v waybar >/dev/null 2>&1 \
         && [ -x "$HOME/.config/labwc/panel.sh" ] \
         && ! grep -qs waybar "$HOME/.config/labwc/autostart"; then
+    if ! aok_font_awesome_present; then
+        log "warning: Font Awesome is not installed, so the panel's icons will"
+        log "         draw as empty boxes with a code in them. Install it with"
+        log "         your package manager ($(aok_font_awesome_package)) and"
+        log "         reopen the desktop, or re-run /AOK/tools/setup-wayland.sh."
+    fi
     log "starting the panel (waybar)"
     spawn_logged panel "$HOME/.config/labwc/panel.sh" start
     PANEL_PID=$SPAWN_PID
