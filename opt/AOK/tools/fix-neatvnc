@@ -1,0 +1,292 @@
+#!/bin/sh
+# fix-neatvnc
+# ---------------------------------------------------------------------------
+# Build and install a neatvnc new enough for the Display applet to resize the
+# Wayland desktop.
+#
+# THE PROBLEM. neatvnc before 0.9.2 encodes a client's pending damage against
+# the current frame without clamping it to that frame's size. Shrink the
+# desktop while anything on it is still redrawing and the raw encoder walks the
+# old, bigger damage box over the new, smaller frame, reads past the end of it,
+# and wayvnc dies with SIGSEGV. Upstream fixed it in 0.9.2 ("server: Clamp
+# damage to fb size"). Because of that, start-wayland.sh reads `wayvnc -V` and
+# starts wayvnc with --disable-resizing on anything older, so the desktop stays
+# at its default size, scaled to fit, instead of following the window.
+#
+# Debian 13 / Devuan 6 ship neatvnc 0.9.1, which is why the desktop does not
+# resize there. Arch ships 1.0.1 and already resizes. Debian forky has 1.0.1
+# too, so a later Devuan will fix itself and this script becomes unnecessary.
+#
+# WHY 0.9.6 BY DEFAULT, NOT 1.0.1. Both have the clamp, but they are not
+# equally cheap to install:
+#
+#   0.9.6  keeps the 0.9 line's soname (libneatvnc.so.0) and its aml 0.3
+#          dependency, so it is a drop-in: the wayvnc already installed links
+#          against it unchanged, and nothing else has to be built.
+#   1.0.1  is a major bump. It needs aml 1.x -- a different library, found
+#          under a different pkg-config name (aml1) -- and it installs
+#          libneatvnc.so.1, which the distro's wayvnc will not load. Using it
+#          means building aml, neatvnc AND wayvnc, and running a wayvnc this
+#          script built rather than the one the distro packaged.
+#
+# Both are more than the >= 0.9.2 that start-wayland.sh asks for, so 0.9.6 buys
+# the same feature for a third of the risk. Ask for 1.0.1 with --version if you
+# want it anyway; the script will build the whole chain.
+#
+# Everything is installed under /usr/local, so the distro's own packages are
+# left alone and `apt remove` / `apk del` still describe reality. Removing what
+# this installs is rm under /usr/local/{lib,include,lib/pkgconfig} plus
+# ldconfig.
+#
+# Run as root:
+#       sudo sh /AOK/tools/fix-neatvnc
+#       sudo sh /AOK/tools/fix-neatvnc --version 1.0.1
+#
+# Then restart the desktop (close the Display applet and reopen it) so
+# start-wayland.sh re-reads the version and drops --disable-resizing.
+# ---------------------------------------------------------------------------
+set -u
+
+SELF=fix-neatvnc
+DEFAULT_TARGET=0.9.6
+PREFIX=/usr/local
+
+log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+warn() { printf '    \033[1;33mwarning:\033[0m %s\n' "$*"; }
+die()  { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: sh /AOK/tools/$SELF [--version VER] [--force] [--keep-build] [-h]
+
+  --version VER   neatvnc release to install (default $DEFAULT_TARGET). A 1.x
+                  version also builds aml 1.x and wayvnc, because 1.x changes
+                  the soname and the distro's wayvnc cannot load it.
+  --force         build and install even when the installed version already
+                  has the damage clamp.
+  --keep-build    leave the build tree behind instead of deleting it.
+  -h, --help      this text.
+EOF
+}
+
+TARGET=$DEFAULT_TARGET
+FORCE=0
+KEEP_BUILD=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version) [ $# -ge 2 ] || die "--version needs a value"; TARGET=$2; shift 2 ;;
+        --version=*) TARGET=${1#--version=}; shift ;;
+        --force) FORCE=1; shift ;;
+        --keep-build) KEEP_BUILD=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "unknown argument: $1" ;;
+    esac
+done
+TARGET=${TARGET#v}
+
+[ "$(id -u)" = 0 ] || die "must run as root:  sudo sh /AOK/tools/$SELF"
+
+# --- version comparison -----------------------------------------------------
+# Numeric, field by field, over the first three dotted fields. A field awk
+# cannot read as a number ("1+dfsg-1") contributes its leading digits, which is
+# what a Debian revision should do here.
+version_ge() {
+    printf '%s\n%s\n' "${1#v}" "${2#v}" | awk -F. '
+        NR == 1 { for (i = 1; i <= 3; i++) a[i] = $i + 0; next }
+                { for (i = 1; i <= 3; i++) b[i] = $i + 0 }
+        END {
+            for (i = 1; i <= 3; i++) {
+                if (a[i] > b[i]) exit 0
+                if (a[i] < b[i]) exit 1
+            }
+            exit 0
+        }'
+}
+
+# What is installed now. pkg-config is the direct answer; `wayvnc -V` is the
+# fallback, and it is also what start-wayland.sh gates on, so it is the reading
+# that actually decides whether resizing gets turned off.
+installed_version() {
+    _v=""
+    if command -v pkg-config >/dev/null 2>&1; then
+        _v=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+                pkg-config --modversion neatvnc 2>/dev/null)
+    fi
+    if [ -z "$_v" ] && command -v wayvnc >/dev/null 2>&1; then
+        _v=$(wayvnc -V 2>/dev/null | awk -F': *' '$1 == "neatvnc" { print $2; exit }')
+    fi
+    printf '%s' "$_v"
+}
+
+CURRENT=$(installed_version)
+log "checking the installed neatvnc"
+if [ -n "$CURRENT" ]; then
+    note "installed: $CURRENT"
+else
+    note "installed: not found (no pkg-config entry and no wayvnc to ask)"
+fi
+note "target:    $TARGET"
+
+if [ -n "$CURRENT" ] && version_ge "$CURRENT" "$TARGET" && [ "$FORCE" = 0 ]; then
+    note "already at or past the target -- nothing to do."
+    note "(pass --force to build it anyway)"
+    exit 0
+fi
+if [ -n "$CURRENT" ] && version_ge "$CURRENT" 0.9.2 && [ "$FORCE" = 0 ]; then
+    note "$CURRENT already has the damage clamp, so resizing is not being"
+    note "disabled on account of neatvnc. Building $TARGET anyway would change"
+    note "nothing the applet can see; pass --force if you want it regardless."
+    exit 0
+fi
+
+# --- what the requested version drags in ------------------------------------
+case "$TARGET" in
+    0.*) AML_TAG=v0.3.0;  AML_PC=aml;  BUILD_WAYVNC=0 ;;
+    1.*) AML_TAG=v1.0.0;  AML_PC=aml1; BUILD_WAYVNC=1; WAYVNC_TAG=v0.10.1 ;;
+    *)   die "unsupported target '$TARGET' -- this script knows the 0.x and 1.x lines" ;;
+esac
+if [ "$BUILD_WAYVNC" = 1 ]; then
+    log "note: $TARGET is a major bump"
+    note "It installs libneatvnc.so.1, which the wayvnc already on this system"
+    note "cannot load, so aml $AML_TAG and wayvnc $WAYVNC_TAG are built too and"
+    note "$PREFIX/bin/wayvnc will shadow the packaged one on PATH."
+fi
+
+# --- build dependencies -----------------------------------------------------
+log "installing build dependencies"
+if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update \
+        || warn "apt-get update failed; trying the install anyway"
+    # libdrm/gbm/ffmpeg are optional neatvnc features, installed so the build
+    # comes out with the same feature set the distro's package had rather than
+    # a quietly smaller one.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential meson ninja-build pkg-config git ca-certificates \
+        libdrm-dev libpixman-1-dev zlib1g-dev libgnutls28-dev nettle-dev \
+        libgmp-dev libturbojpeg0-dev libgbm-dev libavcodec-dev \
+        libavfilter-dev libavutil-dev \
+        || die "apt-get install failed -- see output above"
+elif command -v apk >/dev/null 2>&1; then
+    apk add build-base meson ninja pkgconf git ca-certificates \
+        libdrm-dev pixman-dev zlib-dev gnutls-dev nettle-dev gmp-dev \
+        libjpeg-turbo-dev mesa-dev ffmpeg-dev \
+        || die "apk add failed -- see output above"
+elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm || warn "pacman -Sy failed; trying the install anyway"
+    pacman -S --needed --noconfirm base-devel meson ninja pkgconf git \
+        libdrm pixman zlib gnutls nettle gmp libjpeg-turbo mesa ffmpeg \
+        || die "pacman -S failed -- see output above"
+else
+    die "no apt-get, apk or pacman here -- install meson, ninja, a C toolchain,
+    pkg-config, git and the libdrm/pixman/zlib headers by hand, then re-run"
+fi
+
+for tool in meson ninja git cc pkg-config; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after the dependency install"
+done
+
+# --- fetch and build --------------------------------------------------------
+BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fix-neatvnc.XXXXXX") \
+    || die "could not make a build directory"
+cleanup() {
+    if [ "$KEEP_BUILD" = 1 ]; then
+        note "build tree left at $BUILD_ROOT"
+    else
+        rm -rf "$BUILD_ROOT"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# build_from_git <name> <url> <tag> [extra meson args...]
+build_from_git() {
+    _name=$1; _url=$2; _tag=$3; shift 3
+    log "building $_name $_tag"
+    git clone --quiet --depth 1 --branch "$_tag" "$_url" "$BUILD_ROOT/$_name" \
+        || die "could not clone $_name $_tag from $_url -- check network/DNS (guest /etc/resolv.conf)"
+    ( cd "$BUILD_ROOT/$_name" \
+        && meson setup build --prefix="$PREFIX" --buildtype=release "$@" \
+        && ninja -C build \
+        && ninja -C build install ) \
+        || die "$_name $_tag failed to build -- see output above"
+    note "$_name $_tag installed under $PREFIX"
+}
+
+# aml first: neatvnc needs it, and the version it needs differs per line.
+if pkg-config --exists "$AML_PC" 2>/dev/null; then
+    note "$AML_PC already present ($(pkg-config --modversion "$AML_PC")), not rebuilding"
+else
+    build_from_git aml https://github.com/any1/aml.git "$AML_TAG"
+fi
+
+build_from_git neatvnc https://github.com/any1/neatvnc.git "v$TARGET" \
+    -Dexamples=false -Dbenchmarks=false -Dtests=false
+
+if [ "$BUILD_WAYVNC" = 1 ]; then
+    build_from_git wayvnc https://github.com/any1/wayvnc.git "$WAYVNC_TAG"
+fi
+
+# --- make the loader see it -------------------------------------------------
+log "refreshing the dynamic linker"
+if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig || warn "ldconfig failed; a new library may not be found until it is re-run"
+else
+    # musl has no ldconfig: its loader reads a path list instead, and
+    # /usr/local/lib is not on it by default.
+    for pathfile in /etc/ld-musl-"$(uname -m)".path; do
+        if [ -f "$pathfile" ]; then
+            if ! grep -q "^$PREFIX/lib\$" "$pathfile" 2>/dev/null; then
+                printf '%s\n' "$PREFIX/lib" >> "$pathfile"
+                note "added $PREFIX/lib to $pathfile"
+            fi
+        else
+            printf '%s\n%s\n' "$PREFIX/lib" /usr/lib > "$pathfile"
+            note "wrote $pathfile"
+        fi
+    done
+fi
+
+# --- prove it took ----------------------------------------------------------
+# Installing the library is not the same as wayvnc using it, and that is the
+# only thing that decides whether the desktop resizes. Ask the questions
+# start-wayland.sh will ask.
+log "verifying"
+NEW=$(installed_version)
+note "neatvnc now reports: ${NEW:-<nothing>}"
+[ -n "$NEW" ] || die "neatvnc still cannot be found after installing -- see output above"
+version_ge "$NEW" "$TARGET" \
+    || die "still $NEW after installing $TARGET; the old one is being found first"
+
+FAILED=0
+if command -v wayvnc >/dev/null 2>&1; then
+    WAYVNC_BIN=$(command -v wayvnc)
+    note "wayvnc: $WAYVNC_BIN"
+    WAYVNC_SEES=$(wayvnc -V 2>/dev/null | awk -F': *' '$1 == "neatvnc" { print $2; exit }')
+    note "wayvnc links against neatvnc: ${WAYVNC_SEES:-<could not read>}"
+    if [ -n "$WAYVNC_SEES" ] && ! version_ge "$WAYVNC_SEES" 0.9.2; then
+        warn "wayvnc is still loading $WAYVNC_SEES, so resizing stays off."
+        if command -v ldd >/dev/null 2>&1; then
+            note "it is loading:"
+            ldd "$WAYVNC_BIN" 2>/dev/null | grep neatvnc | sed 's/^/      /'
+        fi
+        note "On glibc that usually means $PREFIX/lib is not ahead of the"
+        note "packaged library for the loader; check /etc/ld.so.conf.d and"
+        note "re-run ldconfig. A 1.x target needs the wayvnc this script built"
+        note "to be first on PATH."
+        FAILED=1
+    fi
+else
+    warn "no wayvnc installed, so there is nothing to link against it yet."
+    note "Run /AOK/tools/setup-wayland.sh to install the desktop."
+fi
+
+if [ "$FAILED" = 0 ]; then
+    log "done"
+    note "Close the Display applet and open it again: start-wayland.sh re-reads"
+    note "the version at start and will leave --disable-resizing off, after"
+    note "which the desktop follows the window it is shown in."
+else
+    die "installed, but wayvnc is not using it yet -- see the notes above"
+fi
