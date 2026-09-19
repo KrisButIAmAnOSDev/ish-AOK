@@ -1010,6 +1010,100 @@ fd_t sys_fsopen(addr_t fsname_addr, dword_t flags) {
 #define FSCONFIG_CMD_CREATE_ 6
 #define FSCONFIG_CMD_RECONFIGURE_ 7
 
+// Option-name vocabularies for fsconfig().
+//
+// An unknown option has to be REFUSED, not swallowed. systemd decides whether a
+// filesystem supports an option by asking (mount_option_supported() in
+// src/basic/mountpoint-util.c), and it opens with a canary: FSCONFIG_SET_FD with
+// the key "adefinitelynotexistingmountoption". A kernel whose fsconfig never
+// fails is exactly what that canary is looking for, and finding one makes
+// systemd give up on the whole question with EAGAIN -- "FSCONFIG_SET_FD worked
+// unexpectedly for '%s', whoa!". That is where an openSUSE guest's "Unable to
+// determine whether tmpfs supports 'usrquota' mount option, assuming not:
+// Resource temporarily unavailable" came from, and the cgroupfs
+// 'memory_hugetlb_accounting' one beside it.
+//
+// This is a check on the option's NAME, not a claim that AOK implements its
+// effect -- AOK still models only "ro", and everything else here is accepted and
+// ignored exactly as before. The vocabulary is the one a stock Linux build of
+// the same filesystem parses, which is the question the caller is really asking:
+// "would a kernel reject this spelling?". So size= and mode= on tmpfs still
+// work, which systemd's own tmpfs setup needs, while usrquota (a CONFIG_TMPFS_
+// QUOTA option, refused on a stock kernel -- measured on Linux 6.12) and
+// outright nonsense are refused.
+//
+// A filesystem with no vocabulary here stays permissive. That keeps AOK's own
+// filesystems (realfs, aokfs, fakefs, binfmt_misc) exactly as they were, so the
+// tightening reaches only the filesystems whose real option sets are written
+// down below.
+static const char *const fsopt_generic[] = {
+    "ro", "rw", "sync", "dirsync", "nosuid", "nodev", "noexec", "noatime",
+    "nodiratime", "relatime", "strictatime", "lazytime", "silent", "source",
+    NULL,
+};
+static const char *const fsopt_tmpfs[] = {
+    "size", "nr_blocks", "nr_inodes", "mode", "uid", "gid", "huge", "mpol",
+    "noswap", NULL,
+};
+static const char *const fsopt_proc[] = {"hidepid", "gid", "subset", NULL};
+static const char *const fsopt_sysfs[] = {NULL};
+static const char *const fsopt_devpts[] = {
+    "uid", "gid", "mode", "ptmxmode", "newinstance", "max", NULL,
+};
+static const char *const fsopt_cgroup2[] = {
+    "nsdelegate", "favordynmods", "memory_localevents", "memory_recursiveprot",
+    "memory_hugetlb_accounting", "pids_localevents", NULL,
+};
+static const char *const fsopt_cgroup[] = {
+    "none", "all", "noprefix", "xattr", "release_agent", "name",
+    "clone_children", "cpu", "cpuacct", "cpuset", "memory", "devices",
+    "freezer", "net_cls", "net_prio", "blkio", "perf_event", "hugetlb",
+    "pids", "rdma", "misc", NULL,
+};
+static const char *const fsopt_fuse[] = {
+    "fd", "rootmode", "user_id", "group_id", "default_permissions",
+    "allow_other", "max_read", "blksize", NULL,
+};
+
+static const struct {
+    const char *fs;
+    const char *const *names;
+} fsopt_vocab[] = {
+    {"tmpfs", fsopt_tmpfs},
+    {"devtmpfs", fsopt_tmpfs},   // a devtmpfs IS a tmpfs
+    {"proc", fsopt_proc},
+    {"sysfs", fsopt_sysfs},
+    {"devpts", fsopt_devpts},
+    {"cgroup2", fsopt_cgroup2},
+    {"cgroup", fsopt_cgroup},
+    {"fuse", fsopt_fuse},
+};
+
+static bool fsopt_listed(const char *const *names, const char *key) {
+    for (size_t i = 0; names[i] != NULL; i++)
+        if (strcmp(names[i], key) == 0)
+            return true;
+    return false;
+}
+
+// True when this option name is one the filesystem would parse. Permissive for
+// anything with no vocabulary, and for an empty key (a caller asking nothing).
+static bool fscontext_option_known(const struct fscontext_data *data, const char *key) {
+    if (key[0] == '\0')
+        return true;
+    if (fsopt_listed(fsopt_generic, key))
+        return true;
+    if (data->fs == NULL || data->fs->name == NULL)
+        return true;  // binfmt_misc and anything else without a table
+    for (size_t i = 0; i < sizeof(fsopt_vocab) / sizeof(fsopt_vocab[0]); i++) {
+        if (strcmp(fsopt_vocab[i].fs, data->fs->name) != 0)
+            continue;
+        // The fuse vocabulary also covers the fuseblk spelling, which shares it.
+        return fsopt_listed(fsopt_vocab[i].names, key);
+    }
+    return true;  // no vocabulary written down for this filesystem
+}
+
 dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_addr_t value_addr, int_t aux) {
     char key[100] = "";
     if (key_addr != 0 && user_read_string(key_addr, key, sizeof(key)))
@@ -1027,12 +1121,15 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
     switch (cmd) {
         case FSCONFIG_SET_FLAG_:
         case FSCONFIG_SET_STRING_:
-            // We only act on the one option this codebase's mount model has
-            // an equivalent for ("ro"); everything else (size=, mode=,
-            // source=, SELinux context=, ...) is silently accepted, matching
-            // this project's existing "don't model X" precedent for mount
-            // options iSH has no backing concept for (see do_mount's
+            // A name this filesystem would not parse is refused, the way Linux
+            // refuses it; see fscontext_option_known. We still only ACT on the
+            // one option this codebase's mount model has an equivalent for
+            // ("ro") -- size=, mode=, SELinux context= and the rest are
+            // accepted and ignored, the existing "don't model X" precedent for
+            // mount options AOK has no backing concept for (see do_mount's
             // MS_IGNORED).
+            if (!fscontext_option_known(data, key))
+                return _EINVAL;
             if (strcmp(key, "ro") == 0)
                 data->readonly = true;
             return 0;
@@ -1040,7 +1137,14 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
         case FSCONFIG_SET_PATH_:
         case FSCONFIG_SET_PATH_EMPTY_:
         case FSCONFIG_SET_FD_:
-            return 0; // accepted, not modeled
+            // AOK has no parameter of any of these kinds -- no filesystem here
+            // takes a blob, a path or a descriptor through fsconfig -- so every
+            // key is an unknown one, which is EINVAL. Linux answers the same for
+            // a filesystem with no such parameter, and systemd's
+            // mount_option_supported() canary reads exactly this: it wants
+            // EINVAL here to conclude the filesystem is converted to the new
+            // mount API and its later answers can be believed.
+            return _EINVAL;
         case FSCONFIG_CMD_CREATE_: {
             if (data->created)
                 return _EBUSY;
