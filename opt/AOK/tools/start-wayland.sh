@@ -1092,6 +1092,21 @@ neatvnc_lacks_damage_clamp() {
         $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+/ { exit 1 }
         { exit !($1 + 0 == 0 && ($2 + 0 < 9 || ($2 + 0 == 9 && $3 + 0 < 2))) }'
 }
+# ISH_DISPLAY_MAX_FPS: wayvnc captures and encodes the whole framebuffer in
+# software, and hands its rate limit to the compositor's screencopy as well, so
+# this bounds BOTH. The default is 30, which is affordable at one pixel per
+# point and is not at 2x or 3x -- four and nine times the bytes per frame. The
+# applet works the number out from the resolution the user chose and passes it
+# here; unset, wayvnc keeps its own default and nothing changes.
+WAYVNC_FPS_ARG=""
+case "${ISH_DISPLAY_MAX_FPS:-}" in
+    "") : ;;
+    *[!0-9]*) log "warning: ignoring non-numeric ISH_DISPLAY_MAX_FPS='$ISH_DISPLAY_MAX_FPS'" ;;
+    0) : ;;
+    *) WAYVNC_FPS_ARG="--max-fps=$ISH_DISPLAY_MAX_FPS"
+       log "capping wayvnc at ${ISH_DISPLAY_MAX_FPS} fps for the chosen resolution" ;;
+esac
+
 WAYVNC_RESIZE_ARG=""
 NEATVNC_VERSION="$(wayvnc -V 2>/dev/null | awk -F': *' '$1 == "neatvnc" { print $2; exit }')"
 if neatvnc_lacks_damage_clamp "$NEATVNC_VERSION" \
@@ -1105,7 +1120,7 @@ wayvnc_attempt=1
 while true; do
     log "starting wayvnc on :$WAYVNC_PORT (attempt $wayvnc_attempt)"
     # $WAYVNC_RESIZE_ARG is empty or one word, so it is left unquoted.
-    spawn_logged "wayvnc-attempt$wayvnc_attempt" wayvnc $WAYVNC_RESIZE_ARG 127.0.0.1 "$WAYVNC_PORT"
+    spawn_logged "wayvnc-attempt$wayvnc_attempt" wayvnc $WAYVNC_RESIZE_ARG $WAYVNC_FPS_ARG 127.0.0.1 "$WAYVNC_PORT"
     WAYVNC_PID=$SPAWN_PID
 
     # Confirm wayvnc is both still alive AND actually bound/listening before

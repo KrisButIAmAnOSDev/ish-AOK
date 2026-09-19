@@ -56,15 +56,44 @@ static CGFloat DisplayResolvedUIScale(void) {
     return (CGFloat) pref;
 }
 
+// wayvnc captures and encodes the WHOLE framebuffer at up to --max-fps, which
+// defaults to 30, in software, inside the guest -- and its rate limit is handed
+// to the compositor's screencopy too, so it bounds the capture as well as the
+// encode. At one pixel per point that is affordable. At 2x it is four times the
+// bytes per frame and at 3x nine times: an iPad at 2x is 1668x2420x4 bytes, so
+// 30fps asks for about 480 MB/s of capture and encode from an emulated guest.
+// Reported as "terminal updates are glacially slow" while menus and window
+// dragging stayed responsive -- which is the signature: a terminal redraws
+// continuously and so competes with the capture, where the rest of the desktop
+// only redraws when touched.
+//
+// So the frame rate comes down as the pixel count goes up, keeping pixels x fps
+// within about twice the 1x baseline. A desktop is not a video player; terminals
+// and menus do not need 30fps, and fewer whole frames beats more frames nobody
+// can wait for. 0 means "say nothing and let wayvnc keep its own default".
+static int DisplayMaxFPSForScale(CGFloat scale) {
+    if (scale >= 2.5)
+        return 10;
+    if (scale >= 1.5)
+        return 15;
+    return 0;
+}
+
 // Carried INSIDE the command string, not in envp: the default-user path runs
 // through `su -`, a login shell, which discards the environment it was handed.
-// At scale 1 this is empty and the command keeps exactly the shape it had, so
-// nothing changes for anyone who has not touched the setting.
+// Empty at scale 1, so the command keeps exactly the shape it had and nothing
+// changes for anyone who has not touched the settings.
 static NSString *DisplayUIScaleEnvPrefix(void) {
-    CGFloat scale = DisplayResolvedUIScale();
-    if (!(scale > 1.0))
-        return @"";
-    return [NSString stringWithFormat:@"ISH_DISPLAY_UI_SCALE=%g ", (double) scale];
+    NSMutableString *prefix = [NSMutableString string];
+    CGFloat uiScale = DisplayResolvedUIScale();
+    if (uiScale > 1.0)
+        [prefix appendFormat:@"ISH_DISPLAY_UI_SCALE=%g ", (double) uiScale];
+    // Keyed off the RESOLUTION, which is what decides the framebuffer's size;
+    // the UI scale only changes how big things look inside it.
+    int maxFPS = DisplayMaxFPSForScale(DisplayResolvedDesktopScale());
+    if (maxFPS > 0)
+        [prefix appendFormat:@"ISH_DISPLAY_MAX_FPS=%d ", maxFPS];
+    return prefix;
 }
 
 static NSArray<NSString *> *DisplayRootCommand(void) {
