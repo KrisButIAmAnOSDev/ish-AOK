@@ -526,6 +526,23 @@ if [ -e "$1" ]; then
             }
             return out s
         }
+        # An entry that asks a file manager to take over the desktop, or to
+        # configure the desktop it would be managing. labwc draws the desktop
+        # here and nothing runs `pcmanfm --desktop`, so these cannot work:
+        # pcmanfm answers --desktop-pref, --wallpaper-mode and --set-wallpaper
+        # with a modal "Desktop manager is not active." (src/pcmanfm.c), and
+        # --desktop itself would try to take the desktop labwc is drawing.
+        #
+        # Neither existing filter catches it. Its Categories carry
+        # DesktopSettings, but dropping that whole category would take
+        # lxappearance with it, which sets the GTK theme and does work here;
+        # and its NotShowIn names GNOME, XFCE, KDE and MATE -- no wlroots
+        # compositor -- so the standard key says nothing about this desktop.
+        # setup-wayland-extras.sh installs pcmanfm in its "tools" set, so the
+        # entry is present on any root that ran it.
+        function manages_the_desktop(cmd) {
+            return cmd ~ /(^| )--(desktop-pref|wallpaper-mode|set-wallpaper|desktop)( |=|$)/
+        }
         # Whether a ;-separated OnlyShowIn/NotShowIn list names this desktop.
         function names_this_desktop(list,    n, i, names) {
             n = split(list, names, ";")
@@ -549,6 +566,7 @@ if [ -e "$1" ]; then
             if (type != "Application" || hidden || name == "" || execline == "") return
             if (only_show_in != "" && !names_this_desktop(only_show_in)) return
             if (not_show_in != "" && names_this_desktop(not_show_in)) return
+            if (manages_the_desktop(execline)) return
             execline = strip_field_codes(execline)
             if (terminal == "true") execline = "foot " execline
             s = section_for(categories)
