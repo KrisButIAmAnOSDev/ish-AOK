@@ -644,6 +644,7 @@ src = [
     'fs/pty.c',
     'fs/tmp.c',
     'fs/fuse.c',
+    'fs/aokgfx.c',
 
     'fs/poll.c',
     'kernel/poll.c',
