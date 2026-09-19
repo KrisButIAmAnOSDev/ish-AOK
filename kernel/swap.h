@@ -60,6 +60,13 @@ int swap_enable(uint64_t bytes);
 // compressed tier or refused, and nothing is ever written to storage. `bytes`
 // is the addressable size, not the memory used -- see swap_ram_only in swap.c.
 int swap_enable_ram_only(uint64_t bytes);
+// Enable swap with a caller-provided file descriptor. The fd must be writable
+// and seekable. OWNERSHIP TRANSFERS AT THIS CALL: on failure the kernel closes
+// the fd before returning; on success it stays open for the area's lifetime
+// and is truncated and closed when the area is released (swap_disable). The
+// caller must never close it. Used for external storage (USB drives) where
+// the fd comes from a security-scoped URL.
+int swap_enable_fd(int host_fd, uint64_t bytes);
 
 // Turn the pager off: stop new eviction, fault every evicted page back into its
 // address space, then release the slot table and truncate and close the file.
@@ -89,6 +96,15 @@ void swap_startup(void);
 // simulator sitting on the rootfs picker with nothing installed had half a
 // gigabyte of swap file open in its container.
 void swap_set_preference(bool enabled, unsigned size_mb);
+
+// Provide a pre-opened file descriptor for external swap (USB drives). Must be
+// called before swap_startup(). The fd is used when shouldEnableSwapOnExternal
+// is set; swap_startup() calls swap_enable_fd() with it instead of
+// swap_enable(). swap_startup() CONSUMES it on every path: it either hands it
+// to swap_enable_fd(), where ownership passes to the kernel whatever the
+// result, or closes it itself. Either way the caller must never close it --
+// not even when swap never comes up.
+void swap_set_external_fd(int fd);
 
 // May a guest process change the switch, through /proc/ish/swap?
 //
