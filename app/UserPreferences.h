@@ -169,6 +169,21 @@ extern NSString *const kThemeBackgroundColor;
 @property NSArray<NSString *> *launchCommand;
 @property NSArray<NSString *> *bootCommand;
 @property (nonatomic) NSString *customDnsServers;
+// The Wayland desktop's two size settings, which are deliberately separate.
+//
+// displayDesktopScale is how many desktop PIXELS the applet asks for per point
+// of the surface showing it: 1 is one pixel per point (what this has always
+// done), 2 and 3 ask for that many times as many, and 0 means the device's own
+// nativeScale. More pixels cost quadratically -- wayvnc encodes every frame in
+// software inside the guest -- so this stays at 1 unless asked.
+//
+// displayUIScale is the scale the compositor reports to its clients, which
+// decides how big things LOOK. 0 means "match the resolution", which keeps text
+// and windows the physical size they are now and just renders them sharply; 1
+// with a raised resolution instead fits proportionally more on screen at
+// proportionally smaller size. Applied in the guest with wlr-randr.
+@property NSInteger displayDesktopScale;
+@property NSInteger displayUIScale;
 // When YES, AOK never writes the guest's /etc/resolv.conf and never binds the
 // local DNS responder on 127.0.0.1:53, leaving name resolution entirely to the
 // guest. The default (NO) rewrites the file on every network path change, which

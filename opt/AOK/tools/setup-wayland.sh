@@ -68,9 +68,9 @@ if command -v apt-get >/dev/null 2>&1; then
     log "apt-get update"
     apt-get update || die "apt-get update failed -- check network/DNS (guest /etc/resolv.conf)"
 
-    log "installing labwc, sway, wofi, foot, wayvnc"
+    log "installing labwc, sway, wofi, foot, wayvnc, wlr-randr"
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        labwc sway wofi foot wayvnc \
+        labwc sway wofi foot wayvnc wlr-randr \
         || die "apt-get install failed -- see output above"
 
 elif command -v pacman >/dev/null 2>&1; then
@@ -82,8 +82,8 @@ elif command -v pacman >/dev/null 2>&1; then
     # run the provisioner first in that case.
     log "pacman -Sy"
     pacman -Sy --noconfirm || die "pacman -Sy failed -- check network/DNS (guest /etc/resolv.conf)"
-    log "installing labwc, sway, wofi, foot, wayvnc"
-    pacman -S --needed --noconfirm labwc sway wofi foot wayvnc \
+    log "installing labwc, sway, wofi, foot, wayvnc, wlr-randr"
+    pacman -S --needed --noconfirm labwc sway wofi foot wayvnc wlr-randr \
         || die "pacman -S failed -- see output above"
 
 elif command -v apk >/dev/null 2>&1; then
@@ -92,7 +92,9 @@ elif command -v apk >/dev/null 2>&1; then
     # font-dejavu: on Devuan and Arch the stack pulls in a text font, and on
     # Alpine nothing does. With only the icon font waybar brings below, every
     # window title, menu and foot terminal was drawn in Font Awesome.
-    apk add labwc sway wofi foot wayvnc font-dejavu || die "apk add failed -- see output above"
+    # wlr-randr sets the output scale the Display applet's UI-scale setting
+    # asks for; labwc has no output configuration of its own.
+    apk add labwc sway wofi foot wayvnc font-dejavu wlr-randr || die "apk add failed -- see output above"
 
 else
     die "no supported package manager found (need apt-get, pacman, or apk)"

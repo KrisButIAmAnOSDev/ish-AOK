@@ -53,6 +53,8 @@ static NSString *const kPreferenceLLMToolMaxRoundsKey = @"LLM Tool Max Rounds";
 static NSString *const kPreferenceLLMHideThinkingKey = @"LLM Hide Thinking";
 static NSString *const kPreferenceShortcutsRunCommandsEnabledKey = @"Shortcuts Run Commands Enabled";
 static NSString *const kPreferenceCustomDnsServersKey = @"Custom DNS Servers";
+static NSString *const kPreferenceDisplayDesktopScaleKey = @"Display Desktop Scale";
+static NSString *const kPreferenceDisplayUIScaleKey = @"Display UI Scale";
 static NSString *const kPreferenceDisableResolvConfRewriteKey = @"Disable Resolv Conf Rewrite";
 
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
@@ -280,6 +282,9 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceBacktickEscapeKey: @(NO),
             kPreferenceDisableDimmingKey: @(NO),
             kPreferenceDisableResolvConfRewriteKey: @(NO),
+            // 1 = one desktop pixel per point, 0 = match the resolution.
+            kPreferenceDisplayDesktopScaleKey: @(1),
+            kPreferenceDisplayUIScaleKey: @(0),
             kPreferenceLaunchCommandKey: ISHDefaultLaunchCommand(),
             kPreferenceBootCommandKey: ISHDefaultBootCommand(),
             // The SESSION SHELL, not the console, and that is what makes a
@@ -359,6 +364,8 @@ void amd64_jit_preference_set(bool enabled) {
             @"disable_dimming": kPreferenceDisableDimmingKey,
             @"custom_dns_servers": kPreferenceCustomDnsServersKey,
             @"disable_resolv_conf_rewrite": kPreferenceDisableResolvConfRewriteKey,
+            @"display_desktop_scale": kPreferenceDisplayDesktopScaleKey,
+            @"display_ui_scale": kPreferenceDisplayUIScaleKey,
             @"enable_llm_client": kPreferenceEnableLLMClientKey,
             @"llm_provider": kPreferenceLLMProviderKey,
             @"llm_server_url": kPreferenceLLMServerURLKey,
@@ -428,6 +435,8 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceShortcutsRunCommandsEnabledKey: property(shortcutsRunCommandsEnabled),
             kPreferenceCustomDnsServersKey: property(customDnsServers),
             kPreferenceDisableResolvConfRewriteKey: property(shouldDisableResolvConfRewrite),
+            kPreferenceDisplayDesktopScaleKey: property(displayDesktopScale),
+            kPreferenceDisplayUIScaleKey: property(displayUIScale),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
             kPreferenceCursorStyleKey: property(cursorStyle),
@@ -911,6 +920,35 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 - (BOOL)validateShouldDisableResolvConfRewrite:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: displayDesktopScale / displayUIScale
+// Clamped to 0..3: 0 carries a meaning (native, and match-the-resolution), and
+// anything past 3 is more pixels than any device here has points to justify.
+- (NSInteger)displayDesktopScale {
+    return MIN(MAX([_defaults integerForKey:kPreferenceDisplayDesktopScaleKey], (NSInteger) 0), (NSInteger) 3);
+}
+
+- (void)setDisplayDesktopScale:(NSInteger)scale {
+    [_defaults setInteger:MIN(MAX(scale, (NSInteger) 0), (NSInteger) 3)
+                   forKey:kPreferenceDisplayDesktopScaleKey];
+}
+
+- (BOOL)validateDisplayDesktopScale:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+- (NSInteger)displayUIScale {
+    return MIN(MAX([_defaults integerForKey:kPreferenceDisplayUIScaleKey], (NSInteger) 0), (NSInteger) 3);
+}
+
+- (void)setDisplayUIScale:(NSInteger)scale {
+    [_defaults setInteger:MIN(MAX(scale, (NSInteger) 0), (NSInteger) 3)
+                   forKey:kPreferenceDisplayUIScaleKey];
+}
+
+- (BOOL)validateDisplayUIScale:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSNumber.class];
 }
 

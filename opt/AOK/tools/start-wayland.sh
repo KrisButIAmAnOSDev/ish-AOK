@@ -1005,6 +1005,35 @@ export WAYLAND_DISPLAY="$WAYLAND_SOCKET_NAME"
 # any more precisely.
 sleep 0.3
 
+# ISH_DISPLAY_UI_SCALE: how big things should LOOK, which is a separate question
+# from how many pixels the desktop has. The applet asks for the pixel count over
+# RFB (SetDesktopSize); this sets the scale the compositor reports to its
+# clients, so a desktop with three times the pixels can either fit three times
+# as much at a third the size (scale 1) or draw the same layout sharply
+# (scale 3). Applied before wayvnc starts, so the first frame it serves is
+# already the right shape.
+#
+# wlr-randr is the standard way to set it on a running wlroots compositor --
+# labwc has no output configuration of its own. It arrives in the environment
+# rather than as an argument because the applet also launches this through
+# `su -`, and the assignment rides inside that command string.
+if [ -n "${ISH_DISPLAY_UI_SCALE:-}" ] && [ "$ISH_DISPLAY_UI_SCALE" != "1" ]; then
+    if command -v wlr-randr >/dev/null 2>&1; then
+        # First column of the first line is the output name (HEADLESS-1 here).
+        scale_output=$(wlr-randr 2>/dev/null | awk 'NF && $1 !~ /^ / { print $1; exit }')
+        if [ -z "$scale_output" ]; then
+            log "warning: wlr-randr listed no output; leaving the scale alone"
+        elif wlr-randr --output "$scale_output" --scale "$ISH_DISPLAY_UI_SCALE" >/dev/null 2>&1; then
+            log "output $scale_output scaled to ${ISH_DISPLAY_UI_SCALE}x"
+        else
+            log "warning: wlr-randr could not set scale $ISH_DISPLAY_UI_SCALE on $scale_output"
+        fi
+    else
+        log "warning: a UI scale of ${ISH_DISPLAY_UI_SCALE}x was asked for, but wlr-randr"
+        log "         is not installed -- re-run /AOK/tools/setup-wayland.sh to add it."
+    fi
+fi
+
 # wayvnc gets its own retry loop on top of the grace sleep above: the same
 # labwc-not-quite-ready race can still occasionally lose even with the
 # sleep (JIT-emulation timing is not consistent run to run), and wayvnc

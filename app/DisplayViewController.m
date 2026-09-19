@@ -38,31 +38,78 @@ static NSArray<NSString *> *const DisplayPlainRootCommand = @[@"/bin/sh", @"/AOK
 // provisioned for this -- [AppDelegate defaultUserAccountName] looks up
 // whatever's actually at UID 1000 on this rootfs; falls back to root if
 // there isn't one.
+// The two size preferences resolved to numbers. 0 means "the device's own
+// scale" for the resolution and "whatever the resolution is" for the UI, which
+// is the pairing that keeps everything the physical size it is now and only
+// makes it sharper.
+static CGFloat DisplayResolvedDesktopScale(void) {
+    NSInteger pref = UserPreferences.shared.displayDesktopScale;
+    if (pref <= 0)
+        return UIScreen.mainScreen.nativeScale;
+    return (CGFloat) pref;
+}
+
+static CGFloat DisplayResolvedUIScale(void) {
+    NSInteger pref = UserPreferences.shared.displayUIScale;
+    if (pref <= 0)
+        return DisplayResolvedDesktopScale();
+    return (CGFloat) pref;
+}
+
+// Carried INSIDE the command string, not in envp: the default-user path runs
+// through `su -`, a login shell, which discards the environment it was handed.
+// At scale 1 this is empty and the command keeps exactly the shape it had, so
+// nothing changes for anyone who has not touched the setting.
+static NSString *DisplayUIScaleEnvPrefix(void) {
+    CGFloat scale = DisplayResolvedUIScale();
+    if (!(scale > 1.0))
+        return @"";
+    return [NSString stringWithFormat:@"ISH_DISPLAY_UI_SCALE=%g ", (double) scale];
+}
+
+static NSArray<NSString *> *DisplayRootCommand(void) {
+    NSString *prefix = DisplayUIScaleEnvPrefix();
+    if (prefix.length == 0)
+        return DisplayPlainRootCommand;
+    return @[@"/bin/sh", @"-c",
+             [NSString stringWithFormat:@"%@exec sh /AOK/tools/start-wayland.sh", prefix]];
+}
+
 static NSArray<NSString *> *DisplayGuestSessionCommand(void) {
     if (!UserPreferences.shared.shouldLoginAsDefaultUser)
-        return DisplayPlainRootCommand;
+        return DisplayRootCommand();
     NSString *accountName = [AppDelegate defaultUserAccountName];
     if (accountName.length == 0)
-        return DisplayPlainRootCommand;
-    return @[@"/bin/su", @"-", accountName, @"-c", @"sh /AOK/tools/start-wayland.sh"];
+        return DisplayRootCommand();
+    return @[@"/bin/su", @"-", accountName, @"-c",
+             [NSString stringWithFormat:@"%@sh /AOK/tools/start-wayland.sh",
+                 DisplayUIScaleEnvPrefix()]];
 }
 static const NSTimeInterval DisplayReadyTimeout = 45.0;
 
 // Desktop size policy, see DisplayDesktopSizeForViewSize in the header.
 static const CGFloat DisplayDesktopMinimumShortSide = 480.0;
-static const CGFloat DisplayDesktopMaximumLongSide = 2560.0;
+// Was 2560, which a device's own scale now exceeds on its own: an iPhone 16 Pro
+// Max at 3x is 1320x2868 and an iPad Pro 13" landscape at 2x is 2752x2064. A
+// ceiling that clamped those would quietly hand back something other than what
+// was asked for. 4096 is the common maximum texture/framebuffer dimension and
+// still refuses the absurd.
+static const CGFloat DisplayDesktopMaximumLongSide = 4096.0;
 static const NSTimeInterval DisplayDesktopResizeSettleDelay = 0.4;
 
-CGSize DisplayDesktopSizeForViewSize(CGSize viewSize) {
+CGSize DisplayDesktopSizeForViewSize(CGSize viewSize, CGFloat pixelsPerPoint) {
     CGFloat width = viewSize.width;
     CGFloat height = viewSize.height;
     if (!(width >= 1.0) || !(height >= 1.0)) // also turns away NaN
         return CGSizeZero;
     CGFloat shortSide = MIN(width, height);
     CGFloat longSide = MAX(width, height);
-    // One desktop pixel per point: labwc's text and window chrome come out the
-    // size of the app's own. The same scale on both axes keeps the shape.
-    CGFloat scale = 1.0;
+    // Desktop pixels per point. At 1 labwc's text and window chrome come out the
+    // size of the app's own; above that the desktop has more pixels for the same
+    // surface, which is only sharper rather than smaller if the compositor's
+    // output scale is raised to match (displayUIScale). The same scale on both
+    // axes keeps the shape. A caller passing nothing sensible gets the old 1.
+    CGFloat scale = (pixelsPerPoint > 0.0 && pixelsPerPoint < 1000.0) ? pixelsPerPoint : 1.0;
     if (shortSide * scale < DisplayDesktopMinimumShortSide)
         scale = DisplayDesktopMinimumShortSide / shortSide;
     // The ceiling wins over the floor: an extreme strip of a window gets a
@@ -529,7 +576,8 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 - (void)_requestDesktopSizeForDisplay {
     if (_rfbClient == nil || !_rfbClientConnected || _displayView == nil)
         return;
-    CGSize desktopSize = DisplayDesktopSizeForViewSize(_displayView.bounds.size);
+    CGSize desktopSize = DisplayDesktopSizeForViewSize(_displayView.bounds.size,
+                                                       DisplayResolvedDesktopScale());
     if (CGSizeEqualToSize(desktopSize, CGSizeZero) || CGSizeEqualToSize(desktopSize, _requestedDesktopSize))
         return;
     _requestedDesktopSize = desktopSize;
@@ -643,11 +691,11 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
                         "HOME=/root\0"
                         "TERM=xterm\0";
     err = do_execve(command[0].UTF8String, command.count, argv, envp);
-    if (err < 0 && ![command isEqualToArray:DisplayPlainRootCommand]) {
+    if (err < 0 && ![command isEqualToArray:DisplayRootCommand()]) {
         // "su" missing (or otherwise failed) on this root -- fall back to
         // running as root rather than failing the whole session over a
         // preference that's a nice-to-have, not a hard requirement.
-        command = DisplayPlainRootCommand;
+        command = DisplayRootCommand();
         [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
         err = do_execve(command[0].UTF8String, command.count, argv, envp);
     }
@@ -877,6 +925,73 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 // do. Ctrl+Alt+Del/Paste are normally on the toolbar card, but that's hidden
 // under "Maximize Screen Space" (see -_updateMaximizeScreenSpaceLayout) --
 // carry them here too so they're never the ONLY way to reach those actions.
+// How the two size settings read in a menu. 0 carries a meaning in both:
+// "Native" for the resolution, "Match Resolution" for the appearance.
+static NSString *DisplayDesktopScaleName(NSInteger pref) {
+    if (pref <= 0)
+        return [NSString stringWithFormat:@"Native (%gx)", (double) UIScreen.mainScreen.nativeScale];
+    return [NSString stringWithFormat:@"%ldx", (long) pref];
+}
+
+static NSString *DisplayUIScaleName(NSInteger pref) {
+    if (pref <= 0)
+        return @"Match Resolution";
+    return [NSString stringWithFormat:@"%ldx", (long) pref];
+}
+
+// A tick on the one in force, and blanks on the rest so the titles line up.
+static NSString *DisplayScaleChoiceTitle(NSString *name, NSInteger value, NSInteger current) {
+    return [NSString stringWithFormat:@"%@%@", value == current ? @"\u2713 " : @"     ", name];
+}
+
+- (void)_presentDesktopResolutionMenuFromView:(UIView *)sender {
+    CGSize now = DisplayDesktopSizeForViewSize(_displayView.bounds.size, DisplayResolvedDesktopScale());
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Desktop Resolution"
+        message:[NSString stringWithFormat:
+            @"How many pixels the desktop has, per point of the view showing it. "
+            @"Currently %g x %g. More pixels are sharper but cost more to draw and "
+            @"send \u2014 every frame is encoded in software inside the guest.",
+            (double) now.width, (double) now.height]];
+    NSInteger current = UserPreferences.shared.displayDesktopScale;
+    __weak typeof(self) weakSelf = self;
+    for (NSNumber *choice in @[@1, @2, @3, @0]) {
+        NSInteger value = choice.integerValue;
+        [sheet addActionWithTitle:DisplayScaleChoiceTitle(DisplayDesktopScaleName(value), value, current)
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
+            UserPreferences.shared.displayDesktopScale = value;
+            // Each size is asked for once per connection, so the guard has to be
+            // cleared or the new one is taken for a repeat and never sent.
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil)
+                return;
+            strongSelf->_requestedDesktopSize = CGSizeZero;
+            [strongSelf _requestDesktopSizeForDisplay];
+        }];
+    }
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sender sourceRect:sender.bounds];
+}
+
+- (void)_presentDesktopAppearanceMenuFromView:(UIView *)sender {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Desktop Appearance"
+        message:@"How big things look. Matching the resolution keeps text and windows "
+                @"the size they are now and only makes them sharper; 1x with a raised "
+                @"resolution fits more on screen at a smaller size. Takes effect on the "
+                @"next Reconnect, and needs wlr-randr in the guest."];
+    NSInteger current = UserPreferences.shared.displayUIScale;
+    for (NSNumber *choice in @[@0, @1, @2, @3]) {
+        NSInteger value = choice.integerValue;
+        [sheet addActionWithTitle:DisplayScaleChoiceTitle(DisplayUIScaleName(value), value, current)
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
+            UserPreferences.shared.displayUIScale = value;
+        }];
+    }
+    [sheet addActionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sender sourceRect:sender.bounds];
+}
+
 - (void)menuPipTapped:(UIButton *)sender {
     ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:@"Wayland Display" message:nil];
     __weak typeof(self) weakSelf = self;
@@ -916,6 +1031,18 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
                         style:UIAlertActionStyleDefault
                       handler:^(__unused UIAlertAction *action) {
         [weakSelf.displayView resignFirstResponder];
+    }];
+    [sheet addActionWithTitle:[NSString stringWithFormat:@"Resolution: %@…",
+                                  DisplayDesktopScaleName(UserPreferences.shared.displayDesktopScale)]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        [weakSelf _presentDesktopResolutionMenuFromView:sender];
+    }];
+    [sheet addActionWithTitle:[NSString stringWithFormat:@"Appearance: %@…",
+                                  DisplayUIScaleName(UserPreferences.shared.displayUIScale)]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        [weakSelf _presentDesktopAppearanceMenuFromView:sender];
     }];
     [sheet addActionWithTitle:@"Open Workspace…"
                         style:UIAlertActionStyleDefault
