@@ -99,6 +99,20 @@ term.io.sendString = term.io.onVTKeyStroke = (data) => {
 
 // hterm size updates native size
 term.io.onTerminalResize = () => native.resize();
+
+// Re-measure against the webview's CURRENT size, whether or not a resize event
+// arrived. hterm learns its size from exactly one place -- a 'resize' listener on
+// the iframe's window (hterm.ScrollPort.paintIframeContents_) -- and a web content
+// process that was suspended while the view was re-laid out, or one the system
+// reclaimed and we rebuilt, can simply never see that event. The scrollport then
+// keeps the geometry of the OLD bounds, so its last rows are drawn below the
+// terminal's real bottom edge, under the extra-keys row, and the view scrolls as
+// if it were still that tall. Returns the size it settled on, so the caller can
+// see it took.
+exports.resync = () => {
+    term.scrollPort_.resize();
+    return [term.screenSize.width, term.screenSize.height];
+};
 exports.getSize = () => [term.screenSize.width, term.screenSize.height];
 
 // selection, copying

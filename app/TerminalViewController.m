@@ -567,6 +567,19 @@ static const NSInteger kMaximumTerminalFontSize = 72;
                selector:@selector(terminalDidLoad:)
                    name:TerminalDidLoadNotification
                  object:nil];
+    // The bottom inset is otherwise only ever set from a keyboard-frame
+    // notification, and hterm only ever learns its size from a resize event
+    // inside its own iframe. Returning from the background satisfies neither
+    // reliably: the keyboard frame that arrives can be the degenerate one this
+    // handler drops, and a web content process that was suspended (or reclaimed
+    // and rebuilt) while the view was re-laid out never sees the resize. Both
+    // leave the terminal drawing at its old height, with the last rows under the
+    // extra-keys row -- reported on 555, worse on some guests than others only
+    // because a busier prompt redraws more of the overlap.
+    [center addObserver:self
+               selector:@selector(_reestablishTerminalGeometry)
+                   name:UIApplicationDidBecomeActiveNotification
+                 object:nil];
     [center addObserver:self
                selector:@selector(terminalLoadFailed:)
                    name:TerminalLoadFailedNotification
@@ -2070,9 +2083,25 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     });
 }
 
+// Put the terminal's geometry back where the layout says it should be, and make
+// hterm agree. Cheap and idempotent: the inset work short-circuits when nothing
+// changed, and a resync that finds the same size is a no-op beyond one tty update.
+- (void)_reestablishTerminalGeometry {
+    [self _updateSafeAreaCompensation];
+    [self.view layoutIfNeeded];
+    [self _applyScreenPadding];
+    [self.terminal resyncSize];
+}
+
 - (void)terminalDidLoad:(NSNotification *)notification {
     if (notification.object != self.terminal)
         return;
+    // A fresh JS context starts with hterm's own defaults and whatever size it
+    // measured as it came up, which is not necessarily the size it has now --
+    // recoverTerminalWebViewWithReason: discards and rebuilds the webview, and
+    // that happens under memory pressure, i.e. exactly when the app has been in
+    // the background a while.
+    [self _reestablishTerminalGeometry];
     [self _hideTerminalStartupOverlay];
     // The terminal is back, so anything still on screen saying it failed is now
     // a lie the user would have to dismiss by hand.

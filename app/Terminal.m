@@ -753,6 +753,20 @@ NSString *ISHPasteSequence(NSString *text, BOOL bracketed, BOOL execute) {
     [self.webView evaluateJavaScript:@"exports.scrollToBottom()" completionHandler:nil];
 }
 
+// Make hterm re-measure. Callers use this after something moved the terminal's
+// bounds at a moment the JS could not observe -- see exports.resync in term.js.
+// The guest is told the result whether or not hterm's own onTerminalResize fires:
+// it only fires when the size CHANGED, and a resync that confirms the current
+// size still has to leave the tty agreeing with it.
+- (void)resyncSize {
+    if (!self.loaded)
+        return;
+    [self.webView evaluateJavaScript:@"exports.resync()" completionHandler:^(id result, NSError *error) {
+        if (error == nil)
+            [self syncWindowSize];
+    }];
+}
+
 - (NSString *)arrow:(char)direction {
     return [NSString stringWithFormat:@"\x1b%c%c", self.applicationCursor ? 'O' : '[', direction];
 }

@@ -57,6 +57,8 @@ struct tty *ISHOpenTerminalForRestoredSession(void);
 // is never bracketed.
 @property (nonatomic) BOOL bracketedPasteEnabled;
 - (void)requestRefresh;
+// Re-measure the terminal against its current bounds; see -resyncSize.
+- (void)resyncSize;
 - (void)setPendingDestroyReason:(NSString *)reason;
 
 - (NSString *)arrow:(char)direction;
