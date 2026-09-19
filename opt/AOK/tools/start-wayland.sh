@@ -405,6 +405,13 @@ for f in /usr/share/applications/*.desktop; do
         /^Exec=/ && execline == "" { execline = substr($0, 6) }
         END {
             if (hidden || name == "" || execline == "") exit
+            # The second copy of this rule -- list-apps.sh has the same one,
+            # with the reasoning (manages_the_desktop). An entry asking a file
+            # manager to take over the desktop, or to configure the desktop it
+            # would be managing, cannot work when the compositor draws it:
+            # pcmanfm answers --desktop-pref with "Desktop manager is not
+            # active." and --desktop would fight sway for the desktop.
+            if (execline ~ /(^| )--(desktop-pref|wallpaper-mode|set-wallpaper|desktop)( |=|$)/) exit
             gsub(/%[a-zA-Z]/, "", execline)
             printf "%s\t%s\n", name, execline
         }
