@@ -139,6 +139,7 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     UIButton *_ctrlAltDelButton;
     UIButton *_pasteButton;
     UIButton *_reconnectButton;
+    UIButton *_menuButton;
     UIButton *_Nullable _menuPip; // standalone mode only
     NSLayoutConstraint *_Nullable _menuPipBottomConstraint;
     // Standalone mode only: DisplayRFBView's accessory key strip, hosted
@@ -223,6 +224,18 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
     _reconnectButton.hidden = YES;
     [_toolbarCard addSubview:_reconnectButton];
 
+    // The same menu the standalone pip opens. Without this the windowed applet
+    // had no route to it at all -- the pip is added only in standaloneMode
+    // below -- so everything that lives ONLY in that menu (the desktop
+    // Resolution and Appearance, the keyboard toggles) was unreachable for
+    // anyone running the Display applet in a Workspace window, which is how it
+    // is normally run. Titled with an ellipsis rather than a word because the
+    // pill already carries three buttons and a status line on a phone.
+    _menuButton = [self displayButtonWithTitle:@"\u22ef" action:@selector(menuPipTapped:)];
+    _menuButton.accessibilityLabel = @"Display menu";
+    _menuButton.accessibilityHint = @"Opens the display menu for resolution, keyboard and input options.";
+    [_toolbarCard addSubview:_menuButton];
+
     CGFloat inset = 8.0;
     NSMutableArray<NSLayoutConstraint *> *constraints = [NSMutableArray arrayWithArray:@[
         [_toolbarCard.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor constant:inset],
@@ -248,9 +261,12 @@ typedef NS_ENUM(NSInteger, DisplayConnectionState) {
 
         [_pasteButton.trailingAnchor constraintEqualToAnchor:_ctrlAltDelButton.leadingAnchor constant:-6.0],
         [_pasteButton.centerYAnchor constraintEqualToAnchor:_toolbarCard.centerYAnchor],
+
+        [_menuButton.trailingAnchor constraintEqualToAnchor:_pasteButton.leadingAnchor constant:-6.0],
+        [_menuButton.centerYAnchor constraintEqualToAnchor:_toolbarCard.centerYAnchor],
     ]];
     [constraints addObject:
-        [_statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_pasteButton.leadingAnchor constant:-6.0]];
+        [_statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_menuButton.leadingAnchor constant:-6.0]];
     // ...but only as tall as that. "At least 22" on its own left the pill's
     // height ambiguous against the display below it, which is pinned between
     // the pill and the bottom edge and has no height of its own. Auto Layout was
