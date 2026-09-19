@@ -78,7 +78,7 @@
 }
 
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)bundledChoices {
-    return Roots.instance.bundledRootChoices;
+    return Roots.instance.offeredRootChoices;
 }
 
 // Groups bundledChoices by distro family (kBundledRootFamilyKey in Roots.m) so

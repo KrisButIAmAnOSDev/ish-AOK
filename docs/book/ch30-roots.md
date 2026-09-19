@@ -32,6 +32,17 @@ before anything is downloaded.
 PSCAL + SmallCLUE — downloaded on demand into `/AOK/persist/roots` and imported
 from there. The catalogue itself is `deps/rootfs-manifest`.
 
+A catalogue entry may also carry a `series` and a `version`. That is for images
+this project builds itself from sources that keep moving, rather than a
+distribution's own release: the PSCAL + SmallCLUE rootfs is rebuilt every so
+often with the same contents and newer code, and each build is published
+alongside the last. Every version stays in the manifest and stays downloadable,
+but the picker offers only the two most recent of each series — otherwise the
+list grows a row every time somebody rebuilds. A version that has fallen off
+the end is hidden, not withdrawn: `install source=catalog id=…` still takes it.
+That split is the difference between `bundledRootChoices` (everything the app
+knows) and `offeredRootChoices` (what it puts in front of you) in `Roots.m`.
+
 **Imported.** Any archive sitting in `/AOK/persist/roots`, whether it got there
 by download or because somebody dropped a `.tar.xz` in through the Files app
 (Chapter 31) or from the guest. Tap it and it becomes a named root.

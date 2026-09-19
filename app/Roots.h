@@ -34,7 +34,14 @@ FOUNDATION_EXPORT NSNotificationName const RootsDidFinishInitialSelectionNotific
 @property (readonly) BOOL needsInitialRootSelection;
 @property (readonly) BOOL initialBundledRootImportInProgress;
 @property (readonly, nullable) NSError *initialBundledRootImportError;
+// Every choice the app knows about, including versions of a series the picker
+// no longer offers -- use this to identify where an already-imported root came
+// from, or to honour an identifier a user named explicitly.
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)bundledRootChoices;
+// What to actually put in front of someone choosing a filesystem: the same
+// list with every superseded version of a series removed (only the two most
+// recent survive). See the series/version notes in Roots.m.
+- (NSArray<NSDictionary<NSString *, NSString *> *> *)offeredRootChoices;
 // YES if this bundled choice's archive isn't shipped in the app bundle and
 // hasn't already been downloaded into /AOK/persist/roots -- i.e. selecting it
 // will trigger a network download before it can be imported.

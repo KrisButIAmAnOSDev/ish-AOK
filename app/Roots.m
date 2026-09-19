@@ -85,6 +85,17 @@ static NSString *const kBundledRootFamilyDisplayNameKey = @"familyDisplayName";
 static NSString *const kBundledRootTierKey = @"tier";
 static NSString *const kBundledRootTierOfficial = @"official";
 static NSString *const kBundledRootTierCommunity = @"community";
+// A "series" is a line of images published repeatedly from the same source as
+// that source moves on -- same distro, same architectures, a newer build (the
+// PSCAL + SmallCLUE rootfs is the first). Every version ever published stays
+// in the manifest, because that file is the record of what exists and an
+// older build stays installable by identifier through ish-cli, but the picker
+// offers only the most recent few: a list that grows a row on every rebuild
+// stops being a picker. Entries with no series are unversioned and always
+// offered.
+static NSString *const kBundledRootSeriesKey = @"series";
+static NSString *const kBundledRootVersionKey = @"version";
+static const NSUInteger kBundledRootSeriesVersionsOffered = 2;
 // Present only for choices whose archive isn't shipped in the app bundle --
 // importing them downloads this URL into /AOK/persist/roots on demand
 // instead (see DownloadBundledArchive / importBundledRootChoice:).
@@ -160,6 +171,22 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
             fixedUp[kBundledRootTierKey] = kBundledRootTierCommunity;
             entry = fixedUp;
         }
+
+        // series/version are optional, so they aren't in RequiredManifestKeys
+        // and nothing above has checked their type. JSON will happily hand us
+        // `"version": 3` as an NSNumber, and every reader from here on treats
+        // these as strings -- so drop anything that isn't one. Losing the keys
+        // makes the entry unversioned (always offered), which is the harmless
+        // direction to fail in.
+        for (NSString *key in @[kBundledRootSeriesKey, kBundledRootVersionKey]) {
+            id value = entry[key];
+            if (value != nil && ![value isKindOfClass:NSString.class]) {
+                NSLog(@"rootfs-manifest.json: entry '%@' has a non-string '%@', ignoring that key", identifier, key);
+                NSMutableDictionary<NSString *, NSString *> *fixedUp = [entry mutableCopy];
+                [fixedUp removeObjectForKey:key];
+                entry = fixedUp;
+            }
+        }
         [entries addObject:entry];
     }
     return entries;
@@ -207,6 +234,56 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void)
         choices = mutableChoices;
     });
     return choices;
+}
+
+// The subset of BundledRootChoices() the picker (and `ish-cli roots catalog`)
+// actually lists: for every series, only the kBundledRootSeriesVersionsOffered
+// most recent versions. Versions are deduped per series first, so a series
+// that ships three architectures per version still counts that as one version.
+// Ordering is NSNumericSearch so "2026.9.19" and "2026.09.19" compare the way
+// a human reads them, and descending so the newest build is the first row.
+//
+// Superseded entries are hidden, not dropped: BundledRootChoices() still has
+// them, so a root imported from one keeps matching its origin choice (tier,
+// guest ABI) and `ish-cli roots install source=catalog id=...` still installs
+// it for anyone whose script already names it.
+static NSArray<NSDictionary<NSString *, NSString *> *> *OfferedRootChoices(NSArray<NSDictionary<NSString *, NSString *> *> *choices) {
+    NSMutableDictionary<NSString *, NSMutableOrderedSet<NSString *> *> *versionsBySeries = [NSMutableDictionary dictionary];
+    for (NSDictionary<NSString *, NSString *> *choice in choices) {
+        NSString *series = choice[kBundledRootSeriesKey];
+        NSString *version = choice[kBundledRootVersionKey];
+        if (series.length == 0 || version.length == 0)
+            continue;
+        NSMutableOrderedSet<NSString *> *versions = versionsBySeries[series];
+        if (versions == nil) {
+            versions = [NSMutableOrderedSet orderedSet];
+            versionsBySeries[series] = versions;
+        }
+        [versions addObject:version];
+    }
+    if (versionsBySeries.count == 0)
+        return choices;
+
+    NSMutableSet<NSString *> *offeredVersions = [NSMutableSet set];
+    [versionsBySeries enumerateKeysAndObjectsUsingBlock:^(NSString *series, NSMutableOrderedSet<NSString *> *versions, __unused BOOL *stop) {
+        [versions sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            return [b compare:a options:NSNumericSearch];
+        }];
+        NSUInteger keep = MIN(versions.count, kBundledRootSeriesVersionsOffered);
+        for (NSUInteger i = 0; i < keep; i++)
+            [offeredVersions addObject:[NSString stringWithFormat:@"%@\t%@", series, versions[i]]];
+    }];
+
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *offered = [NSMutableArray array];
+    for (NSDictionary<NSString *, NSString *> *choice in choices) {
+        NSString *series = choice[kBundledRootSeriesKey];
+        NSString *version = choice[kBundledRootVersionKey];
+        if (series.length == 0 || version.length == 0 ||
+                [offeredVersions containsObject:[NSString stringWithFormat:@"%@\t%@", series, version]]) {
+            [offered addObject:choice];
+        }
+    }
+    return offered;
 }
 
 // Bundled root archives may ship in any container format libarchive (and thus
@@ -686,6 +763,15 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 
 - (NSArray<NSDictionary<NSString *,NSString *> *> *)bundledRootChoices {
     return BundledRootChoices();
+}
+
+- (NSArray<NSDictionary<NSString *,NSString *> *> *)offeredRootChoices {
+    static NSArray<NSDictionary<NSString *, NSString *> *> *offered;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        offered = OfferedRootChoices(BundledRootChoices());
+    });
+    return offered;
 }
 
 - (BOOL)bundledRootChoiceNeedsDownload:(NSDictionary<NSString *, NSString *> *)choice {
@@ -1545,7 +1631,11 @@ static NSString *const kRootsJobStateDone = @"done";
         [text appendFormat:@"root default=%d\n", [name isEqualToString:defaultRoot] ? 1 : 0];
         [text appendFormat:@"root name=%@\n", name];
     }
-    for (NSDictionary<NSString *, NSString *> *choice in [roots bundledRootChoices]) {
+    // offeredRootChoices, not bundledRootChoices: this listing is what a
+    // person browses to find an id, so it shows the same set the picker does.
+    // A superseded id still installs (see the install handler) -- it just
+    // isn't advertised any more.
+    for (NSDictionary<NSString *, NSString *> *choice in [roots offeredRootChoices]) {
         [text appendFormat:@"available id=%@\n", choice[kBundledRootIdentifierKey] ?: @""];
         [text appendFormat:@"available abi=%@\n", choice[kBundledRootGuestABIKey] ?: @"unknown"];
         [text appendFormat:@"available download=%d\n", [roots bundledRootChoiceNeedsDownload:choice] ? 1 : 0];
